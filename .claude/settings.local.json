@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Command cl.exe -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command nasm -ErrorAction SilentlyContinue)",
+      "PowerShell($env:VCToolsInstallDir)",
+      "PowerShell(Get-Command py -ErrorAction SilentlyContinue; Get-Command python3 -ErrorAction SilentlyContinue; Get-ChildItem \"$env:LOCALAPPDATA\\\\Programs\\\\Python\" -ErrorAction SilentlyContinue; where.exe python 2>$null)",
+      "Skill(run)",
+      "Skill(run:*)",
+      "PowerShell(Get-ChildItem -Path \"$env:APPDATA\" -Recurse -Filter \"library.json\" -ErrorAction SilentlyContinue | Select-Object FullName)",
+      "PowerShell(\\(Get-Content \"c:\\\\Users\\\\DELL\\\\OneDrive\\\\Desktop\\\\LocalHost py\\\\Hypervisor.c\"\\) -replace 'injectInterrupt\\\\\\(partition, ATA_IRQ14_VECTOR\\\\\\);', 'ataMaybeInjectIrq\\(partition\\);' | Set-Content \"c:\\\\Users\\\\DELL\\\\OneDrive\\\\Desktop\\\\LocalHost py\\\\Hypervisor.c\" -Encoding ascii)",
+      "PowerShell(Get-Process -Name python,Hypervisor -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -ErrorAction SilentlyContinue)",
+      "PowerShell(& \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe\" -u \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\\\bb0f880f-1c6f-4c67-9a8b-f3f397a439b8\\\\scratchpad\\\\drive_only.py\")",
+      "PowerShell(\"Cleaned up\")",
+      "PowerShell(& \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe\" \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\\\bb0f880f-1c6f-4c67-9a8b-f3f397a439b8\\\\scratchpad\\\\click_yes.py\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"ProcessId=14212\")",
+      "PowerShell(& \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Python\\\\pythoncore-3.14-64\\\\python.exe\" \"C:\\\\Users\\\\DELL\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\\\5bed7398-339c-497a-9383-821cf9d2769e\\\\scratchpad\\\\disasm_with_symbols.py\" 0x78E44 400)"
+    ],
+    "defaultMode": "bypassPermissions"
+  }
+}

@@ -1,0 +1,13 @@
+[
+    {
+        "name": "VM",
+        "mode": "vmware",
+        "iso": "",
+        "ram": 0,
+        "cpu": 0,
+        "storage": 0,
+        "vmx_path": "C:/Users/DELL/Documents/Virtual Machines/Arch/Arch.vmx",
+        "state": "off",
+        "snapshots": []
+    }
+]

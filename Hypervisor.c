@@ -1,0 +1,7593 @@
+// Known limitations and the backend roadmap are tracked in docs/
+// (docs/known-limitations.md, docs/roadmap.md). In particular, real Windows
+// guests currently bugcheck 0x5C during HAL timer init -- see
+// docs/investigations/vppt-synic-blocker.md for the full investigation
+// before re-attempting a fix here.
+
+#define _WIN32_WINNT 0x0A00
+// winsock2.h must come before windows.h (it defines _WINSOCKAPI_, which
+// stops windows.h from pulling in the legacy winsock.h and conflicting).
+// This is the ONE place the networking backend (see the "net" section
+// below, around rtl8139TransmitFrame/rtl8139ReceiveFrame) touches anything
+// Windows-specific -- everything past initialization uses plain BSD
+// sockets calls (socket/bind/connect/send/recv/select), the same subset
+// Winsock and POSIX sockets share, so the backend logic itself stays
+// portable to a hypothetical future Linux/macOS build.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <WinHvPlatformDefs.h>
+#include <WinHvPlatform.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <intrin.h>
+#include <stdarg.h>
+
+unsigned char cmosRegisters[256] = { 0 };
+unsigned char cmosSelectedReg = 0;
+int refreshToggle = 0;
+
+// --- CMOS RTC time/date fields (registers 0x00-0x09) + status registers
+// A/B/D (0x0A/0x0B/0x0D) ---
+// Previously cmosRegisters[] was a flat, statically zero-initialized array:
+// reads of the RTC time/date fields always returned 0, and Register A/B/D
+// never reflected real hardware semantics at all. Cross-referenced against
+// the real EDK2 PcRtc.c source (the driver OVMF uses to implement
+// EFI_RUNTIME_SERVICES->GetTime(), which Windows Boot Manager's
+// BlpTimeInitialize calls into): PcRtcGetTime()'s RtcWaitToUpdate() helper
+// returns EFI_DEVICE_ERROR outright if Register D's VRT (Valid RAM/Time)
+// bit is 0, and separately, if Register B's Dm bit selects BCD mode (which
+// bit 0 means it does, since Dm=0 -> BCD), a raw 0x00 byte IS valid BCD
+// zero -- but the resulting Month=0/Day=0 then fails RtcTimeFieldsValid()'s
+// range check (Month must be 1-12, Day must be a valid day for that
+// month), which PcRtcGetTime() remaps to EFI_DEVICE_ERROR same as the VRT
+// case. This exact chain was confirmed empirically via runtime
+// instrumentation (BlpTimeInitialize is the function that returns
+// 0xC0000185/STATUS_IO_DEVICE_ERROR, the NTSTATUS PcRtcGetTime's
+// EFI_DEVICE_ERROR maps to) before this fix.
+//
+// Fix: report live wall-clock time on every read of 0x00-0x09, encoded to
+// match whatever BCD/binary (Register B bit 2) and 12/24-hour (bit 1) mode
+// is *currently* configured -- PcRtcGetTime() re-reads Register B fresh on
+// every call rather than caching a fixed mode, so the encoding must track
+// it live rather than being fixed at startup. Register A always reports
+// UIP=0 (our "update" is instantaneous, never caught mid-cycle) and
+// Register D always reports VRT=1 (battery/CMOS always valid) regardless
+// of whatever raw byte a guest write may have stored there.
+unsigned char cmosEncodeRtcField(unsigned char decimalValue, int useBcd) {
+    if (!useBcd) return decimalValue;
+    return (unsigned char)(((decimalValue / 10) << 4) | (decimalValue % 10));
+}
+
+unsigned char cmosReadRtcField(unsigned char reg) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    unsigned char regB = cmosRegisters[0x0B];
+    int useBcd = (regB & 0x04) == 0;   // Dm bit: 0 = BCD, 1 = binary
+    int is24Hour = (regB & 0x02) != 0; // Mil bit: 1 = 24-hour, 0 = 12-hour + PM bit
+
+    switch (reg) {
+        case 0x00: return cmosEncodeRtcField((unsigned char)st.wSecond, useBcd);
+        case 0x02: return cmosEncodeRtcField((unsigned char)st.wMinute, useBcd);
+        case 0x04: {
+            unsigned char hour24 = (unsigned char)st.wHour;
+            if (is24Hour) return cmosEncodeRtcField(hour24, useBcd);
+            int isPM = hour24 >= 12;
+            unsigned char hour12 = (unsigned char)(hour24 % 12);
+            if (hour12 == 0) hour12 = 12;
+            unsigned char encoded = cmosEncodeRtcField(hour12, useBcd);
+            return isPM ? (unsigned char)(encoded | 0x80) : encoded;
+        }
+        case 0x06: return cmosEncodeRtcField((unsigned char)(st.wDayOfWeek + 1), useBcd); // RTC convention: 1-7
+        case 0x07: return cmosEncodeRtcField((unsigned char)st.wDay, useBcd);
+        case 0x08: return cmosEncodeRtcField((unsigned char)st.wMonth, useBcd);
+        case 0x09: return cmosEncodeRtcField((unsigned char)(st.wYear % 100), useBcd);
+        default: return 0;
+    }
+}
+
+LARGE_INTEGER perfFrequency;
+LARGE_INTEGER lastToggleTime;
+
+// ---------------------------------------------------------------------
+// Live INT3 breakpoint infrastructure for the bugcheck-0x139 investigation
+// (see docs/investigations/post-vppt-boot-stall.md, "live breakpointing"
+// update). Deliberately isolated to this block plus its two call sites
+// (the reset handler and the main exit-handling switch) so it can be
+// deleted cleanly once the root cause is identified.
+//
+// Strategy (round 2): the fail-site breakpoint (RVA 0x34420F, the
+// `mov ecx,3` immediately preceding the `int 0x29` trap at 0x344214)
+// already captured R10 (subsegment=NULL) reliably across two boots. But
+// RDX (the "owner" parameter) read 0 there too -- and static disassembly
+// shows RDX legitimately gets reassigned mid-function (`xor edx,edx` at
+// RVA 0x344195, on an intermediate success path) before reaching the fail
+// site, so that 0 is NOT trustworthy as the genuine entry parameter.
+// Retargeted to the function's true entry instead (RVA 0x34412C, the
+// first prologue instruction, confirmed live via FailSite.disasm.txt) --
+// RCX/RDX/R8 are the genuine, unclobbered subsegment/owner/flags
+// parameters there. Unlike the fail-site breakpoint, entry is hit on
+// EVERY call (including ordinary successful ones), so the handler re-arms
+// after each non-matching hit (RCX != 0) and only produces a full report
+// (+ stops re-arming) when RCX == 0, the signature of the known failing
+// call.
+// RVA 0x34412C (RtlpHpLfhOwnerMoveSubsegment's true entry) confirmed both
+// subsegment(rcx) and owner(rdx) NULL, then RVA 0x2382C1
+// (RtlpHpLfhSlotAllocate+0xCA1, confirmed via a downloaded matching
+// ntkrnlmp.pdb + capstone) confirmed the NULL value is `*(rbp+0x58)` --
+// which a full-function disassembly then proved is RtlpHpLfhSlotAllocate's
+// OWN second incoming parameter (spilled to its home slot at entry,
+// offset math: rbp = entry_rsp-0x48, so rbp+0x58 = entry_rsp+0x10, exactly
+// where the prologue's `mov [rsp+0x10],rdx` puts it), never written
+// anywhere else in the function (see
+// docs/investigations/post-vppt-boot-stall.md, 2026-07-17 continuation).
+// [ACTIVE: retargeted back to 0x237620 -- see below] Then RVA 0x237620
+// (RtlpHpLfhSlotAllocate's own entry) traced the chain up
+// to ExAllocateHeapPool+0x2B1, which reads R13 (NULL) from a global array
+// at ExPoolState+0x3900 (stride 0x20C0). A follow-up survey found ALL 16
+// sampled array indices NULL, not just one -- systemic, not a single bad
+// slot. Per explicit user direction: investigate (without changing reset
+// behavior) whether the array is never initialized post-reset or
+// explicitly cleared without rebuild. RVA 0x3C3B64 is
+// `ExInitializePoolHeapManagement`, found via PDB symbol enumeration
+// (SymEnumSymbols against patterns like "*Init*Pool*") as the strongest
+// name-matched candidate for what populates this array -- no matching
+// "*teardown*"/"*destroy*" pool function exists in the public symbol
+// table at all, itself a data point. Breaking at its entry (unconditional,
+// first-hit-only, like the very first breakpoint site in this
+// investigation) checks whether/when it actually runs.
+// RETARGETED AGAIN (2026-07-17): full-image static scan (16MB kernel dump
+// + capstone, offline) found exactly ONE writer to the ExPoolState array
+// anywhere in ntoskrnl.exe -- ExInitializePoolHeapManagement, writing
+// +8 -- and NO writer anywhere to +0x10 (the field found NULL). This
+// raises a sharper alternative hypothesis: maybe +0x10 isn't a
+// reset-broken re-init path at all, but a slot that's simply never
+// populated on ANY boot pass until first requested with these specific
+// flags -- i.e. not a regression, just the first-ever use of this
+// particular flag-selected pool variant happening to land on pass 2.
+// Back to RVA 0x237620 (RtlpHpLfhSlotAllocate's entry, already has
+// working re-arm emulation from earlier this session) to survey the
+// array's +0x10 field repeatedly throughout PASS 1's own extensive,
+// successful heap activity -- if it's null there too, this isn't a
+// reset-specific gap at all.
+// RETARGETED (2026-07-17): RVA 0xA3DC14 is `Phase1InitializationDiscard`'s
+// true entry (confirmed via SymFromName), the real system-thread routine
+// that runs Phase 1 kernel init on genuine Windows. Testing whether it's
+// reached at all on pass 2, one level above both pool-heap initializers.
+// 2026-07-19, U18: repurposed to HalpInitSystemHelper+0x5A (the `inc edi`
+// immediately after the dispatch call returns and the `js` non-negative
+// check). Multi-shot counter: if this fires ~as often as HalpIommuInitSystem
+// on pass 2, the inner loop advances past the IOMMU dispatch (cycling);
+// if it ~never fires, execution never reaches the increment (frozen at the
+// dispatch return -- e.g. an interrupt diverts before it).
+// 2026-07-19, U23b: the per-call check at RtlpHpLfhOwnerMoveSubsegment's
+// entry was abandoned -- it is a HOT heap function and breakpointing every
+// call added so much overhead (exitCount ballooned to ~20M) that the guest
+// never reached pass 2. DR2 is parked at an inert address (base+0, the PE
+// header, never executed) so it never fires. U25b: crash-state inspection is
+// dead (trap-frame GPRs all zero at the int 0x29 fastfail; the subsegment is
+// not on the shallow stack). So instead instrument the WRITER path. DR2 ->
+// RtlpHpLfhBucketAddSubsegment (0x343DB8), which links a new subsegment into a
+// bucket and is called only when a bucket grows (far rarer than the alloc-path
+// walk). Pass-2 gated (g_sawReset). Args: rcx=owner, rdx=subsegment, r8=bucket,
+// r9=flag. AddSubsegment & SubsegmentFree both fired 0x on pass 2 pre-crash.
+// U26 breakthrough: breakpoint RtlpHpLfhOwnerMoveSubsegment+0xE3 (0x34420F),
+// the `mov ecx,3` right before `int 0x29`. This offset is reached ONLY via the
+// failed LIST_ENTRY-check jne's (+0x4D/+0xAD/+0xB6), so it fires ONLY on the
+// corrupt call -- once, zero overhead -- and unlike the trap frame the LIVE
+// registers are intact here: entry=rcx (insert check) or rdx (remove check),
+// bad neighbor in rax/r11. This finally recovers the corrupted subsegment VA.
+// U28: DR2 targets RtlpHpLfhBucketGetSubsegment+0x45 (GETSUB_RVA), where
+// rdx=[rbx]=the subsegment being handed to MoveSubsegment. Registers read
+// normally at this mid-function point. This site is HOT, so DR2 is NOT armed
+// at discovery; it is armed dynamically only in a narrow exitCount window
+// before the pass-2 crash (see the windowed-arm block in the main loop) so the
+// fatal (already-corrupt) subsegment is captured with bounded overhead.
+#define BP_FAIL_SITE_RVA 0x343B49
+#define LOOPADV_MAX_HITS 3000
+
+// 2026-07-18 (superseded, kept for history): the previous version of this
+// breakpoint set bisected InitBootProcessor's own sequence and found that
+// CmInitSystem0 (+0x348) and KeInitSystem (+0x370) are BOTH never reached
+// on pass 2, while HalInitSystem's own subtree (+0x312, confirmed via
+// HalpApicInitializeIoUnit) IS reached -- bracketing the divergence to a
+// 54-byte stretch of InitBootProcessor's own code. Disassembling that
+// stretch (disasm_bracket.py, scratchpad) found the answer immediately:
+//   +0x312: call HalInitSystem
+//   +0x317: test al, al
+//   +0x319: je <bailout>      <- skips everything else if HalInitSystem
+//                                 returns FALSE, including KeInitializeClock,
+//                                 CmInitSystem0, KeInitSystem, MmInitSystem,
+//                                 and eventually PsInitSystem/PspInitPhase0.
+// The bailout target (RVA 0xA3DA8F, InitBootProcessor+0xA3B) loads
+// `ecx = 0x5C` before its first call -- 0x5C is the real NT bugcheck code
+// HAL_INITIALIZATION_FAILED, strongly suggesting this path calls
+// KeBugCheckEx. That's inconsistent with what's actually observed (pass 2
+// runs for tens of thousands of VM exits before eventually bugchecking
+// with 0x139, not immediately with 0x5C) -- so whether this branch is
+// actually taken on pass 2, and if so why it doesn't immediately
+// bugcheck, needs direct confirmation, not just static inference.
+//   WP_PHASE1INIT_ENTRY_RVA (repurposed): KeInitializeClock entry
+//     (InitBootProcessor's other call in this bracket, +0x338) -- was
+//     "status unknown" before; resolved now for completeness.
+//   BP_FAIL_SITE_RVA (unchanged): MmInitSystem entry -- kept as the
+//     known-negative anchor/consistency check.
+//
+// 2026-07-18, U12: U10 found HalpIommuInitSystem never succeeds on pass 2
+// (see the block below). I7 (docs/investigations/phase0-divergence-summary.md)
+// speculates this same retry loop might be the *direct* cause of the
+// eventual 0x139 bugcheck -- since HalpIommuInitSystem's own callees
+// plausibly allocate pool memory before MmInitSystem has initialized the
+// Segment Heap descriptors. First attempt: a one-shot breakpoint at the
+// exact faulting instruction (RtlpHpLfhOwnerMoveSubsegment+0xE8, RVA
+// 0x344214, confirmed via the KiBugCheckData/EXCEPTION_RECORD scan much
+// earlier this investigation) with a deep heuristic stack scan -- this
+// DID extend the known allocator chain by one level
+// (ExAllocatePoolWithTag, not previously identified), but the *caller* of
+// ExAllocatePoolWithTag itself couldn't be reliably distinguished from
+// stale stack data using that heuristic method (a plain "any
+// canonical-looking qword" scan isn't real unwind-based stack walking).
+// U12 traced this to KiSwInterruptDispatch, unrelated to HalpIommuInitSystem
+// -- see docs/investigations/phase0-divergence-summary.md (I7 refined) and
+// post-vppt-boot-stall.md ("U12 resolved") for the full result.
+//
+// 2026-07-18, U13: why does HalpIommuInitSystem itself never make
+// progress on pass 2? Static disassembly of HalpInitSystemHelper's FULL
+// body (not just its one visible `call guard_dispatch_icall` -- earlier
+// scans only listed distinct call *instructions*, missing that this one
+// sits inside a genuine nested loop) revealed the real structure:
+//   outer loop: ebx = ecx_arg .. edx_arg (a range)
+//   inner loop: edi = 0..0x15 (21), table = &HalSubComponents, stride 0x10
+//     rax = table[outer? no -- fixed at r12][inner].funcptr
+//     ecx=outer_index, edx=r15d (current processor number, gs:[0x1a4]),
+//     r8=original third arg
+//     call guard_dispatch_icall(rax) -- dispatches to the specific
+//       component initializer for this (outer, inner) slot
+//     if (result < 0) bail out of BOTH loops entirely (single shared
+//       failure path, not a per-slot retry)
+// HalpIommuInitSystem's own entry immediately tests its first parameter
+// (ecx, i.e. the outer loop index) for zero and branches differently if
+// so. Given the earlier live trace (docs, U10) showed the SAME dispatch
+// target (HalpIommuInitSystem) firing thousands of times with an
+// IDENTICAL RSP, but HalpInitSystemHelper's own bailout-on-failure would
+// exit the whole function (and thus return control to InitBootProcessor,
+// contradicting the already-confirmed fact that it never returns) --
+// something doesn't add up between the static structure and the live
+// result. Rather than keep guessing from statics, WP_RETURN_RVA and
+// HALI_DISPATCH_CALL_RVA are retargeted to directly observe
+// HalpIommuInitSystem's own inputs and outputs on every call:
+//   WP_RETURN_RVA (repurposed): HalpIommuInitSystem's own entry -- reads
+//     RCX/RDX/R8/R9 (its real arguments) on every hit.
+//   HALI_DISPATCH_CALL_RVA (repurposed): HalpIommuInitSystem's own return
+//     point (RVA 0x9A188F = entry+0x1DF, the `ret` instruction, EAX
+//     already holds its real return value at this exact point) -- reads
+//     EAX on every hit.
+#define WP_RETURN_RVA 0x9A16B0           /* HalpIommuInitSystem entry (U13, multi-shot like DR3) */
+// 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
+// confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
+// (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
+// in a given outer iteration shares the SAME ecx=ebx across all 21 inner slots --
+// so observing HalpIommuInitSystem called thousands of times with an IDENTICAL
+// rcx=0x9 does NOT distinguish "stuck in one outer iteration, inner loop
+// legitimately re-reaching this slot" from "the entire HalpInitSystemHelper
+// function is being freshly re-invoked from outside, over and over, each time
+// reaching the same slot first" (H6 vs H7 in the docs). Direct discriminator:
+// breakpoint HalpInitSystemHelper's OWN entry, multi-shot. If it fires roughly
+// once per HalpIommuInitSystem call (1:1), that's H7 (repeated external
+// re-invocation). If it fires once (or a small bounded number of times) while
+// HalpIommuInitSystem keeps firing for thousands more, that's H6 (single call,
+// internal loop genuinely stuck without ever returning to re-enter this function).
+// 2026-07-19, U21: U20 established the HAL init loop is normal (identical
+// on both passes) and the watchdog "stall" is just HaliHaltSystem (the
+// post-bugcheck CPU halt). So DR1 is retargeted from the (useless-on-pass-2)
+// HalpInitSystemHelper entry to KeBugCheckEx's entry -- to catch the 0x139
+// bugcheck itself at the moment it fires: rcx=bugcheck code, rdx/r8/r9=
+// params 1-3, [rsp+0x28]=param 4, [rsp+0x00]=the caller that detected the
+// corruption (the real lead).
+#define WP_PHASE1INIT_ENTRY_RVA 0x3FD6F0 /* KeBugCheckEx entry (U21) */
+#define CRASH_STACK_SCAN_BYTES 0x400     /* deep stack walk, kept for the (now unused) crash-site slot's code path */
+#define POOL_CALLER_MAX_HITS 200
+#define HELPER_ENTRY_MAX_HITS 3000
+
+// 2026-07-18, U10: the live check above (WP_RETURN_RVA) falsified the
+// "HalInitSystem returns FALSE" hypothesis -- it never returns to its
+// caller AT ALL on pass 2. Static disassembly traced why HalpApicInitializeIoUnit
+// (the last confirmed-reached point) isn't a simple direct call:
+// HalInitSystem -> HalpInitSystemPhase0/Phase1 (a phase dispatcher, like
+// PsInitSystem/ExInitSystem) -> both call a shared HalpInitSystemHelper ->
+// which makes exactly ONE call, to `guard_dispatch_icall` (Control Flow
+// Guard's indirect-call trampoline) -- meaning this is a table-driven
+// dispatch loop (standard real-HAL architecture: one function pointer per
+// platform sub-init routine), not a direct call chain. This explains why
+// the much earlier whole-image static scan (U6's first attempt) found no
+// direct references to anything -- CFG-guarded indirect calls don't leave
+// a literal `call rel32` or matching RIP-relative load at the call site.
+// Per the standard MSVC/CFG x64 ABI, the actual target is loaded into RAX
+// immediately before `call guard_dispatch_icall`. A DEDICATED FOURTH
+// breakpoint (DR3) traces this: unlike DR0-DR2 (one-shot, disabled after
+// firing), DR3 stays armed across repeated hits within the same pass,
+// logging each dispatched target's RAX value and resolved symbol -- this
+// directly reveals which table entry runs on pass 1 that pass 2 never
+// reaches (or hangs inside).
+#define HALI_DISPATCH_CALL_RVA 0x9A188F /* HalpIommuInitSystem+0x1DF, its own `ret` (U13, EAX = real return value) */
+// First run at a cap of 40 showed the dispatch target repeating
+// IDENTICALLY (same RAX, same RSP) many times in a row before the cap
+// was hit -- resolved to real HAL subsystem initializers
+// (HalpIommuInitSystem, then HalpAcpiInitSystem), confirming this is a
+// genuine table-driven loop with a per-subsystem retry/poll pattern, not
+// a single stuck instruction. 40 wasn't enough to see either subsystem's
+// retry loop actually terminate on pass 1. Raised substantially to
+// capture full retry counts on pass 1 (establishing a normal baseline)
+// and to give pass 2 maximum room to either match that pattern or hang
+// indefinitely on one target.
+#define HALI_DISPATCH_MAX_HITS 3000
+
+// Small ring buffer of recent hypervisor-side activity (VM exits,
+// interrupt injections, device events), timestamped in milliseconds
+// since first use. Appending is just a struct write -- no I/O -- so the
+// steady-state cost is negligible; contents are only printed when the
+// breakpoint fires.
+#define BP_EVENT_RING_SIZE 128
+typedef struct {
+    double timestampMs;
+    char desc[96];
+} BpEventEntry;
+BpEventEntry g_bpEventRing[BP_EVENT_RING_SIZE];
+int g_bpEventRingPos = 0;
+int g_bpEventRingCount = 0;
+LARGE_INTEGER g_bpEventRingStart = { 0 };
+
+void logBpEvent(const char *fmt, ...) {
+    if (g_bpEventRingStart.QuadPart == 0) {
+        if (perfFrequency.QuadPart == 0) return; // not yet initialized this early
+        QueryPerformanceCounter(&g_bpEventRingStart);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    BpEventEntry *e = &g_bpEventRing[g_bpEventRingPos];
+    e->timestampMs = (double)(now.QuadPart - g_bpEventRingStart.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+    va_list args;
+    va_start(args, fmt);
+    _vsnprintf_s(e->desc, sizeof(e->desc), _TRUNCATE, fmt, args);
+    va_end(args);
+    g_bpEventRingPos = (g_bpEventRingPos + 1) % BP_EVENT_RING_SIZE;
+    if (g_bpEventRingCount < BP_EVENT_RING_SIZE) g_bpEventRingCount++;
+}
+
+void printBpEventRing(void) {
+    printf("[bp] last %d hypervisor events before the breakpoint (ms since first logged event):\n", g_bpEventRingCount);
+    int startIdx = (g_bpEventRingCount < BP_EVENT_RING_SIZE) ? 0 : g_bpEventRingPos;
+    int i;
+    for (i = 0; i < g_bpEventRingCount; i++) {
+        int idx = (startIdx + i) % BP_EVENT_RING_SIZE;
+        printf("  [%9.3f ms] %s\n", g_bpEventRing[idx].timestampMs, g_bpEventRing[idx].desc);
+    }
+    fflush(stdout);
+}
+
+// Breakpoint state. g_bpModuleBase==0 means "not yet located for the
+// current boot instance" -- cleared by the port-0x64/0xFE reset handler
+// so it's rediscovered fresh after each reset (KASLR gives ntoskrnl.exe a
+// new base every boot). Discovery is opportunistic: the main loop checks
+// on ordinary I/O port exits (cheap, frequent, already touching live
+// RIP/CR3) whether the current RIP looks like a plausible canonical
+// kernel address and, if so, tries the same backward MZ/PE scan used
+// throughout this investigation.
+UINT64 g_bpModuleBase = 0;
+UINT64 g_bpTargetVA = 0;
+UINT64 g_bpCr3 = 0; // the CR3 active when the patch was written, for correct unpatching later
+unsigned char g_bpOriginalByte = 0;
+int g_bpPatched = 0;
+int g_bpHitCount = 0;
+int g_nonBpHitCount = 0; // throttling counter for genuine unrelated INT3s hit while our interception is active
+
+// Hardware data watchpoint state (DR0/DR7) -- see the discovery block for
+// why/how this is armed. Re-armed fresh at every module rediscovery
+// (including post-reset, since the reset handler zeroes DR7).
+// g_wpTargetVA/DR2 = MmInitSystem entry (BP_FAIL_SITE_RVA), known-negative
+//   anchor from U8.
+// g_wpTargetVA0/DR0 = InitBootProcessor+0x317 (WP_RETURN_RVA), the
+//   `test al,al` right after `call HalInitSystem` -- AL here IS
+//   HalInitSystem's raw return value.
+// g_wpTargetVA1/DR1 = KeInitializeClock entry (WP_PHASE1INIT_ENTRY_RVA).
+// All three are armed together and disabled independently (one-shot each)
+// as they fire, so a single armed pass can observe all three events.
+UINT64 g_wpTargetVA = 0;
+UINT64 g_wpTargetVA0 = 0;
+UINT64 g_wpTargetVA1 = 0;
+int g_wpArmed = 0;
+int g_wpHitCount = 0;
+int g_wp0Fired = 0;
+int g_wp1Fired = 0;
+int g_wp2Fired = 0;
+
+// DR3 -- the multi-shot CFG-dispatch tracer (U10, HALI_DISPATCH_CALL_RVA).
+// Unlike DR0-DR2 above, this one is NOT one-shot: it stays armed across
+// repeated hits within the same pass (a table-driven dispatch loop calls
+// through the same site once per table entry), capped at
+// HALI_DISPATCH_MAX_HITS to bound worst-case log volume.
+UINT64 g_haliDispatchTargetVA = 0;
+int g_haliDispatchArmed = 0;
+int g_haliDispatchHitCount = 0;
+
+// DR0 (repurposed for U12) -- also multi-shot, same pattern as DR3: traces
+// every call to ExAllocatePoolWithTag (WP_RETURN_RVA) by reading the
+// guaranteed-real return address at [rsp+0x00] on each hit, capped at
+// POOL_CALLER_MAX_HITS. Uses g_wpTargetVA0 (already computed by the
+// discovery/arm block) as its target VA; this flag pair just tracks its
+// own multi-shot state separately from the one-shot g_wp0Fired semantics
+// the generic wpSlot logic used to use for this same DR slot.
+int g_poolCallerArmed = 0;
+int g_poolCallerHitCount = 0;
+
+// DR1 (repurposed for U15) -- also multi-shot, same pattern as DR0/DR3:
+// traces every entry to HalpInitSystemHelper (WP_PHASE1INIT_ENTRY_RVA) by
+// reading ecx/edx/r8 (its real arguments: outer index, outer limit, third
+// arg) on each hit, capped at HELPER_ENTRY_MAX_HITS. Discriminates H6
+// (single call, internal loop stuck) from H7 (repeated external
+// re-invocation) -- see the WP_PHASE1INIT_ENTRY_RVA comment block above.
+int g_helperEntryArmed = 0;
+int g_helperEntryHitCount = 0;
+
+// DR2 (repurposed for U18) -- multi-shot counter at HalpInitSystemHelper+0x5A
+// (the inc edi after the dispatch call). See BP_FAIL_SITE_RVA comment.
+int g_loopAdvArmed = 0;
+int g_loopAdvHitCount = 0;
+// U23c: set once the guest's mid-install reset has happened, so the hot
+// RtlpHpLfhOwnerMoveSubsegment entry check (DR2) is armed ONLY on pass 2 --
+// pass 1 then runs at full speed and only pass 2 bears the per-call overhead
+// (which balloons exitCount) up to the crash.
+int g_sawReset = 0;
+// U28: exitCount at the pass-2 reset, and whether the windowed GetSubsegment
+// capture (DR2 at RtlpHpLfhBucketGetSubsegment+0x45) has been armed yet. That
+// site is HOT, so we only arm it in a narrow window before the ~reset+120k
+// crash to bound overhead while still containing the fatal call.
+long g_resetExitCount = 0;
+int g_getsubWindowArmed = 0;
+#define GETSUB_WINDOW_START 40000L   /* arm DR2 this many exits after reset */
+// U30: chain traced up to ExAllocateHeapPool, where r10 = *(*(rsp+0x58)) is a
+// null LFH heap-context. Breakpoint just after that load (0x236C58); when r10
+// (the context) is null, capture ptrB=[rsp+0x58] (what structure holds the null
+// context pointer) + dump around it -- identifies the true root datum.
+#define GETSUB_RVA 0x236C58          /* ExAllocateHeapPool, after r10=*(*(rsp+0x58)) */
+
+void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
+int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
+
+// WHV rejects injecting a pending interruption while the guest has
+// interrupts masked (EFLAGS.IF=0) -- that produces an
+// InvalidVpRegisterValue exit on the next run. A real PIC would latch
+// the IRQ request until the CPU unmasks interrupts; we do the same
+// with a single-slot flag that the main loop drains once IF=1 (see
+// deliverPendingAtaIrq, called every iteration).
+int pendingAtaIrq = 0;
+
+void ataMaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
+    if (guestInterruptsEnabled(partition)) {
+        injectInterrupt(partition, 0x76);
+    } else {
+        pendingAtaIrq = 1;
+    }
+}
+
+void deliverPendingAtaIrq(WHV_PARTITION_HANDLE partition) {
+    if (pendingAtaIrq && guestInterruptsEnabled(partition)) {
+        injectInterrupt(partition, 0x76);
+        pendingAtaIrq = 0;
+    }
+}
+
+// --- PIT (8253/8254) channel 2 one-shot emulation ---
+// SeaBIOS calibrates the TSC by programming channel 2 with a count via
+// ports 0x43/0x42, enabling the gate via port 0x61 bit0, then polling
+// port 0x61 bit5 (the channel-2 output) until it goes high -- which real
+// hardware does once the programmed count of 1.193182MHz ticks has
+// elapsed. We fake that countdown using wall-clock time instead of an
+// actual clock divider.
+#define PIT_HZ 1193182.0
+unsigned char port61Gate = 0;      // last-written bit0 (gate2)
+unsigned char port61SpeakerData = 0; // last-written bit1 (speaker data)
+
+// Port 0x92 (PS/2 System Control Port A): bit1 is the "fast" A20 gate,
+// bit0 is "Alternate Hot Reset" -- writing 1 there triggers a real CPU
+// reset on actual hardware. BIOS code uses this (and the equivalent
+// keyboard-controller reset command) to bounce from protected mode back
+// to real mode. We only track the non-reset bits for readback.
+unsigned char port92Value = 0x02;
+
+// --- A20 gate emulation ---
+// BIOS POST tests the A20 gate by writing to the classic 0x100000-0x10FFFF
+// "HMA" window and checking whether it aliases back to 0x0-0xFFFF (gate
+// disabled, real 8086-style 20-bit wraparound) or is genuinely distinct
+// memory (gate enabled). We don't have a real address-line to toggle, so we
+// fake the same observable behavior by remapping that GPA window to either
+// the same host memory as low RAM (aliased/wrapped) or its own dedicated
+// buffer (not aliased), whichever the gate state currently implies.
+#define A20_WINDOW_BASE 0x100000
+#define A20_WINDOW_SIZE 0x10000
+void *guestMemory = NULL;  // low 1MB, also backs the A20-disabled alias
+SIZE_T guestMemSize = 0;   // set once in main(); global so device emulation
+                           // code (e.g. AHCI command processing) outside
+                           // main() can bounds-check guest-memory pointers
+void *hmaMemory = NULL;    // dedicated backing for the A20-enabled window
+int a20Enabled = 0;        // matches real hardware's power-on default (off)
+
+int a20RemapCount = 0;
+int memAccessFaultCount = 0;
+int ahciCmdLogCount = 0;
+
+// "etc/ramfb" state (see the fw_cfg section below for how these get
+// populated) -- declared up here, ahead of WndProc, so the paint handler
+// can use them directly.
+int ramfbConfigWritten = 0; // becomes true once all 28 bytes have been written at least once
+UINT64 ramfbAddress = 0;
+UINT32 ramfbWidth = 0, ramfbHeight = 0, ramfbStride = 0;
+
+// --- UEFI (OVMF) boot support ---
+// UEFI firmware wants to sit at the very top of a real 4GB address space
+// (see the reset-vector setup in main()), not squeezed into the legacy
+// sub-1MB BIOS area, so it needs a much larger flat guest RAM region than
+// the legacy 1MB path uses.
+//
+// Capped at 3GB (0xC0000000), not 4GB: firmware is mapped at the literal
+// top of the 32-bit space (see fwBase in main()), and real PC platforms
+// leave a "PCI hole" below 4GB for MMIO (PCI BARs, LAPIC, IOAPIC, HPET,
+// firmware) rather than backing that whole range with RAM -- our AHCI
+// ABAR and the firmware image itself both live in that gap. Going toward
+// Windows boot support, which wants 4GB+ total, needs a *second*,
+// separate high-memory region mapped above 4GB rather than just growing
+// this one past the hole.
+#define UEFI_GUEST_RAM_SIZE (3072ULL * 1024 * 1024)
+void *uefiFirmwareMemory = NULL;   // backing for the mapped-at-top-of-4GB firmware image
+
+// --- Minimal PCI host-bridge stub ---
+// OVMF's PlatformPei reads PCI config space (bus 0/device 0/function 0)
+// very early to tell an i440fx platform apart from Q35 and pick the right
+// register layout. We don't emulate a real PCI bus -- just enough of the
+// CONFIG_ADDRESS/CONFIG_DATA mechanism (ports 0xCF8/0xCFC) to answer that
+// one probe as an i440fx host bridge (vendor 0x8086, device 0x1237) and
+// report every other bus/device/function as absent (0xFFFFFFFF), matching
+// real unpopulated PCI slots. See pciHandleConfigAccess.
+UINT32 pciConfigAddress = 0;
+
+// --- Minimal 16550 UART emulation (COM1, ports 0x3F8-0x3FF) ---
+// Real UEFI console/terminal drivers (unlike the raw QEMU debugcon sink at
+// port 0x402, which just accepts bytes unconditionally) speak the actual
+// 16550 protocol: before writing to the transmit register (0x3F8), they
+// poll the Line Status Register (0x3FD) for the "transmitter holding
+// register empty" bit. Previously 0x3F8 was handled identically to 0x402
+// (a bare byte sink) with no LSR/other-register support at all -- with no
+// real UART behind it, always reporting "ready" is the simplest correct
+// answer, so writes never block. Received data is always "none available"
+// since nothing feeds real serial input in; this is output-only. See
+// uartHandleAccess.
+unsigned char uartIer = 0, uartLcr = 0, uartMcr = 0, uartScr = 0;
+unsigned char uartDivisorLow = 0, uartDivisorHigh = 0;
+
+// --- Second 16550 UART (COM2, ports 0x2F8-0x2FF), bridged to a Windows
+// named pipe instead of our text log -- deliberately a separate port range
+// from COM1 (which carries OVMF's own DEBUG() log output) so a real kernel
+// debugger's binary KD protocol never shares a wire with human-readable
+// ASCII log text. WinDbg attaches via `-k com:pipe,port=\\.\pipe\LocalHostKD,
+// resets=0,reconnect`, and the guest is pointed at it with
+// `bcdedit /set {bootmgr} bootdebug on` + `bcdedit /dbgsettings serial
+// debugport:2 baudrate:115200` against the offline BCD store.
+unsigned char uart2Ier = 0, uart2Lcr = 0, uart2Mcr = 0, uart2Scr = 0;
+unsigned char uart2FifoEnabled = 0;
+unsigned char uart2DivisorLow = 0, uart2DivisorHigh = 0;
+HANDLE kdPipe = INVALID_HANDLE_VALUE;
+CRITICAL_SECTION kdRxLock;
+unsigned char kdRxBuf[4096];
+volatile int kdRxHead = 0, kdRxTail = 0; // ring buffer: pipe reader thread -> guest RBR reads
+CRITICAL_SECTION kdTxLock;
+HANDLE kdTxEvent = NULL; // signaled whenever the writer thread should wake up and drain kdTxBuf
+unsigned char kdTxBuf[4096];
+volatile int kdTxHead = 0, kdTxTail = 0; // ring buffer: guest THR writes -> pipe writer thread
+volatile int kdClientConnected = 0; // set by the reader thread once WinDbg attaches
+
+// --- EFI runtime instrumentation ---
+// Inline hooks on bootmgfw.efi's own EfiOpenProtocol/EfiLocateHandleBuffer
+// wrapper functions (RVAs found via real PDB symbols, see the scratchpad
+// disassembly work), installed by patching their machine code directly in
+// guest memory once bootmgfw's runtime load base is located (same
+// memory-scan-for-a-known-string technique used for the earlier, abandoned
+// KD attempt -- minus the hardware-breakpoint piece, which WHV silently
+// failed to intercept). Traps through port 0xE2 -- the same "OUT triggers a
+// VM exit, host reads full register state" mechanism already proven
+// reliable everywhere else in this hypervisor -- rather than #DB/#BP
+// exceptions, which are NOT intercepted by WHV in this environment
+// (confirmed empirically: the guest's own exception handler caught them
+// instead of us, crashing OVMF).
+int efiHooksInstalled = 0;
+int efiHookScanAttempted = 0;
+UINT64 efiHookLoadBase = 0;
+UINT64 efiHookScratchBase = 0; // guest GPA where trampoline code lives
+UINT64 efiHookOpenProtoOrigAddr = 0;
+UINT64 efiHookLocateHandleBufOrigAddr = 0;
+UINT64 efiHookOpenProtoPreAddr = 0, efiHookOpenProtoPostAddr = 0;
+UINT64 efiHookLHBPreAddr = 0, efiHookLHBPostAddr = 0;
+
+// State captured at each hook's pre-call VM exit, read back at the
+// corresponding post-call VM exit to correlate request and result (safe as
+// a single global scratch slot since bootmgfw runs single-threaded/
+// cooperatively on our one vCPU -- calls are properly nested, not
+// concurrent).
+UINT64 efiHookLastInterfaceOutAddr = 0;
+int efiHookLastIsBlockIo = 0;
+UINT64 efiHookLastNoHandlesOutAddr = 0;
+
+// Real, standard UEFI spec GUIDs (bytes_le), confirmed against bootmgfw.efi's
+// own embedded copies during static analysis (RVA 0xD528/0xD348) rather than
+// assumed from memory.
+const unsigned char efiBlockIoProtocolGuid[16] = {
+    0x21,0x5B,0x4E,0x96, 0x59,0x64, 0x11,0xD2, 0x8E,0x39, 0x00,0xA0,0xC9,0x69,0x72,0x3B
+};
+const unsigned char efiDevicePathProtocolGuid[16] = {
+    0x91,0x6E,0x57,0x09, 0x3F,0x6D, 0x11,0xD2, 0x8E,0x39, 0x00,0xA0,0xC9,0x69,0x72,0x3B
+};
+
+#define EFI_HOOK_NEEDLE_RVA 0x70B0
+#define EFI_HOOK_OPENPROTO_RVA 0x58324
+#define EFI_HOOK_LHB_RVA 0x58194
+
+const unsigned char efiHookNeedle[] = {
+    'B',0,'l',0,'I',0,'n',0,'i',0,'t',0,'i',0,'a',0,'l',0,'i',0,'z',0,
+    'e',0,'L',0,'i',0,'b',0,'r',0,'a',0,'r',0,'y',0,' ',0,'f',0,'a',0,
+    'i',0,'l',0,'e',0,'d',0
+};
+
+void efiHookWriteJmp(unsigned char *at, UINT64 fromAddr, UINT64 toAddr) {
+    at[0] = 0xE9;
+    INT32 rel = (INT32)(toAddr - (fromAddr + 5));
+    memcpy(at + 1, &rel, 4);
+}
+
+// --- TEMP DIAGNOSTIC: identify which routine is hammering the CMOS RTC
+// ports after BlpTimeInitialize succeeds. The RTC-validity fix (see
+// cmosReadRtcField) resolved the original hard failure, but boot now
+// crawls through extremely heavy, slow CMOS polling afterward -- a
+// separate issue. This captures RIP (resolved to an RVA within
+// bootmgfw.efi once we know its runtime load base, via the same PDB
+// symbol table used to find BlpTimeInitialize) and the guest's current TSC
+// value on a bounded number of CMOS accesses, cheaply: one one-shot memory
+// scan for the load base (not repeated -- retries shouldn't recur now that
+// the original failure is fixed), then only register reads already free
+// at the existing CMOS port trap. No inline code patching this time.
+int rtcDiagLoadBaseKnown = 0;
+UINT64 rtcDiagLoadBase = 0;
+int rtcDiagLogCount = 0;
+
+void rtcDiagTryFindLoadBase(void) {
+    if (rtcDiagLoadBaseKnown || !guestMemory) return;
+    unsigned char *mem = (unsigned char *)guestMemory;
+    UINT64 needleLen = sizeof(efiHookNeedle);
+    UINT64 i, limit = guestMemSize > needleLen ? guestMemSize - needleLen : 0;
+    for (i = 0; i < limit; i++) {
+        if (mem[i] == efiHookNeedle[0] && memcmp(mem + i, efiHookNeedle, needleLen) == 0) {
+            rtcDiagLoadBase = i - EFI_HOOK_NEEDLE_RVA;
+            rtcDiagLoadBaseKnown = 1;
+            printf("[rtcdiag] bootmgfw.efi load base=0x%llX\n", (unsigned long long)rtcDiagLoadBase);
+            fflush(stdout);
+            return;
+        }
+    }
+}
+
+// TEMP DIAGNOSTIC: RIP at the CMOS trap turned out to be outside
+// bootmgfw.efi's range entirely (a huge, nonsensical RVA), meaning some
+// OTHER module -- almost certainly the next-stage loader, given AHCI disk
+// activity resumed right around the same point -- owns this code. Rather
+// than guessing which file to extract and symbolicate, find the owning
+// module directly in guest memory: scan backward from RIP for its PE
+// header (MZ + "PE\0\0"), then read that module's own embedded RSDS debug
+// directory entry (PDB filename) the same way pefile did for bootmgfw.efi,
+// just done manually here since this is live guest memory, not a file on
+// disk.
+int rtcDiagModuleIdentified = 0;
+
+void rtcDiagIdentifyModule(unsigned char *guestMem, UINT64 rip) {
+    if (rtcDiagModuleIdentified) return;
+    UINT64 scanStart = (rip > 0x2000000) ? rip - 0x2000000 : 0; // search up to 32MB back
+    UINT64 addr;
+    for (addr = (rip & ~0xFFFULL); addr + 0x400 < guestMemSize && addr >= scanStart; addr -= 0x1000) {
+        if (guestMem[addr] == 'M' && guestMem[addr + 1] == 'Z') {
+            UINT32 peOff = *(UINT32 *)(guestMem + addr + 0x3C);
+            if (addr + peOff + 4 < guestMemSize &&
+                guestMem[addr + peOff] == 'P' && guestMem[addr + peOff + 1] == 'E' &&
+                guestMem[addr + peOff + 2] == 0 && guestMem[addr + peOff + 3] == 0) {
+                printf("[rtcdiag] found PE header for owning module at guest addr 0x%llX (rip was 0x%llX, +0x%llX into it)\n",
+                       (unsigned long long)addr, (unsigned long long)rip, (unsigned long long)(rip - addr));
+                fflush(stdout);
+                // Properly parse the PE32+ Optional Header's Data Directory
+                // (a brute-force scan for the "RSDS" signature anywhere in
+                // the image hit a false positive in code bytes first try).
+                // DataDirectory starts at (PE sig)+4 + (FileHeader)20 + 112
+                // = peOff+136; entry 6 (IMAGE_DIRECTORY_ENTRY_DEBUG) is 8
+                // bytes at peOff+136+6*8 = peOff+184: {RVA(4), Size(4)}.
+                UINT32 debugDirRva = *(UINT32 *)(guestMem + addr + peOff + 184);
+                if (debugDirRva == 0 || addr + debugDirRva + 28 >= guestMemSize) {
+                    printf("[rtcdiag] no debug directory RVA in this module's PE header\n");
+                    fflush(stdout);
+                    rtcDiagModuleIdentified = 1;
+                    return;
+                }
+                // IMAGE_DEBUG_DIRECTORY: ... Type(4)@0xC, SizeOfData(4)@0x10, AddressOfRawData(4)@0x14
+                unsigned char *dbgDir = guestMem + addr + debugDirRva;
+                UINT32 dbgType = *(UINT32 *)(dbgDir + 0xC);
+                UINT32 cvRva = *(UINT32 *)(dbgDir + 0x14);
+                printf("[rtcdiag] debug directory: type=%u codeViewRva=0x%X\n", dbgType, cvRva);
+                if (dbgType == 2 /* IMAGE_DEBUG_TYPE_CODEVIEW */ && cvRva != 0 && addr + cvRva + 24 < guestMemSize) {
+                    unsigned char *cv = guestMem + addr + cvRva;
+                    if (cv[0] == 'R' && cv[1] == 'S' && cv[2] == 'D' && cv[3] == 'S') {
+                        char pdbName[128] = { 0 };
+                        UINT64 nameOff = addr + cvRva + 4 + 16 + 4; // past signature, GUID, age
+                        size_t k;
+                        for (k = 0; k < sizeof(pdbName) - 1 && nameOff + k < guestMemSize; k++) {
+                            char c = (char)guestMem[nameOff + k];
+                            if (c == 0) break;
+                            pdbName[k] = c;
+                        }
+                        printf("[rtcdiag] module PDB name: %s\n", pdbName);
+                    } else {
+                        printf("[rtcdiag] CodeView record doesn't start with RSDS (got %02X %02X %02X %02X)\n",
+                               cv[0], cv[1], cv[2], cv[3]);
+                    }
+                }
+                fflush(stdout);
+                rtcDiagModuleIdentified = 1;
+                return;
+            }
+        }
+        if (addr < 0x1000) break;
+    }
+    printf("[rtcdiag] no PE header found scanning back from rip=0x%llX\n", (unsigned long long)rip);
+    fflush(stdout);
+    rtcDiagModuleIdentified = 1;
+}
+
+void rtcDiagLogAccess(WHV_PARTITION_HANDLE partition, UINT64 rip, unsigned char reg, int isWrite) {
+    if (rtcDiagLogCount >= 80) return;
+    rtcDiagLogCount++;
+    if (rtcDiagLogCount == 1 && guestMemory) {
+        rtcDiagIdentifyModule((unsigned char *)guestMemory, rip);
+    }
+    // TEMP DIAGNOSTIC: RIP alone only shows OVMF's own PcRtc driver code
+    // (confirmed by its register-access sequence matching PcRtcGetTime()'s
+    // real read order exactly), never the caller repeatedly invoking it --
+    // dump the stack once to find a plausible return address instead.
+    if (rtcDiagLogCount == 3 && guestMemory) {
+        WHV_REGISTER_NAME rspName = WHvX64RegisterRsp;
+        WHV_REGISTER_VALUE rspVal = { 0 };
+        WHvGetVirtualProcessorRegisters(partition, 0, &rspName, 1, &rspVal);
+        UINT64 rsp = rspVal.Reg64;
+        unsigned char *mem = (unsigned char *)guestMemory;
+        printf("[rtcdiag] stack dump at rsp=0x%llX (showing PcRtc-range hits + last one before each):\n", (unsigned long long)rsp);
+        int i;
+        int prevWasPcRtc = 0;
+        for (i = 0; i < 800; i++) {
+            UINT64 addr = rsp + (UINT64)i * 8;
+            if (addr + 8 >= guestMemSize) break;
+            UINT64 val = *(UINT64 *)(mem + addr);
+            int looksLikePcRtcAddr = (val >= 0xBFD67000ULL && val < 0xBFD70000ULL);
+            if (looksLikePcRtcAddr || (prevWasPcRtc && !looksLikePcRtcAddr)) {
+                printf("[rtcdiag]   [rsp+0x%03X] = 0x%016llX%s\n", i * 8, (unsigned long long)val,
+                       looksLikePcRtcAddr ? " (in PcRtc module)" : "  <-- first non-PcRtc after a PcRtc hit");
+            }
+            prevWasPcRtc = looksLikePcRtcAddr;
+        }
+        fflush(stdout);
+    }
+    WHV_REGISTER_NAME tscName = WHvX64RegisterTsc;
+    WHV_REGISTER_VALUE tscVal = { 0 };
+    WHvGetVirtualProcessorRegisters(partition, 0, &tscName, 1, &tscVal);
+    UINT64 rva = rtcDiagLoadBaseKnown ? (rip - rtcDiagLoadBase) : 0;
+    printf("[rtcdiag] #%d rip=0x%llX rva=0x%llX reg=0x%02X %s tsc=%llu\n",
+           rtcDiagLogCount, (unsigned long long)rip, (unsigned long long)rva, reg,
+           isWrite ? "write" : "read", (unsigned long long)tscVal.Reg64);
+    fflush(stdout);
+}
+
+// TEMP DIAGNOSTIC: the OpenProtocol/LocateHandleBuffer hooks below never
+// fired in testing -- both installed successfully but the guest reached its
+// "give up, show boot menu" fallback without ever hitting them, meaning the
+// real failure happens *before* BlpIoInitialize (which is what calls down
+// into the OpenProtocol/LocateHandleBuffer chain) even runs. These
+// checkpoints watch every `test eax,eax` that immediately follows each of
+// InitializeLibrary's other early-init calls (BlpFwInitialize,
+// BlpArchInitialize, BlpMmInitialize, BlpTimeInitialize), all confirmed via
+// the same PDB-symbol-verified disassembly as the rest of this call graph,
+// to find exactly which one first returns a negative (error) EAX -- none of
+// them need fresh disk I/O either, consistent with the "zero new AHCI
+// commands before the failure" constraint established earlier.
+typedef struct { UINT32 rva; const char *label; } EfiCheckpoint;
+EfiCheckpoint efiCheckpoints[] = {
+    { 0x19F046, "after BlpFwInitialize(1st)" },
+    { 0x19F151, "after BlpArchInitialize(1st)" },
+    { 0x19F169, "after BlpMmInitialize" },
+    { 0x19F1FA, "after BlpFwInitialize(2nd)" },
+    { 0x19F209, "after BlpTimeInitialize" },
+    { 0x19F21B, "after BlpArchInitialize(2nd)" },
+    { 0x19F325, "after BlpIoInitialize" },
+};
+#define EFI_CHECKPOINT_COUNT (sizeof(efiCheckpoints) / sizeof(efiCheckpoints[0]))
+// Multiple copies of bootmgfw.efi can be resident in guest memory at once
+// (confirmed empirically: 3 simultaneous matches found for the same needle
+// string, roughly one image-size apart -- almost certainly BDS loading
+// several candidate boot files, e.g. root \bootmgfw.efi, \EFI\BOOT\
+// BOOTX64.EFI, and \EFI\Microsoft\Boot\bootmgfw.efi, to validate them
+// during boot-option discovery, even though only one is ever actually
+// executed). Patching only the first-found copy meant our hooks sat on a
+// copy that was never the one actually running, and never fired.
+#define EFI_HOOK_MAX_COPIES 8
+int efiHookCopyCount = 0;
+UINT64 efiCheckpointHookAddr[EFI_HOOK_MAX_COPIES][EFI_CHECKPOINT_COUNT];   // origAddr -- what the port handler matches RIP against
+UINT64 efiCheckpointResumeAddr[EFI_HOOK_MAX_COPIES][EFI_CHECKPOINT_COUNT]; // trampoline address to resume at instead of origAddr+2
+
+void efiHookWriteCall(unsigned char *at, UINT64 fromAddr, UINT64 toAddr) {
+    at[0] = 0xE8;
+    INT32 rel = (INT32)(toAddr - (fromAddr + 5));
+    memcpy(at + 1, &rel, 4);
+}
+
+// Scans guest RAM once for a string known (from static analysis of the
+// extracted bootmgfw.efi) to live at a fixed offset from that image's own
+// load base -- string bytes are never relocated, only pointers to them are
+// -- then patches EfiOpenProtocol/EfiLocateHandleBuffer's entry points to
+// jump into trampolines that log via port 0xE2 before/after calling the
+// real, relocated original code.
+void tryInstallEfiHooks(void) {
+    if (!guestMemory) return;
+    unsigned char *mem = (unsigned char *)guestMemory;
+    UINT64 needleLen = sizeof(efiHookNeedle);
+    UINT64 i, limit = guestMemSize > needleLen ? guestMemSize - needleLen : 0;
+    UINT64 loadBases[EFI_HOOK_MAX_COPIES];
+    int matchCount = 0;
+    for (i = 0; i < limit && matchCount < EFI_HOOK_MAX_COPIES; i++) {
+        if (mem[i] == efiHookNeedle[0] && memcmp(mem + i, efiHookNeedle, needleLen) == 0) {
+            loadBases[matchCount] = i - EFI_HOOK_NEEDLE_RVA;
+            printf("[efihook] copy #%d: needle at 0x%llX -> loadBase=0x%llX\n",
+                   matchCount + 1, (unsigned long long)i, (unsigned long long)loadBases[matchCount]);
+            matchCount++;
+        }
+    }
+    fflush(stdout);
+    if (matchCount == 0) {
+        printf("[efihook] bootmgfw.efi load base not found in guest memory\n");
+        fflush(stdout);
+        return;
+    }
+    efiHookCopyCount = matchCount;
+    efiHookLoadBase = loadBases[0]; // kept for the (currently disabled) single-copy OpenProtocol/LHB hooks below
+
+    efiHookOpenProtoOrigAddr = efiHookLoadBase + EFI_HOOK_OPENPROTO_RVA;
+    efiHookLocateHandleBufOrigAddr = efiHookLoadBase + EFI_HOOK_LHB_RVA;
+    // Scratch region for trampoline code. NOTE: guestMemSize-0x2000 (right at
+    // the very top of guest RAM) was tried first and crashed OVMF -- a crash
+    // dump showed the GDT at 0xBFD50000 and a live stack around 0xBBE1xxxx,
+    // both within a few hundred KB of that address, meaning firmware/boot
+    // manager actively uses the top of RAM for these structures and our
+    // write smashed one of them. 0x08000000 (128MB) is far from both that
+    // high-memory working set and the low-1MB legacy area.
+    efiHookScratchBase = 0x08000000;
+
+#if 0 // TEMP DIAGNOSTIC: disabled to isolate whether these hooks interfere
+      // with the checkpoint hooks below -- neither ever fired with both
+      // installed, so testing the checkpoints alone first.
+    UINT64 openProtoStub = efiHookScratchBase + 0x000;
+    efiHookOpenProtoPreAddr = efiHookScratchBase + 0x020;
+    UINT64 openProtoCallSite = efiHookOpenProtoPreAddr + 2; // right after the pre "out"
+    efiHookOpenProtoPostAddr = openProtoCallSite + 5;        // right after "call stub"
+
+    UINT64 lhbStub = efiHookScratchBase + 0x040;
+    efiHookLHBPreAddr = efiHookScratchBase + 0x060;
+    UINT64 lhbCallSite = efiHookLHBPreAddr + 2;
+    efiHookLHBPostAddr = lhbCallSite + 5;
+
+    // --- OpenProtocol prologue stub: relocated original 5 bytes (a single
+    // "mov [rsp+8], rbx" instruction, confirmed via disassembly) + jmp back
+    // into the real function body right after that instruction. ---
+    unsigned char stubBuf[16] = { 0 };
+    memcpy(stubBuf, mem + efiHookOpenProtoOrigAddr, 5);
+    efiHookWriteJmp(stubBuf + 5, openProtoStub + 5, efiHookOpenProtoOrigAddr + 5);
+    memcpy(mem + openProtoStub, stubBuf, 10);
+
+    // --- OpenProtocol trampoline: out (pre-log); call stub; out (post-log); ret ---
+    unsigned char tramp[16] = { 0 };
+    tramp[0] = 0xE6; tramp[1] = 0xE2; // out 0xE2, al
+    efiHookWriteCall(tramp + 2, efiHookOpenProtoPreAddr + 2, openProtoStub);
+    tramp[7] = 0xE6; tramp[8] = 0xE2;
+    tramp[9] = 0xC3; // ret
+    memcpy(mem + efiHookOpenProtoPreAddr, tramp, 10);
+
+    // --- patch the real OpenProtocol entry to jump into our trampoline ---
+    unsigned char patch[8] = { 0 };
+    efiHookWriteJmp(patch, efiHookOpenProtoOrigAddr, efiHookOpenProtoPreAddr);
+    memcpy(mem + efiHookOpenProtoOrigAddr, patch, 5);
+
+    // --- LocateHandleBuffer prologue stub: relocated original 7 bytes
+    // ("mov rax,rsp" + "mov [rax+8],rbx", confirmed via disassembly) + jmp back. ---
+    unsigned char stubBuf2[20] = { 0 };
+    memcpy(stubBuf2, mem + efiHookLocateHandleBufOrigAddr, 7);
+    efiHookWriteJmp(stubBuf2 + 7, lhbStub + 7, efiHookLocateHandleBufOrigAddr + 7);
+    memcpy(mem + lhbStub, stubBuf2, 12);
+
+    // --- LocateHandleBuffer trampoline ---
+    unsigned char tramp2[16] = { 0 };
+    tramp2[0] = 0xE6; tramp2[1] = 0xE2;
+    efiHookWriteCall(tramp2 + 2, efiHookLHBPreAddr + 2, lhbStub);
+    tramp2[7] = 0xE6; tramp2[8] = 0xE2;
+    tramp2[9] = 0xC3;
+    memcpy(mem + efiHookLHBPreAddr, tramp2, 10);
+
+    // --- patch the real LocateHandleBuffer entry (7 bytes: 5-byte jmp + 2 NOPs) ---
+    unsigned char patch2[8] = { 0 };
+    efiHookWriteJmp(patch2, efiHookLocateHandleBufOrigAddr, efiHookLHBPreAddr);
+    patch2[5] = 0x90; patch2[6] = 0x90;
+    memcpy(mem + efiHookLocateHandleBufOrigAddr, patch2, 7);
+#endif
+
+    // --- checkpoint hooks: in-place 2-byte "test eax,eax" -> "out 0xE2,al"
+    // swap (same size, no relocation needed for the 2-byte patch site
+    // itself -- there isn't room there for a 5-byte jmp rel32). The host
+    // port handler recognizes origAddr directly (that's the only guest
+    // code that actually executes and traps), logs EAX, then resumes
+    // execution *at the trampoline* (not origAddr+2) so the relocated
+    // test+jmp-back runs and the real conditional branch that follows
+    // still sees correct flags. Installed identically across every
+    // discovered copy of bootmgfw.efi, since only one is ever actually
+    // executed but we don't know which in advance. ---
+    for (int copyIdx = 0; copyIdx < efiHookCopyCount; copyIdx++) {
+        for (size_t ci = 0; ci < EFI_CHECKPOINT_COUNT; ci++) {
+            UINT64 origAddr = loadBases[copyIdx] + efiCheckpoints[ci].rva;
+            UINT64 tramp3Addr = efiHookScratchBase + 0x100 + (copyIdx * EFI_CHECKPOINT_COUNT + ci) * 0x20;
+            efiCheckpointHookAddr[copyIdx][ci] = origAddr;
+            efiCheckpointResumeAddr[copyIdx][ci] = tramp3Addr;
+
+            unsigned char tramp3[16] = { 0 };
+            memcpy(tramp3, mem + origAddr, 2);                          // relocated "test eax,eax"
+            efiHookWriteJmp(tramp3 + 2, tramp3Addr + 2, origAddr + 2);  // jmp back
+            memcpy(mem + tramp3Addr, tramp3, 7);
+
+            unsigned char cpPatch[2] = { 0xE6, 0xE2 }; // out 0xE2, al (in place, same size)
+            memcpy(mem + origAddr, cpPatch, 2);
+        }
+    }
+
+    efiHooksInstalled = 1;
+    printf("[efihook] installed checkpoint hooks across %d copies, scratch=0x%llX\n",
+           efiHookCopyCount, (unsigned long long)efiHookScratchBase);
+    fflush(stdout);
+}
+
+void efiHookFormatGuid(unsigned char *guestMem, UINT64 addr, char *outBuf, size_t outBufSize) {
+    if (addr == 0 || addr + 16 > guestMemSize) { _snprintf_s(outBuf, outBufSize, _TRUNCATE, "(null)"); return; }
+    unsigned char *g = guestMem + addr;
+    _snprintf_s(outBuf, outBufSize, _TRUNCATE,
+                "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6],
+                g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+}
+
+void efiHookLogBlockIoMedia(unsigned char *guestMem, UINT64 interfacePtr) {
+    if (interfacePtr == 0 || interfacePtr + 0x20 > guestMemSize) {
+        printf("[efihook]   (interface ptr null/out-of-range: 0x%llX)\n", (unsigned long long)interfacePtr);
+        return;
+    }
+    UINT64 mediaPtr = *(UINT64 *)(guestMem + interfacePtr + 8); // EFI_BLOCK_IO_PROTOCOL->Media
+    if (mediaPtr == 0 || mediaPtr + 0x20 > guestMemSize) {
+        printf("[efihook]   Media ptr null/out-of-range: 0x%llX\n", (unsigned long long)mediaPtr);
+        return;
+    }
+    unsigned char *m = guestMem + mediaPtr;
+    UINT32 mediaId = *(UINT32 *)(m + 0);
+    unsigned char removable = m[4], present = m[5], logicalPartition = m[6], readOnly = m[7];
+    UINT32 blockSize = *(UINT32 *)(m + 0xC);
+    UINT64 lastBlock = *(UINT64 *)(m + 0x18);
+    printf("[efihook]   Media@0x%llX: MediaId=0x%X Removable=%d Present=%d LogicalPartition=%d ReadOnly=%d BlockSize=%u LastBlock=%llu\n",
+           (unsigned long long)mediaPtr, mediaId, removable, present, logicalPartition, readOnly,
+           blockSize, (unsigned long long)lastBlock);
+    fflush(stdout);
+}
+
+void efiHookHandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    UINT64 rip = exitContext->VpContext.Rip;
+    unsigned char *mem = (unsigned char *)guestMemory;
+
+    WHV_REGISTER_NAME regNames[6] = { WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterR8,
+                                       WHvX64RegisterR9, WHvX64RegisterRax, WHvX64RegisterRsp };
+    WHV_REGISTER_VALUE regVals[6] = { 0 };
+    WHvGetVirtualProcessorRegisters(partition, 0, regNames, 6, regVals);
+    UINT64 rcx = regVals[0].Reg64, rdx = regVals[1].Reg64, r8 = regVals[2].Reg64,
+           r9 = regVals[3].Reg64, rax = regVals[4].Reg64, rsp = regVals[5].Reg64;
+
+    static int logCount = 0;
+    int shouldLog = (logCount < 500);
+
+    if (rip == efiHookOpenProtoPreAddr) {
+        efiHookLastInterfaceOutAddr = r8;
+        char guidStr[40];
+        efiHookFormatGuid(mem, rdx, guidStr, sizeof(guidStr));
+        efiHookLastIsBlockIo = (rdx + 16 <= guestMemSize && memcmp(mem + rdx, efiBlockIoProtocolGuid, 16) == 0);
+        int isDevicePath = (rdx + 16 <= guestMemSize && memcmp(mem + rdx, efiDevicePathProtocolGuid, 16) == 0);
+        if (shouldLog) {
+            logCount++;
+            printf("[efihook] #%d OpenProtocol(Handle=0x%llX, Protocol=%s%s%s, InterfaceOut=0x%llX, Agent=0x%llX)\n",
+                   logCount, (unsigned long long)rcx, guidStr,
+                   efiHookLastIsBlockIo ? " [BlockIo]" : "", isDevicePath ? " [DevicePath]" : "",
+                   (unsigned long long)r8, (unsigned long long)r9);
+            fflush(stdout);
+        }
+    } else if (rip == efiHookOpenProtoPostAddr) {
+        if (shouldLog) {
+            printf("[efihook]   -> status=0x%llX%s\n", (unsigned long long)rax,
+                   rax == 0 ? " (SUCCESS)" : (rax == 0x8000000000000007ULL ? " (EFI_DEVICE_ERROR !!!)" : ""));
+            if (rax == 0 && efiHookLastIsBlockIo && efiHookLastInterfaceOutAddr + 8 <= guestMemSize) {
+                UINT64 ifacePtr = *(UINT64 *)(mem + efiHookLastInterfaceOutAddr);
+                printf("[efihook]   Interface=0x%llX\n", (unsigned long long)ifacePtr);
+                efiHookLogBlockIoMedia(mem, ifacePtr);
+            }
+            fflush(stdout);
+        }
+    } else if (rip == efiHookLHBPreAddr) {
+        efiHookLastNoHandlesOutAddr = r9;
+        char guidStr[40];
+        efiHookFormatGuid(mem, rdx, guidStr, sizeof(guidStr));
+        int isBlockIo = (rdx + 16 <= guestMemSize && memcmp(mem + rdx, efiBlockIoProtocolGuid, 16) == 0);
+        if (shouldLog) {
+            logCount++;
+            printf("[efihook] #%d LocateHandleBuffer(SearchType=%llu, Protocol=%s%s, SearchKey=0x%llX)\n",
+                   logCount, (unsigned long long)rcx, guidStr, isBlockIo ? " [BlockIo]" : "",
+                   (unsigned long long)r8);
+            fflush(stdout);
+        }
+    } else if (rip == efiHookLHBPostAddr) {
+        if (shouldLog) {
+            UINT64 noHandles = (efiHookLastNoHandlesOutAddr + 8 <= guestMemSize)
+                                    ? *(UINT64 *)(mem + efiHookLastNoHandlesOutAddr) : 0;
+            printf("[efihook]   -> status=0x%llX%s NoHandles=%llu\n", (unsigned long long)rax,
+                   rax == 0 ? " (SUCCESS)" : (rax == 0x8000000000000007ULL ? " (EFI_DEVICE_ERROR !!!)" : ""),
+                   (unsigned long long)noHandles);
+            fflush(stdout);
+        }
+    }
+
+    UINT64 resumeAt = rip + exitContext->VpContext.InstructionLength; // default: advance past the 2-byte "out"
+    for (int copyIdx = 0; copyIdx < efiHookCopyCount; copyIdx++) {
+        for (size_t ci = 0; ci < EFI_CHECKPOINT_COUNT; ci++) {
+            if (rip == efiCheckpointHookAddr[copyIdx][ci]) {
+                printf("[efihook-cp] copy#%d %s: eax=0x%llX%s\n", copyIdx + 1, efiCheckpoints[ci].label,
+                       (unsigned long long)rax, (rax & 0x80000000ULL) ? " (NEGATIVE/ERROR)" : " (ok)");
+                fflush(stdout);
+                resumeAt = efiCheckpointResumeAddr[copyIdx][ci]; // run the relocated test+jmp-back, not origAddr+2
+                goto efiHookCheckpointFound;
+            }
+        }
+    }
+efiHookCheckpointFound:;
+
+    WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+    WHV_REGISTER_VALUE newRip = { 0 };
+    newRip.Reg64 = resumeAt;
+    WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &newRip);
+}
+
+void updateA20Mapping(WHV_PARTITION_HANDLE partition) {
+    a20RemapCount++;
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    WHvUnmapGpaRange(partition, A20_WINDOW_BASE, A20_WINDOW_SIZE);
+    void *target = a20Enabled ? hmaMemory : guestMemory;
+    WHvMapGpaRange(partition, target, A20_WINDOW_BASE, A20_WINDOW_SIZE,
+                   WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute);
+
+    QueryPerformanceCounter(&t1);
+    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+    if (a20RemapCount <= 20 || a20RemapCount % 500 == 0) {
+        printf("[a20 remap #%d took %.3f ms, now %s]\n", a20RemapCount, ms, a20Enabled ? "enabled" : "disabled");
+        fflush(stdout);
+    }
+}
+UINT16 pitChannel2Reload = 0;
+unsigned char pitChannel2AccessMode = 0; // bits 5-4 of the port 0x43 command byte
+unsigned char pitChannel2LowByte = 0;
+int pitChannel2WritePhase = 0;    // 0 = expect low/only byte, 1 = expect high byte
+int pitChannel2Loaded = 0;
+LARGE_INTEGER pitChannel2LoadTime;
+
+// --- HLT / interrupt handling state ---
+// cpuHalted: set when the guest executes HLT. We don't stop the hypervisor,
+// we just stop calling WHvRunVirtualProcessor until we have something to
+// inject (keyboard data or a timer tick), then resume normally.
+int cpuHalted = 0;
+LARGE_INTEGER lastTimerTick;
+#define TIMER_TICK_INTERVAL_MS 54.925 // ~18.2 Hz, classic PC/PIT default rate
+
+// --- RTC (MC146818) periodic interrupt emulation ---
+// We already emulate CMOS/RTC time/date register reads (see
+// cmosReadRtcField), but never generated the periodic interrupt on IRQ8
+// that real hardware fires when Register B's PIE bit is set -- confirmed
+// live (see docs/investigations/vppt-synic-blocker.md part 10) to be
+// exactly what Windows HAL's HalpTimerWaitForPhase0Interrupt is waiting
+// on: it configures the IOAPIC redirection entry for GSI 8 with vector
+// 0xD1, unmasked, then busy-waits up to 3 seconds for that interrupt to
+// actually fire. Since nothing ever raised it, HAL gave up and bugchecked
+// (0x5C, STATUS_UNSUCCESSFUL) every single time. Rate-select-to-period
+// table per the standard MC146818 divider formula (period = 2^(rate-1) /
+// 32768 seconds, valid for rate 3-15; rates 0-2 mean "no periodic output").
+LARGE_INTEGER lastRtcPeriodicTick;
+int rtcPeriodicTickArmed = 0;
+double rtcPeriodicIntervalMs(unsigned char regA) {
+    int rate = regA & 0x0F;
+    if (rate < 3) return 0.0; // periodic interrupt disabled by this rate value
+    return (double)(1 << (rate - 1)) / 32768.0 * 1000.0;
+}
+
+// --- Primary ATA/IDE controller emulation (LBA28 PIO, master drive only) ---
+// Backs the guest's virtual hard disk with a per-VM raw image file. Commands
+// complete synchronously (no simulated seek latency): a command written to
+// 0x1F7 performs the whole file I/O immediately and leaves the result sitting
+// in ataDataBuffer for the guest to stream out/in via 0x1F0, then fires IRQ14
+// (vector 0x76, the real-mode default for the primary ATA controller).
+FILE *ataDiskFile = NULL;
+UINT64 ataDiskSectors = 0;
+// 512 for a plain raw/VHD disk image; 2048 for an ISO -- EDK2's PartitionDxe
+// El Torito parser (MdeModulePkg/Universal/Disk/PartitionDxe/ElTorito.c)
+// hard-requires BlockIo->Media->BlockSize == 2048 before it will even
+// attempt to recognize a CD-ROM boot catalog, which is how Windows
+// installer media conventionally gets consumed -- without this, boot still
+// partially works via UdfDxe's direct UDF/ISO9660 traversal (proven: files
+// get found and read correctly, verified byte-for-byte against the source
+// ISO), but something downstream (likely bootmgfw.efi itself, once
+// started) fails with a generic Device Error, plausibly because it expects
+// the conventional El-Torito-mediated boot path.
+UINT32 ataSectorSize = 512;
+
+unsigned char ataFeatures = 0;
+unsigned char ataSectorCount = 1;
+unsigned char ataLbaLow = 0, ataLbaMid = 0, ataLbaHigh = 0;
+unsigned char ataDriveHead = 0xA0;
+unsigned char ataStatus = 0x50;   // DRDY | DSC
+unsigned char ataError = 0;
+
+// The legacy PIO path's sector-count register is 8-bit (max 256 sectors =
+// 128KB per command, hardware-enforced there regardless of this constant),
+// but AHCI has no such limit -- a single command's FIS sector count is
+// 16-bit and, more importantly, PRDT entries can be chained for
+// multi-megabyte transfers in one command. EDK2's disk I/O layer can and
+// does coalesce a file's cluster chain into large single reads (observed:
+// a ~1.1MB EFI binary load failing to find/load at all once its read size
+// exceeded the old 128KB cap here -- silently rejected as ok=0, which
+// bubbled up as a generic "Not Found" rather than an obvious I/O error).
+#define ATA_MAX_TRANSFER (8 * 1024 * 1024)
+unsigned char ataDataBuffer[ATA_MAX_TRANSFER];
+UINT32 ataDataLen = 0;
+UINT32 ataDataPos = 0;
+int ataDataIsWrite = 0;
+UINT32 ataPendingLba = 0;
+
+#define ATA_ST_BSY  0x80
+#define ATA_ST_DRDY 0x40
+#define ATA_ST_DSC  0x10  // Drive Seek Complete -- some drivers wait for
+                          // this alongside DRDY before proceeding; our
+                          // synchronous emulation never has a seek "in
+                          // progress" so it's always set once ready.
+#define ATA_ST_DRQ  0x08
+#define ATA_ST_ERR  0x01
+#define ATA_ERR_ABRT 0x04
+#define ATA_IRQ14_VECTOR 0x76
+
+UINT32 ataCurrentLba(void) {
+    return (UINT32)ataLbaLow | ((UINT32)ataLbaMid << 8) | ((UINT32)ataLbaHigh << 16)
+           | ((UINT32)(ataDriveHead & 0x0F) << 24);
+}
+
+// Bit 4 of the drive/head register (0x1F6) selects master (0) vs slave (1).
+// We only emulate a single drive on the primary channel's master position --
+// the slave must consistently look absent (floating bus, all-1s reads) or
+// the guest sees two identical phantom drives instead of one real one.
+int ataSlaveSelected(void) {
+    return (ataDriveHead & 0x10) != 0;
+}
+
+void ataPutString(unsigned char *dst, const char *src, int len) {
+    int srcLen = (int)strlen(src);
+    int i;
+    for (i = 0; i < len; i += 2) {
+        unsigned char c0 = (i < srcLen) ? (unsigned char)src[i] : ' ';
+        unsigned char c1 = (i + 1 < srcLen) ? (unsigned char)src[i + 1] : ' ';
+        dst[i] = c1;
+        dst[i + 1] = c0;
+    }
+}
+
+void ataFillIdentify(unsigned char *buf, UINT64 sectors) {
+    UINT16 id[256];
+    UINT32 lba28;
+    UINT32 heads, sectorsPerTrack, cylinders;
+    memset(id, 0, sizeof(id));
+
+    lba28 = (UINT32)((sectors > 0x0FFFFFFF) ? 0x0FFFFFFF : sectors);
+
+    // Legacy CHS geometry, derived from the actual LBA capacity so it's at
+    // least self-consistent -- some BIOSes sanity-check reported CHS against
+    // the LBA sector count and distrust/skip a drive where they wildly
+    // disagree (e.g. a fixed 16383/16/63 placeholder next to a tiny image).
+    heads = 16;
+    sectorsPerTrack = 63;
+    cylinders = lba28 / (heads * sectorsPerTrack);
+    if (cylinders > 16383) cylinders = 16383;
+    if (cylinders == 0) cylinders = 1;
+
+    id[0] = 0x0040; // fixed, non-removable ATA device
+    id[1] = (UINT16)cylinders;
+    id[3] = (UINT16)heads;
+    id[6] = (UINT16)sectorsPerTrack;
+    ataPutString((unsigned char *)&id[10], "LH0001", 20);                  // serial number
+    ataPutString((unsigned char *)&id[23], "1.0", 8);                      // firmware revision
+    ataPutString((unsigned char *)&id[27], "LocalHost Virtual Disk", 40);  // model number
+    id[49] = 0x0200; // bit9: LBA supported
+
+    // "Current" CHS translation + capacity (words 53-58). Some BIOS ATA
+    // drivers read *these* for capacity instead of the total-user-sectors
+    // field (60-61) when word 53 bit0 claims them valid -- leaving them
+    // zeroed (with the validity bit unset) can make a drive look like it
+    // has 0 usable sectors and get silently skipped as a boot candidate.
+    id[53] = 0x0003; // bit0: words 54-58 valid, bit1: words 64-70 valid
+    id[54] = (UINT16)cylinders;
+    id[55] = (UINT16)heads;
+    id[56] = (UINT16)sectorsPerTrack;
+    id[57] = (UINT16)(lba28 & 0xFFFF);
+    id[58] = (UINT16)(lba28 >> 16);
+
+    id[60] = (UINT16)(lba28 & 0xFFFF);
+    id[61] = (UINT16)(lba28 >> 16);
+
+    memcpy(buf, id, 512);
+}
+
+void ataCompleteWithError(WHV_PARTITION_HANDLE partition) {
+    ataStatus = ATA_ST_DRDY | ATA_ST_DSC | ATA_ST_ERR;
+    ataError = ATA_ERR_ABRT;
+    ataDataLen = 0;
+    ataDataPos = 0;
+    ataMaybeInjectIrq(partition);
+}
+
+void ataHandleCommand(WHV_PARTITION_HANDLE partition, unsigned char cmd) {
+    // A real absent slave drive doesn't respond to commands at all -- no
+    // status change, no IRQ. Silently drop it here so probing the slave
+    // never looks like a second copy of our one real (master) disk.
+    if (ataSlaveSelected()) return;
+
+    UINT32 lba = ataCurrentLba();
+    UINT32 count = ataSectorCount == 0 ? 256 : ataSectorCount;
+    printf("[ata] cmd=0x%02X drivehead=0x%02X lba=%u count=%u diskFile=%p diskSectors=%llu\n",
+           cmd, ataDriveHead, lba, count, (void *)ataDiskFile, (unsigned long long)ataDiskSectors);
+    fflush(stdout);
+
+    switch (cmd) {
+        case 0xEC: // IDENTIFY DEVICE
+            if (!ataDiskFile) { ataCompleteWithError(partition); break; }
+            ataFillIdentify(ataDataBuffer, ataDiskSectors);
+            ataDataLen = 512;
+            ataDataPos = 0;
+            ataDataIsWrite = 0;
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC | ATA_ST_DRQ;
+            ataMaybeInjectIrq(partition);
+            break;
+
+        case 0x20: case 0x21: // READ SECTORS (with/without retry)
+            if (!ataDiskFile || (UINT64)(lba + count) > ataDiskSectors || count * 512 > ATA_MAX_TRANSFER) {
+                ataCompleteWithError(partition);
+                break;
+            }
+            _fseeki64(ataDiskFile, (long long)lba * 512, SEEK_SET);
+            fread(ataDataBuffer, 1, (size_t)count * 512, ataDiskFile);
+            ataDataLen = count * 512;
+            ataDataPos = 0;
+            ataDataIsWrite = 0;
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC | ATA_ST_DRQ;
+            ataMaybeInjectIrq(partition);
+            printf("[ata] READ SECTORS ok: dataLen=%u status=0x%02X\n", ataDataLen, ataStatus);
+            fflush(stdout);
+            break;
+
+        case 0x30: case 0x31: // WRITE SECTORS (with/without retry)
+            if (!ataDiskFile || (UINT64)(lba + count) > ataDiskSectors || count * 512 > ATA_MAX_TRANSFER) {
+                ataCompleteWithError(partition);
+                break;
+            }
+            ataPendingLba = lba;
+            ataDataLen = count * 512;
+            ataDataPos = 0;
+            ataDataIsWrite = 1;
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC | ATA_ST_DRQ;
+            // No IRQ yet -- fired once the guest finishes pushing the data (below).
+            break;
+
+        case 0xE7: case 0xEA: // FLUSH CACHE / FLUSH CACHE EXT
+            if (ataDiskFile) fflush(ataDiskFile);
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+            ataMaybeInjectIrq(partition);
+            break;
+
+        case 0x91: // INITIALIZE DEVICE PARAMETERS
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+            ataMaybeInjectIrq(partition);
+            break;
+
+        default:
+            ataCompleteWithError(partition);
+            break;
+    }
+}
+
+// Port 0x1F0 (ATA data register) carries the actual sector/IDENTIFY payload.
+// Real ATA drivers move that data with `rep insw`/`rep outsw`, which WHV
+// exits *once* for the whole repeated operation -- Rcx holds the repeat
+// count and Rsi/Rdi/Ds/Es locate the guest-memory buffer directly, rather
+// than routing anything through Rax. Handling this as a plain register-value
+// IN/OUT (like every other port here) silently transfers nothing.
+void ataHandlePioDataPort(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext, void *guestMemory) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+
+    if (!io->AccessInfo.StringOp) {
+        // Plain `in ax, dx` / `out dx, ax` -- transfer through Rax like every
+        // other emulated port, no guest-memory buffer involved.
+        UINT16 word = 0xFFFF;
+        if (io->AccessInfo.IsWrite) {
+            word = (UINT16)io->Rax;
+            if (ataDataIsWrite && ataDataPos < ataDataLen) {
+                ataDataBuffer[ataDataPos++] = (unsigned char)(word & 0xFF);
+                if (io->AccessInfo.AccessSize >= 2 && ataDataPos < ataDataLen) {
+                    ataDataBuffer[ataDataPos++] = (unsigned char)((word >> 8) & 0xFF);
+                }
+                if (ataDataPos >= ataDataLen) {
+                    if (ataDiskFile) {
+                        _fseeki64(ataDiskFile, (long long)ataPendingLba * 512, SEEK_SET);
+                        fwrite(ataDataBuffer, 1, ataDataLen, ataDiskFile);
+                        fflush(ataDiskFile);
+                    }
+                    ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+                    ataMaybeInjectIrq(partition);
+                }
+            }
+        } else if (!ataDataIsWrite && ataDataPos < ataDataLen) {
+            word = ataDataBuffer[ataDataPos++];
+            if (io->AccessInfo.AccessSize >= 2 && ataDataPos < ataDataLen) {
+                word |= (UINT16)ataDataBuffer[ataDataPos++] << 8;
+            }
+            if (ataDataPos >= ataDataLen) ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+        }
+        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+        WHV_REGISTER_VALUE values[2] = { 0 };
+        values[0].Reg64 = word;
+        values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+        return;
+    }
+
+    UINT32 accessSize = io->AccessInfo.AccessSize;
+    if (accessSize < 1) accessSize = 2;
+    UINT32 count = io->AccessInfo.RepPrefix ? (UINT32)io->Rcx : 1;
+    if (count == 0) count = 1;
+
+    UINT64 rsiOut = io->Rsi;
+    UINT64 rdiOut = io->Rdi;
+    UINT32 i;
+
+    if (io->AccessInfo.IsWrite) {
+        unsigned char *guestPtr = (unsigned char *)guestMemory + (((UINT64)io->Ds.Base + io->Rsi) & 0xFFFFF);
+        for (i = 0; i < count && ataDataIsWrite && ataDataPos < ataDataLen; i++) {
+            UINT16 word = *(UINT16 *)(guestPtr + (UINT64)i * accessSize);
+            ataDataBuffer[ataDataPos++] = (unsigned char)(word & 0xFF);
+            if (accessSize >= 2 && ataDataPos < ataDataLen) {
+                ataDataBuffer[ataDataPos++] = (unsigned char)((word >> 8) & 0xFF);
+            }
+        }
+        rsiOut += (UINT64)i * accessSize;
+        if (ataDataIsWrite && ataDataPos >= ataDataLen) {
+            if (ataDiskFile) {
+                _fseeki64(ataDiskFile, (long long)ataPendingLba * 512, SEEK_SET);
+                fwrite(ataDataBuffer, 1, ataDataLen, ataDiskFile);
+                fflush(ataDiskFile);
+            }
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+            ataMaybeInjectIrq(partition);
+        }
+    } else {
+        unsigned char *guestPtr = (unsigned char *)guestMemory + (((UINT64)io->Es.Base + io->Rdi) & 0xFFFFF);
+        for (i = 0; i < count; i++) {
+            UINT16 word = 0xFFFF;
+            if (!ataDataIsWrite && ataDataPos < ataDataLen) {
+                word = ataDataBuffer[ataDataPos++];
+                if (accessSize >= 2 && ataDataPos < ataDataLen) {
+                    word |= (UINT16)ataDataBuffer[ataDataPos++] << 8;
+                }
+            }
+            *(UINT16 *)(guestPtr + (UINT64)i * accessSize) = word;
+        }
+        rdiOut += (UINT64)count * accessSize;
+        if (!ataDataIsWrite && ataDataLen > 0 && ataDataPos >= ataDataLen) {
+            ataStatus = ATA_ST_DRDY | ATA_ST_DSC; // transfer complete, DRQ clears
+        }
+    }
+
+    WHV_REGISTER_NAME names[4] = { WHvX64RegisterRcx, WHvX64RegisterRsi, WHvX64RegisterRdi, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[4] = { 0 };
+    values[0].Reg64 = (io->AccessInfo.StringOp && io->AccessInfo.RepPrefix) ? 0 : io->Rcx;
+    values[1].Reg64 = rsiOut;
+    values[2].Reg64 = rdiOut;
+    values[3].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 4, values);
+}
+
+unsigned char kbQueue[64];
+int kbHead = 0, kbTail = 0;
+
+void kbEnqueue(unsigned char b) {
+    kbQueue[kbTail] = b;
+    kbTail = (kbTail + 1) % 64;
+}
+int kbHasData() { return kbHead != kbTail; }
+unsigned char kbDequeue() {
+    unsigned char b = kbQueue[kbHead];
+    kbHead = (kbHead + 1) % 64;
+    return b;
+}
+
+// --- PS/2 AUX (mouse) port -- Phase 1: controller/device command handling
+// only, no host input capture yet (see docs/roadmap.md). Mirrors the
+// keyboard queue above exactly; real i8042 hardware keeps keyboard and AUX
+// as independent queues with a fixed keyboard-first read priority rather
+// than one interleaved FIFO, so this is modeled the same way rather than
+// merged with kbQueue.
+unsigned char auxQueue[64];
+int auxHead = 0, auxTail = 0;
+
+void auxEnqueue(unsigned char b) {
+    auxQueue[auxTail] = b;
+    auxTail = (auxTail + 1) % 64;
+}
+int auxHasData() { return auxHead != auxTail; }
+unsigned char auxDequeue() {
+    unsigned char b = auxQueue[auxHead];
+    auxHead = (auxHead + 1) % 64;
+    return b;
+}
+
+// Controller-level AUX port state (set via 0x64 writes 0xA7/0xA8, consumed
+// by 0xD4 below).
+int auxPortEnabled = 0;
+// One-shot flag set by a 0x64 write of 0xD4: the *next* 0x60 write is routed
+// to the mouse device's own command handler (auxHandleCommand) instead of
+// the keyboard's.
+int nextByteTargetsAux = 0;
+
+// Mouse device state, PS/2 spec defaults (set on 0xFF reset and 0xF6 set-
+// defaults): resolution 4 counts/mm, sample rate 100/s, 1:1 scaling,
+// streaming reports disabled until 0xF4.
+unsigned char auxResolution = 2;   // 2 = 4 counts/mm (the spec default code, not counts/mm itself)
+unsigned char auxSampleRate = 100;
+int auxScaling2to1 = 0;
+int auxReportingEnabled = 0;
+
+// Set by 0xE8 (set resolution) / 0xF3 (set sample rate): the next
+// AUX-directed byte (still individually 0xD4-prefixed by the driver) is a
+// parameter for that command rather than a new command.
+int auxAwaitingParam = 0;
+unsigned char auxAwaitingParamFor = 0;
+
+void auxResetState(void) {
+    auxResolution = 2;
+    auxSampleRate = 100;
+    auxScaling2to1 = 0;
+    auxReportingEnabled = 0;
+    auxAwaitingParam = 0;
+}
+
+// Handles a byte written to port 0x60 while nextByteTargetsAux is set --
+// i.e. a byte the driver directed at the mouse device itself (as opposed to
+// the 0xA7/0xA8/0xA9/0xD4 controller-level commands on port 0x64, handled
+// where those are dispatched). Mirrors the keyboard command handling's
+// style: an explicit reset handshake, a handful of specifically-modeled
+// commands, and a generic-ACK fallback for everything else.
+void auxHandleCommand(unsigned char val) {
+    // Always-on device trace, matching [ahci]/[uart2]'s existing style --
+    // useful for watching the reset/identification handshake once a real
+    // AUX-driving driver is reachable (see docs/roadmap.md phase 2 notes).
+    printf("[aux] command 0x%02X\n", val); fflush(stdout);
+    if (auxAwaitingParam) {
+        // Parameter byte for a preceding 0xE8/0xF3 -- just acknowledge and
+        // store it; the actual value doesn't affect our packet generation.
+        if (auxAwaitingParamFor == 0xE8) auxResolution = val;
+        else if (auxAwaitingParamFor == 0xF3) auxSampleRate = val;
+        auxAwaitingParam = 0;
+        auxEnqueue(0xFA);
+        return;
+    }
+
+    switch (val) {
+        case 0xFF: // Reset
+            auxResetState();
+            auxEnqueue(0xFA); // command acknowledged
+            auxEnqueue(0xAA); // self-test passed
+            auxEnqueue(0x00); // device ID: 0x00 = standard PS/2 mouse
+            break;
+        case 0xF6: // Set defaults
+            auxResetState();
+            auxEnqueue(0xFA);
+            break;
+        case 0xF4: // Enable data reporting
+            auxReportingEnabled = 1;
+            auxEnqueue(0xFA);
+            break;
+        case 0xF5: // Disable data reporting
+            auxReportingEnabled = 0;
+            auxEnqueue(0xFA);
+            break;
+        case 0xE8: // Set resolution -- next byte is the parameter
+            auxAwaitingParam = 1;
+            auxAwaitingParamFor = 0xE8;
+            auxEnqueue(0xFA);
+            break;
+        case 0xF3: // Set sample rate -- next byte is the parameter
+            auxAwaitingParam = 1;
+            auxAwaitingParamFor = 0xF3;
+            auxEnqueue(0xFA);
+            break;
+        case 0xE6: // Set scaling 1:1
+            auxScaling2to1 = 0;
+            auxEnqueue(0xFA);
+            break;
+        case 0xE7: // Set scaling 2:1
+            auxScaling2to1 = 1;
+            auxEnqueue(0xFA);
+            break;
+        case 0xF2: // Get device ID
+            auxEnqueue(0xFA);
+            auxEnqueue(0x00);
+            break;
+        default: // Generic ACK, matching the keyboard's own catch-all.
+            auxEnqueue(0xFA);
+            break;
+    }
+}
+
+// Phase 2: host mouse input -> PS/2 relative-motion packets. Tracked
+// separately from auxHandleCommand's protocol/command-response state above.
+int auxLastCursorX = 0, auxLastCursorY = 0;
+int auxCursorPosKnown = 0;
+unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
+
+// Builds and enqueues one standard 3-byte PS/2 packet (status, dx, dy) if
+// reporting is enabled and there's AUX port. dx/dy are relative motion in
+// client pixels (PS/2 is inherently relative -- no guest resolution or
+// cursor-position knowledge needed here, same as real hardware). Called on
+// every mouse-move or button-state-change message; real mice likewise only
+// send a packet when something actually changed, not on a fixed interval.
+void auxSendPacket(int dx, int dy) {
+    if (!auxReportingEnabled || !auxPortEnabled) return;
+
+    // PS/2 Y+ is up; Windows client-area Y+ is down.
+    dy = -dy;
+
+    // Clamp to the 9-bit signed range each field can represent (sign bit +
+    // 8 data bits), setting the overflow bits instead of wrapping if a
+    // single event's motion exceeds it (a fast physical flick could in
+    // principle exceed this between two WM_MOUSEMOVE messages).
+    unsigned char status = auxButtonMask & 0x07;
+    status |= 0x08; // bit 3: always-1 marker, used by drivers to resync the byte stream
+
+    int overflowX = 0, overflowY = 0;
+    if (dx > 255) { dx = 255; overflowX = 1; }
+    if (dx < -256) { dx = -256; overflowX = 1; }
+    if (dy > 255) { dy = 255; overflowY = 1; }
+    if (dy < -256) { dy = -256; overflowY = 1; }
+
+    if (dx < 0) status |= 0x10; // bit 4: X sign
+    if (dy < 0) status |= 0x20; // bit 5: Y sign
+    if (overflowX) status |= 0x40; // bit 6: X overflow
+    if (overflowY) status |= 0x80; // bit 7: Y overflow
+
+    auxEnqueue(status);
+    auxEnqueue((unsigned char)(dx & 0xFF));
+    auxEnqueue((unsigned char)(dy & 0xFF));
+}
+
+unsigned char vkToScancode(int vk) {
+    switch (vk) {
+        case VK_ESCAPE: return 0x01;
+        case '1': return 0x02; case '2': return 0x03; case '3': return 0x04;
+        case '4': return 0x05; case '5': return 0x06; case '6': return 0x07;
+        case '7': return 0x08; case '8': return 0x09; case '9': return 0x0A;
+        case '0': return 0x0B;
+        case VK_BACK: return 0x0E;
+        case VK_TAB: return 0x0F;
+        case 'Q': return 0x10; case 'W': return 0x11; case 'E': return 0x12;
+        case 'R': return 0x13; case 'T': return 0x14; case 'Y': return 0x15;
+        case 'U': return 0x16; case 'I': return 0x17; case 'O': return 0x18;
+        case 'P': return 0x19;
+        case VK_RETURN: return 0x1C;
+        case 'A': return 0x1E; case 'S': return 0x1F; case 'D': return 0x20;
+        case 'F': return 0x21; case 'G': return 0x22; case 'H': return 0x23;
+        case 'J': return 0x24; case 'K': return 0x25; case 'L': return 0x26;
+        case 'Z': return 0x2C; case 'X': return 0x2D; case 'C': return 0x2E;
+        case 'V': return 0x2F; case 'B': return 0x30; case 'N': return 0x31;
+        case 'M': return 0x32;
+        case VK_SPACE: return 0x39;
+        case VK_UP: return 0x48;
+        case VK_LEFT: return 0x4B;
+        case VK_RIGHT: return 0x4D;
+        case VK_DOWN: return 0x50;
+        default: return 0x00;
+    }
+}
+
+#define LOG_BUFFER_SIZE 8192
+char logBuffer[LOG_BUFFER_SIZE];
+int logLength = 0;
+CRITICAL_SECTION logLock;
+
+// TEMP DIAGNOSTIC: incremented every time "starting Boot0002" (BdsDxe's own
+// debug text, printed right before it calls StartImage on the real, chosen
+// boot file) appears in the accumulated log text -- NOT just once, since
+// the whole boot attempt retries multiple times (each retry reloads a
+// fresh, unpatched copy of bootmgfw.efi), so a one-shot trigger only ever
+// catches the first attempt even when that attempt isn't the one that
+// matters. The main loop re-installs hooks on every new occurrence.
+int efiHookStartingBoot0002Count = 0;
+
+void appendToLog(char c) {
+    EnterCriticalSection(&logLock);
+    if (logLength < LOG_BUFFER_SIZE - 1) {
+        logBuffer[logLength++] = c;
+        logBuffer[logLength] = '\0';
+    }
+    LeaveCriticalSection(&logLock);
+    putchar(c);
+    fflush(stdout);
+
+    {
+        static const char needle[] = "starting Boot0002";
+        static int matchPos = 0;
+        if (c == needle[matchPos]) {
+            matchPos++;
+            if (needle[matchPos] == '\0') { efiHookStartingBoot0002Count++; matchPos = 0; }
+        } else {
+            matchPos = (c == needle[0]) ? 1 : 0;
+        }
+    }
+}
+
+HWND g_hwnd = NULL;
+HFONT g_font = NULL;
+char g_windowTitle[256] = "Hypervisor.c -- Guest Display";
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_KEYDOWN: {
+            unsigned char sc = vkToScancode((int)wParam);
+            if (sc != 0) kbEnqueue(sc);
+            return 0;
+        }
+        case WM_KEYUP: {
+            unsigned char sc = vkToScancode((int)wParam);
+            if (sc != 0) kbEnqueue(sc | 0x80);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            int x = (int)(short)LOWORD(lParam);
+            int y = (int)(short)HIWORD(lParam);
+            if (auxCursorPosKnown) {
+                int dx = x - auxLastCursorX;
+                int dy = y - auxLastCursorY;
+                if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
+            }
+            auxLastCursorX = x;
+            auxLastCursorY = y;
+            auxCursorPosKnown = 1;
+            return 0;
+        }
+        case WM_LBUTTONDOWN: { auxButtonMask |= 0x01; auxSendPacket(0, 0); return 0; }
+        case WM_LBUTTONUP:   { auxButtonMask &= ~0x01; auxSendPacket(0, 0); return 0; }
+        case WM_RBUTTONDOWN: { auxButtonMask |= 0x02; auxSendPacket(0, 0); return 0; }
+        case WM_RBUTTONUP:   { auxButtonMask &= ~0x02; auxSendPacket(0, 0); return 0; }
+        case WM_MBUTTONDOWN: { auxButtonMask |= 0x04; auxSendPacket(0, 0); return 0; }
+        case WM_MBUTTONUP:   { auxButtonMask &= ~0x04; auxSendPacket(0, 0); return 0; }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+
+            // Once the guest has configured a ramfb framebuffer, prefer
+            // showing that (it's what OVMF/Windows Setup actually draws
+            // to) over the text-mode log rendering below.
+            if (ramfbConfigWritten && ramfbWidth > 0 && ramfbHeight > 0 &&
+                guestMemory && ramfbAddress + (UINT64)ramfbStride * ramfbHeight <= guestMemSize) {
+                BITMAPINFO bmi = { 0 };
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = (LONG)ramfbWidth;
+                bmi.bmiHeader.biHeight = -(LONG)ramfbHeight; // negative: top-down, matches GOP's row order
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                StretchDIBits(
+                    hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                    0, 0, ramfbWidth, ramfbHeight,
+                    (unsigned char *)guestMemory + ramfbAddress, &bmi, DIB_RGB_COLORS, SRCCOPY);
+            } else {
+                HFONT oldFont = (HFONT)SelectObject(hdc, g_font);
+                SetBkColor(hdc, RGB(0, 0, 0));
+                SetTextColor(hdc, RGB(0, 255, 0));
+
+                EnterCriticalSection(&logLock);
+                FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                DrawTextA(hdc, logBuffer, logLength, &rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+                LeaveCriticalSection(&logLock);
+
+                SelectObject(hdc, oldFont);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void createWindowThread() {
+    WNDCLASSA wc = { 0 };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "HypervisorWindowClass";
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassA(&wc);
+
+    g_hwnd = CreateWindowA("HypervisorWindowClass", g_windowTitle,
+                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                            740, 480, NULL, NULL, GetModuleHandle(NULL), NULL);
+    ShowWindow(g_hwnd, SW_SHOW);
+}
+
+// Returns non-zero if the guest currently has interrupts enabled (EFLAGS.IF).
+int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition) {
+    WHV_REGISTER_NAME regName = WHvX64RegisterRflags;
+    WHV_REGISTER_VALUE regValue = { 0 };
+    HRESULT hr = WHvGetVirtualProcessorRegisters(partition, 0, &regName, 1, &regValue);
+    if (FAILED(hr)) return 0;
+    return (regValue.Reg64 & (1ULL << 9)) != 0; // bit 9 = IF
+}
+
+// Injects a hardware interrupt vector directly into the vCPU via the
+// "pending interruption" register. This bypasses any PIC/APIC model --
+// it's a minimal stand-in until real 8259 PIC emulation exists.
+void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
+    logBpEvent("injectInterrupt vector=0x%02X", vector);
+    WHV_REGISTER_NAME regName = WHvRegisterPendingInterruption;
+    WHV_REGISTER_VALUE regValue = { 0 };
+
+    UINT64 pending = 0;
+    pending |= 1ULL;                       // InterruptionPending = 1
+    pending |= ((UINT64)0ULL << 1);        // InterruptionType = WHvX64PendingInterrupt (0)
+    pending |= ((UINT64)vector << 16);     // InterruptionVector (bits 16-31)
+    regValue.Reg64 = pending;
+
+    WHvSetVirtualProcessorRegisters(partition, 0, &regName, 1, &regValue);
+}
+
+// Real, stateful 256-byte config spaces for the handful of functions we
+// model. Earlier this stub answered every register with a fixed canned
+// constant and silently discarded all writes ("nothing we model is
+// writable"). That broke down once PCI bus enumeration started doing real
+// write-then-read-back verification (the standard way to probe which
+// registers/bits are actually implemented, and how BAR sizing works): a
+// write that never sticks makes that verification -- and any driver logic
+// built on top of it -- retry forever. Backing each function with real
+// read/write storage lets writes actually stick, while a handful of fields
+// stay read-only (identity/class registers) or hardwired to 0 (BARs,
+// expansion ROM, capabilities pointer).
+//
+// We model three functions because real i440fx platforms -- which is what
+// OVMF's PlatformPei detects and assumes once it sees our host bridge's
+// device ID -- always have a PIIX3 ISA bridge (0:1.0) and PIIX4 power
+// management function (0:1.3) alongside the host bridge (0:0.0); platform
+// code can reasonably assume both unconditionally exist and hang/retry
+// waiting for a device that, in an incomplete stub, simply never appears.
+unsigned char pciHostBridgeConfig[256] = { 0 }; // 0:0.0 -- i440fx host bridge
+unsigned char pciIsaBridgeConfig[256] = { 0 };  // 0:1.0 -- PIIX3 ISA bridge
+unsigned char pciPmConfig[256] = { 0 };         // 0:1.3 -- PIIX4 power management
+unsigned char pciAhciConfig[256] = { 0 };       // 0:2.0 -- AHCI (SATA) controller
+unsigned char pciRtl8139Config[256] = { 0 };    // 0:3.0 -- RTL8139 NIC
+int pciConfigSpacesInit = 0;
+
+// PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
+// hardware sets this only after an SMI handler processes a write to the
+// SMI_CMD port (0xB2, PIIX4's fixed default) -- we don't emulate SMM at
+// all, so a BIOS/OS that writes 0xB2 and then polls PM1a_CNT (or the
+// legacy 0xB3 SMI-status port) waiting for that bit would spin forever.
+// Setting SCI_EN synchronously on the 0xB2 write stands in for "the SMI
+// handler ran instantly."
+//
+// Our FADT (acpiBuildTables) declares SMI_CMD=0, which per the ACPI spec
+// means "ACPI mode is already enabled, no SMM handshake needed" -- so
+// SCI_EN must already read as 1 at boot, or anything that checks it
+// (confirmed live: SeaBIOS itself, spinning forever reading port 0x604
+// with SCI_EN never observed set) hangs waiting for a handshake that will
+// never happen since nothing ever writes SMI_CMD=0. Starting this at 1
+// keeps the two in sync.
+UINT16 pm1aControl = 0x1;
+
+// PORT_SMI_STATUS (0xB3): SeaBIOS's SMM relocation code
+// (smm_relocate_and_restore()) writes 0x01 here, writes 0x00 to
+// PORT_SMI_CMD (0xB2) to trigger an SMI, then spins on `while
+// (inb(PORT_SMI_STATUS) != 0x00);` waiting for the SMI handler's first
+// action (clearing status back to 0) as an acknowledgment. We don't
+// emulate SMM/SMI delivery, so the 0xB2 write clears this synchronously.
+unsigned char smiStatus = 0;
+
+// --- AHCI (SATA) controller: BAR5/ABAR state ---
+// BAR5 (offset 0x24) is the one register pciRegisterIsReadOnly's generic
+// "BARs are hardwired to 0" rule doesn't apply to here -- unlike the
+// host bridge/PIIX3/PIIX4, this device needs a real, guest-programmable
+// memory BAR so the driver can find its register block. See
+// ahciHandleBar5Access and pciHandleConfigAccess.
+#define AHCI_BAR_SIZE 0x2000  // 8KB: comfortably covers HBA regs (0x100) + one port block (0x80)
+int ahciBar5Sizing = 0;       // true after the guest probes the BAR size with an all-1s write
+UINT32 ahciAbarBase = 0;      // guest-programmed ABAR GPA, once set
+void *ahciAbarMemory = NULL;  // host backing buffer for the mapped ABAR window
+int ahciAbarMapped = 0;
+
+// --- RTL8139 NIC -- Phase 1: PCI identity, BAR0 (I/O space) sizing, and
+// enough of the register file for a driver to complete reset/init and see
+// link-up. No TX/RX data movement or host networking yet (see
+// docs/roadmap.md) -- unlike AHCI's BAR (memory-mapped, backed by real
+// guest RAM the driver polls directly), RTL8139's BAR0 is I/O-space, so
+// register accesses come through the same io-port dispatch switch as
+// ATA/UART/PIT etc. rather than through WHvMapGpaRange.
+#define RTL8139_IO_SIZE 0x100
+int rtl8139Bar0Sizing = 0;    // true after the guest probes the BAR size with an all-1s write
+UINT32 rtl8139IoBase = 0;     // guest-programmed BAR0 I/O base, once set (0 = not yet programmed)
+unsigned char rtl8139Regs[RTL8139_IO_SIZE] = { 0 }; // raw register file, offset-indexed
+
+// Locally-administered MAC (52:54:00:xx:xx:xx is the same OUI prefix QEMU's
+// own emulated NICs use for exactly this purpose -- a safe, real-hardware-
+// conflict-free address for an emulated device).
+unsigned char rtl8139Mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+
+// --- RTL8139 Phase 2: TX descriptor handling, RX ring buffer, and
+// interrupt generation. Deliberately kept separate from the networking
+// backend -- rtl8139TransmitFrame (device -> backend) and
+// rtl8139ReceiveFrame (backend -> device) are the only two entry points
+// that will need to change when the real slirp-style NAT backend replaces
+// today's log/test-injection stubs.
+//
+// TX: RTL8139 has 4 fixed descriptor slots (not a true ring) -- TSAD0-3
+// (0x20/0x24/0x28/0x2C, the guest-physical frame address) and TSD0-3
+// (0x10/0x14/0x18/0x1C, status+size). A write to a TSDx register is the
+// real hardware's "submit this frame" trigger; we do the whole DMA-read +
+// hand-to-backend + status-update synchronously in that same write,
+// matching how real hardware transmits fast enough that a driver's
+// completion poll basically never sees "in progress."
+//
+// RX: a single circular buffer at RBSTART (0x30), sized by RCR's RBLEN
+// bits, that we DMA-write received frames into with the standard 4-byte
+// status+length header real hardware prefixes each packet with. CAPR
+// (0x38) is the guest's read pointer, CBR (0x3A) mirrors our own write
+// pointer.
+//
+// IRQ: real hardware routes RTL8139 through its assigned PCI INTx line via
+// PIRQ/APIC routing we don't model (see injectInterrupt's own comment --
+// this whole codebase bypasses PIC/APIC routing and hardcodes vectors for
+// every device). IRQ11 (vector 0x73, the standard legacy master-PIC-range
+// vector for IRQ11) is unused by every other emulated device, so it's used
+// here the same way IRQ14/vector 0x76 is hardcoded for ATA.
+UINT32 rtl8139RxWritePos = 0; // our own tracked ring write offset (mirrored into CBR)
+int pendingRtl8139Irq = 0;    // same latch-until-IF=1 pattern as pendingAtaIrq
+
+void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
+    UINT16 isr = *(UINT16 *)&rtl8139Regs[0x3E];
+    UINT16 imr = *(UINT16 *)&rtl8139Regs[0x3C];
+    if ((isr & imr) == 0) return; // nothing enabled is actually pending
+    if (guestInterruptsEnabled(partition)) {
+        injectInterrupt(partition, 0x73);
+    } else {
+        pendingRtl8139Irq = 1;
+    }
+}
+
+void deliverPendingRtl8139Irq(WHV_PARTITION_HANDLE partition) {
+    if (pendingRtl8139Irq && guestInterruptsEnabled(partition)) {
+        injectInterrupt(partition, 0x73);
+        pendingRtl8139Irq = 0;
+    }
+}
+
+UINT32 rtl8139RxRingSize(void) {
+    UINT32 rcr = *(UINT32 *)&rtl8139Regs[0x44];
+    UINT32 rblen = (rcr >> 11) & 0x3;
+    return 8192u << rblen; // RBLEN 00/01/10/11 -> 8K/16K/32K/64K
+}
+
+void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
+
+// =====================================================================
+// Phase 3: slirp-style NAT networking backend.
+//
+// Deliberately kept behind exactly two entry points, same as Phase 2 left
+// it: rtl8139TransmitFrame (device -> backend, called when the guest
+// submits a TX descriptor) and rtl8139ReceiveFrame (backend -> device,
+// injects a frame into the RX ring). Nothing in here reaches back into the
+// register file or ring-buffer mechanics directly -- the RTL8139 emulation
+// stays completely unaware this backend exists versus, say, a future
+// bridged or host-only backend swapped in behind the same two functions.
+//
+// Portability: the only Windows-specific pieces are socket-library
+// startup/teardown and a couple of naming differences (closesocket vs
+// close, ioctlsocket vs fcntl) -- isolated in the tiny shim right below.
+// Everything else (socket/bind/connect/send/recv/sendto/recvfrom/select)
+// is plain BSD sockets, the subset Winsock and POSIX sockets share, so a
+// future Linux/macOS build could reuse this section largely unchanged.
+//
+// Contents, in order: platform shim + the RTL8139<->backend seam
+// (g_netTransmit) -> virtual addressing constants -> wire-format read/
+// write and checksum helpers -> netSendIpFrame (the shared reply-framing
+// helper everything below uses) -> ARP -> ICMP -> DHCP -> general UDP NAT
+// (DNS relay is a special case of it) -> TCP NAT -> netHandleIpv4
+// (protocol dispatch) -> netSlirpTransmit + rtl8139TransmitFrame (the
+// device-facing entry points) -> rtl8139ReceiveFrame (Phase 2, backend ->
+// device, unchanged since it's already backend-agnostic).
+// =====================================================================
+
+typedef SOCKET netsock_t;
+#define NETSOCK_INVALID INVALID_SOCKET
+#define netCloseSocket closesocket
+
+int netSetNonBlocking(netsock_t s) {
+    u_long mode = 1;
+    return ioctlsocket(s, FIONBIO, &mode) == 0;
+}
+
+// Every real socket this backend opens (UDP NAT sessions, TCP NAT
+// sessions) is non-blocking and IPv4 -- shared here rather than repeated
+// at each call site.
+netsock_t netCreateNonBlockingSocket(int type, int proto) {
+    netsock_t s = socket(AF_INET, type, proto);
+    if (s != NETSOCK_INVALID) netSetNonBlocking(s);
+    return s;
+}
+
+struct sockaddr_in netMakeSockAddr(UINT32 ip, UINT16 port) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(ip);
+    addr.sin_port = htons(port);
+    return addr;
+}
+
+int g_netBackendReady = 0;
+
+// The RTL8139<->backend seam: rtl8139TransmitFrame (device layer, near the
+// bottom of this section) calls whatever's registered here rather than
+// naming a backend directly. netBackendInit registers netSlirpTransmit
+// (defined further below, forward-declared here since it's registered
+// from up here). A future bridged/host-only backend would register its
+// own transmit function the same way -- e.g. gated on a config option --
+// without any change to rtl8139TransmitFrame or the RTL8139 device code
+// above it. (rtl8139ReceiveFrame, the backend -> device direction, is
+// already backend-agnostic: any backend just calls it directly.)
+typedef void (*NetTransmitFn)(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
+void netSlirpTransmit(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
+NetTransmitFn g_netTransmit = NULL;
+
+void netBackendInit(void) {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        printf("[net] WSAStartup failed -- networking backend disabled\n");
+        fflush(stdout);
+        return;
+    }
+    g_netBackendReady = 1;
+    g_netTransmit = netSlirpTransmit;
+    printf("[net] backend initialized\n");
+    fflush(stdout);
+}
+
+// --- Virtual network addressing (same well-known private range QEMU's own
+// slirp backend uses, chosen for the same reason: a safe, conventional
+// choice unlikely to collide with anything the guest expects). ---
+#define NET_GUEST_IP     0x0A00020FU // 10.0.2.15
+#define NET_GATEWAY_IP   0x0A000202U // 10.0.2.2  -- also the NAT router
+#define NET_DNS_IP       0x0A000203U // 10.0.2.3  -- DNS relay
+#define NET_NETMASK      0xFFFFFF00U // 255.255.255.0
+#define NET_BROADCAST_IP 0x0A0002FFU // 10.0.2.255
+
+unsigned char netGatewayMac[6] = { 0x52, 0x55, 0x0A, 0x00, 0x02, 0x02 }; // encodes 10.0.2.2
+unsigned char netDnsMac[6]     = { 0x52, 0x55, 0x0A, 0x00, 0x02, 0x03 }; // encodes 10.0.2.3
+unsigned char netGuestMac[6];   // learned from the guest's first transmitted frame
+int netGuestMacKnown = 0;
+
+// --- Wire-format header layouts (packed manually via byte offsets rather
+// than struct pragmas, matching this file's existing style for ACPI
+// tables/PE headers elsewhere). All multi-byte network fields are
+// big-endian ("network byte order"); helpers below make that explicit at
+// each read/write site rather than relying on casts.
+UINT16 netRd16(const unsigned char *p) { return (UINT16)((p[0] << 8) | p[1]); }
+UINT32 netRd32(const unsigned char *p) { return ((UINT32)p[0] << 24) | ((UINT32)p[1] << 16) | ((UINT32)p[2] << 8) | p[3]; }
+void netWr16(unsigned char *p, UINT16 v) { p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
+void netWr32(unsigned char *p, UINT32 v) { p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16); p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v; }
+
+// Standard 16-bit one's-complement checksum (RFC 1071), used for the IP
+// header and, with a pseudo-header prepended, UDP/TCP.
+UINT16 netChecksum(const unsigned char *data, UINT32 len, UINT32 seed) {
+    UINT32 sum = seed;
+    UINT32 i;
+    for (i = 0; i + 1 < len; i += 2) sum += netRd16(data + i);
+    if (len & 1) sum += (UINT32)data[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (UINT16)~sum;
+}
+
+// Pseudo-header checksum seed for UDP/TCP: src IP + dst IP + zero byte +
+// protocol + length, summed the same way as the real header/payload.
+UINT32 netL4ChecksumSeed(UINT32 srcIp, UINT32 dstIp, unsigned char proto, UINT16 l4Len) {
+    unsigned char pseudo[12];
+    netWr32(pseudo + 0, srcIp);
+    netWr32(pseudo + 4, dstIp);
+    pseudo[8] = 0;
+    pseudo[9] = proto;
+    netWr16(pseudo + 10, l4Len);
+    UINT32 sum = 0;
+    UINT32 i;
+    for (i = 0; i < 12; i += 2) sum += netRd16(pseudo + i);
+    return sum;
+}
+
+// Builds a complete Ethernet+IPv4 frame around an already-built L4 payload
+// (ICMP, or a UDP/TCP header+payload the caller assembled) and hands it to
+// the device via rtl8139ReceiveFrame. Fills in and checksums the IP header;
+// the caller is responsible for its own L4 checksum (UDP/TCP need the
+// pseudo-header, ICMP doesn't) before calling this.
+void netSendIpFrame(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac, UINT32 srcIp,
+                     UINT32 dstIp, unsigned char proto, const unsigned char *l4, UINT32 l4Len) {
+    if (!netGuestMacKnown) return;
+    unsigned char frame[1600];
+    UINT32 ipLen = 20 + l4Len;
+    if (14 + ipLen > sizeof(frame)) return;
+
+    memcpy(frame + 0, netGuestMac, 6);   // dst: guest
+    memcpy(frame + 6, srcMac, 6);        // src: gateway/DNS
+    netWr16(frame + 12, 0x0800);         // ethertype: IPv4
+
+    unsigned char *ip = frame + 14;
+    ip[0] = 0x45; // version 4, IHL 5 (20 bytes, no options)
+    ip[1] = 0x00; // DSCP/ECN
+    netWr16(ip + 2, (UINT16)ipLen);
+    netWr16(ip + 4, 0); // identification
+    netWr16(ip + 6, 0x4000); // flags: don't fragment
+    ip[8] = 64;   // TTL
+    ip[9] = proto;
+    netWr16(ip + 10, 0); // checksum, filled below
+    netWr32(ip + 12, srcIp);
+    netWr32(ip + 16, dstIp);
+    netWr16(ip + 10, netChecksum(ip, 20, 0));
+
+    memcpy(frame + 34, l4, l4Len);
+    rtl8139ReceiveFrame(partition, frame, 14 + ipLen);
+}
+
+void netHandleArp(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    if (len < 14 + 28) return;
+    const unsigned char *arp = frame + 14;
+    UINT16 op = netRd16(arp + 6);
+    UINT32 targetIp = netRd32(arp + 24);
+    if (op != 1) return; // only handle requests (op=1); we never issue our own requests to need op=2 replies
+
+    const unsigned char *replyMac = NULL;
+    if (targetIp == NET_GATEWAY_IP) replyMac = netGatewayMac;
+    else if (targetIp == NET_DNS_IP) replyMac = netDnsMac;
+    else return; // not asking about a device we emulate
+
+    unsigned char reply[42];
+    memcpy(reply + 0, frame + 6, 6);   // dst: requester
+    memcpy(reply + 6, replyMac, 6);    // src: us
+    netWr16(reply + 12, 0x0806);       // ethertype: ARP
+
+    unsigned char *rarp = reply + 14;
+    netWr16(rarp + 0, 1);   // HTYPE: Ethernet
+    netWr16(rarp + 2, 0x0800); // PTYPE: IPv4
+    rarp[4] = 6;  // HLEN
+    rarp[5] = 4;  // PLEN
+    netWr16(rarp + 6, 2); // OPER: reply
+    memcpy(rarp + 8, replyMac, 6);
+    netWr32(rarp + 14, targetIp);
+    memcpy(rarp + 18, frame + 6, 6); // target hw addr: requester
+    netWr32(rarp + 24, netRd32(arp + 14)); // target IP: requester's own IP (sender IP from the request)
+
+    rtl8139ReceiveFrame(partition, reply, sizeof(reply));
+}
+
+// ICMP echo (ping) only -- the minimum needed for a guest to consider the
+// gateway/Internet reachable at all. Anything else (unreachable, TTL
+// exceeded, etc.) is left unimplemented; the guest just won't see those
+// diagnostics, which is a reasonable Phase 3 gap since correctness there
+// doesn't block "obtain an IP and reach the Internet."
+void netHandleIcmp(WHV_PARTITION_HANDLE partition, UINT32 srcIp, UINT32 dstIp,
+                    const unsigned char *icmp, UINT32 icmpLen) {
+    if (icmpLen < 8 || icmp[0] != 8) return; // not an echo request (type 8)
+
+    unsigned char reply[1500];
+    if (icmpLen > sizeof(reply)) return;
+    memcpy(reply, icmp, icmpLen);
+    reply[0] = 0; // type: echo reply
+    reply[1] = 0; // code
+    netWr16(reply + 2, 0); // checksum, filled below
+    netWr16(reply + 2, netChecksum(reply, icmpLen, 0));
+
+    const unsigned char *replyMac = (dstIp == NET_DNS_IP) ? netDnsMac : netGatewayMac;
+    netSendIpFrame(partition, replyMac, dstIp, srcIp, 1 /* ICMP */, reply, icmpLen);
+}
+
+// Builds a UDP header around payload, computes the pseudo-header checksum,
+// and hands off to netSendIpFrame. Shared by DHCP, the DNS relay, and
+// general UDP NAT (all added below).
+void netSendUdp(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac, UINT32 srcIp, UINT16 srcPort,
+                 UINT32 dstIp, UINT16 dstPort, const unsigned char *payload, UINT32 payloadLen) {
+    unsigned char udp[1500];
+    UINT32 udpLen = 8 + payloadLen;
+    if (udpLen > sizeof(udp)) return;
+    netWr16(udp + 0, srcPort);
+    netWr16(udp + 2, dstPort);
+    netWr16(udp + 4, (UINT16)udpLen);
+    netWr16(udp + 6, 0); // checksum, filled below
+    memcpy(udp + 8, payload, payloadLen);
+    UINT32 seed = netL4ChecksumSeed(srcIp, dstIp, 17 /* UDP */, (UINT16)udpLen);
+    UINT16 cksum = netChecksum(udp, udpLen, seed);
+    if (cksum == 0) cksum = 0xFFFF; // UDP: a computed 0 means "no checksum"; avoid emitting a literal zero
+    netWr16(udp + 6, cksum);
+    netSendIpFrame(partition, srcMac, srcIp, dstIp, 17, udp, udpLen);
+}
+
+// Minimal single-lease DHCP server: always offers/acks NET_GUEST_IP, since
+// this backend only ever serves one guest. Real IP pool management isn't
+// needed for that. DISCOVER -> OFFER, REQUEST -> ACK; anything else (or a
+// malformed/non-BOOTREQUEST packet) is ignored.
+void netHandleDhcp(WHV_PARTITION_HANDLE partition, const unsigned char *dhcp, UINT32 dhcpLen) {
+    if (dhcpLen < 240) return; // fixed BOOTP header (236) + magic cookie (4)
+    if (dhcp[0] != 1) return;  // BOOTREQUEST only
+    if (netRd32(dhcp + 236) != 0x63825363) return; // DHCP magic cookie
+
+    UINT32 xid = netRd32(dhcp + 4);
+    unsigned char chaddr[6];
+    memcpy(chaddr, dhcp + 28, 6);
+
+    unsigned char msgType = 0;
+    UINT32 i = 240;
+    while (i < dhcpLen) {
+        unsigned char opt = dhcp[i];
+        if (opt == 255) break;
+        if (opt == 0) { i++; continue; }
+        if (i + 1 >= dhcpLen) break;
+        unsigned char optLen = dhcp[i + 1];
+        if (opt == 53 && optLen >= 1 && i + 2 < dhcpLen) msgType = dhcp[i + 2];
+        i += 2 + optLen;
+    }
+
+    unsigned char replyType;
+    if (msgType == 1) replyType = 2;      // DISCOVER -> OFFER
+    else if (msgType == 3) replyType = 5; // REQUEST -> ACK
+    else return;
+
+    unsigned char reply[300] = { 0 };
+    reply[0] = 2; // BOOTREPLY
+    reply[1] = 1; // htype: Ethernet
+    reply[2] = 6; // hlen
+    netWr32(reply + 4, xid);
+    netWr32(reply + 16, NET_GUEST_IP);   // yiaddr
+    netWr32(reply + 20, NET_GATEWAY_IP); // siaddr (informational)
+    memcpy(reply + 28, chaddr, 6);
+    netWr32(reply + 236, 0x63825363);
+
+    UINT32 o = 240;
+    reply[o++] = 53; reply[o++] = 1; reply[o++] = replyType;
+    reply[o++] = 1; reply[o++] = 4; netWr32(reply + o, NET_NETMASK); o += 4;
+    reply[o++] = 3; reply[o++] = 4; netWr32(reply + o, NET_GATEWAY_IP); o += 4;
+    reply[o++] = 6; reply[o++] = 4; netWr32(reply + o, NET_DNS_IP); o += 4;
+    reply[o++] = 51; reply[o++] = 4; netWr32(reply + o, 86400); o += 4; // lease: 1 day
+    reply[o++] = 54; reply[o++] = 4; netWr32(reply + o, NET_GATEWAY_IP); o += 4; // server ID
+    reply[o++] = 255;
+
+    netSendUdp(partition, netGatewayMac, NET_GATEWAY_IP, 67, NET_BROADCAST_IP, 68, reply, o);
+}
+
+// --- General UDP NAT (also carries the DNS relay, as a special case where
+// the destination gets translated on the way out and back). One real host
+// UDP socket per active guest source port; unconnected (send/recvfrom), so
+// a single socket can talk to multiple real destinations if the guest
+// reuses one source port for several flows -- recvfrom's fromaddr tells us
+// which real peer a given reply came from. ---
+#define NET_MAX_UDP_SESSIONS 32
+#define NET_UPSTREAM_DNS_IP 0x08080808U // 8.8.8.8 -- fixed, since there's no portable way to
+                                         // discover "the host's configured DNS server" without
+                                         // platform-specific APIs (see the portability note above)
+typedef struct {
+    int inUse;
+    UINT16 guestPort;
+    netsock_t sock;
+} NetUdpSession;
+NetUdpSession g_udpSessions[NET_MAX_UDP_SESSIONS];
+
+// Looks up the session for guestPort, opening a new real UDP socket for it
+// if none exists yet. Returns NULL if the table is full or socket()
+// itself fails.
+NetUdpSession *netFindOrCreateUdpSession(UINT16 guestPort) {
+    int i;
+    for (i = 0; i < NET_MAX_UDP_SESSIONS; i++) {
+        if (g_udpSessions[i].inUse && g_udpSessions[i].guestPort == guestPort) return &g_udpSessions[i];
+    }
+    for (i = 0; i < NET_MAX_UDP_SESSIONS; i++) {
+        if (!g_udpSessions[i].inUse) {
+            netsock_t s = netCreateNonBlockingSocket(SOCK_DGRAM, IPPROTO_UDP);
+            if (s == NETSOCK_INVALID) return NULL;
+            g_udpSessions[i].inUse = 1;
+            g_udpSessions[i].guestPort = guestPort;
+            g_udpSessions[i].sock = s;
+            return &g_udpSessions[i];
+        }
+    }
+    return NULL; // session table full
+}
+
+void netHandleUdpGuestPacket(UINT32 dstIp, const unsigned char *udp, UINT32 udpLen) {
+    if (udpLen < 8 || !g_netBackendReady) return;
+    UINT16 srcPort = netRd16(udp + 0);
+    UINT16 dstPort = netRd16(udp + 2);
+    const unsigned char *payload = udp + 8;
+    UINT32 payloadLen = udpLen - 8;
+
+    // DNS relay: redirect the virtual DNS proxy to a real upstream
+    // resolver. Everything else is plain outbound NAT -- the guest's
+    // stated destination is used as-is.
+    UINT32 realDstIp = (dstIp == NET_DNS_IP && dstPort == 53) ? NET_UPSTREAM_DNS_IP : dstIp;
+    UINT16 realDstPort = dstPort;
+
+    NetUdpSession *sess = netFindOrCreateUdpSession(srcPort);
+    if (!sess) return;
+
+    struct sockaddr_in dst = netMakeSockAddr(realDstIp, realDstPort);
+    sendto(sess->sock, (const char *)payload, (int)payloadLen, 0, (struct sockaddr *)&dst, sizeof(dst));
+}
+
+// Polls every active UDP session for a reply, non-blocking, and relays
+// anything received back to the guest. Called once per main-loop
+// iteration, same pattern as ahciProcessPendingCommands/deliverPendingAtaIrq.
+void netPollUdpSessions(WHV_PARTITION_HANDLE partition) {
+    if (!g_netBackendReady) return;
+    int i;
+    for (i = 0; i < NET_MAX_UDP_SESSIONS; i++) {
+        if (!g_udpSessions[i].inUse) continue;
+        unsigned char buf[1500];
+        struct sockaddr_in from;
+        int fromLen = sizeof(from);
+        int n = recvfrom(g_udpSessions[i].sock, (char *)buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromLen);
+        if (n > 0) {
+            UINT32 fromIp = ntohl(from.sin_addr.s_addr);
+            UINT16 fromPort = ntohs(from.sin_port);
+            // Mirror the DNS translation on the way back: a reply from the
+            // real upstream resolver should appear to come from the
+            // virtual DNS proxy the guest actually queried.
+            UINT32 replySrcIp = (fromIp == NET_UPSTREAM_DNS_IP && fromPort == 53) ? NET_DNS_IP : fromIp;
+            netSendUdp(partition, netGatewayMac, replySrcIp, fromPort, NET_GUEST_IP, g_udpSessions[i].guestPort,
+                       buf, (UINT32)n);
+        }
+    }
+}
+
+// --- TCP NAT. One real host TCP socket per active guest connection
+// (keyed by guest source port, same simplification as the UDP table --
+// reasonable for a single guest whose OS picks distinct ephemeral ports
+// per connection). We run a minimal, deliberately non-RFC793-complete TCP
+// state machine on the guest-facing side: no retransmission timers, no
+// out-of-order/reassembly handling, no real window-size-based flow
+// control (we advertise a large fixed window and trust the guest's own
+// stack + the real socket's own TCP flow control on the other side to
+// keep things reasonable), and teardown just sends our FIN and frees the
+// session rather than tracking the full close handshake. All acceptable
+// simplifications for "reach the Internet," not full protocol compliance.
+#define NET_MAX_TCP_SESSIONS 16
+#define NET_TCP_FIN  0x01
+#define NET_TCP_SYN  0x02
+#define NET_TCP_RST  0x04
+#define NET_TCP_PSH  0x08
+#define NET_TCP_ACK  0x10
+
+typedef enum { NET_TCP_CONNECTING, NET_TCP_ESTABLISHED } NetTcpState;
+typedef struct {
+    int inUse;
+    NetTcpState state;
+    UINT16 guestPort;
+    UINT32 realDstIp;
+    UINT16 realDstPort;
+    netsock_t sock;
+    UINT32 guestSeq; // next sequence number we expect from the guest (our ack value)
+    UINT32 hostSeq;  // next sequence number we send
+} NetTcpSession;
+NetTcpSession g_tcpSessions[NET_MAX_TCP_SESSIONS];
+
+// Closes the real socket and frees the session slot. Does not notify the
+// guest -- callers that need the guest informed (RST/FIN) send that
+// segment themselves first, since the right flags/seq numbers depend on
+// why the session is closing.
+void netCloseTcpSession(NetTcpSession *s) {
+    if (s->sock != NETSOCK_INVALID) netCloseSocket(s->sock);
+    s->inUse = 0;
+}
+
+// Looks up an existing session by guest source port. Unlike the UDP
+// equivalent, this never creates one -- new TCP sessions are only ever
+// created by an incoming SYN, handled explicitly in netHandleTcpGuestPacket.
+NetTcpSession *netFindTcpSession(UINT16 guestPort) {
+    int i;
+    for (i = 0; i < NET_MAX_TCP_SESSIONS; i++)
+        if (g_tcpSessions[i].inUse && g_tcpSessions[i].guestPort == guestPort) return &g_tcpSessions[i];
+    return NULL;
+}
+
+// Builds one TCP segment (20-byte header, no options) and sends it via
+// netSendIpFrame. srcIp/srcPort here is what the GUEST sees as the remote
+// end -- for a NAT'd connection that's the real destination's own address,
+// unchanged, so the guest's TCP stack associates replies with the
+// connection it opened (same principle as general UDP's pass-through
+// case) -- only DHCP/DNS use a fixed virtual address.
+void netSendTcpSegment(WHV_PARTITION_HANDLE partition, UINT32 srcIp, UINT16 srcPort, UINT32 dstIp, UINT16 dstPort,
+                        UINT32 seq, UINT32 ack, unsigned char flags, const unsigned char *payload, UINT32 payloadLen) {
+    unsigned char seg[1500];
+    UINT32 tcpLen = 20 + payloadLen;
+    if (tcpLen > sizeof(seg)) return;
+    netWr16(seg + 0, srcPort);
+    netWr16(seg + 2, dstPort);
+    netWr32(seg + 4, seq);
+    netWr32(seg + 8, ack);
+    seg[12] = (5 << 4); // data offset: 5 words (20 bytes), no options
+    seg[13] = flags;
+    netWr16(seg + 14, 65535); // window -- fixed/large, see the simplifications note above
+    netWr16(seg + 16, 0); // checksum, filled below
+    netWr16(seg + 18, 0); // urgent pointer
+    if (payloadLen) memcpy(seg + 20, payload, payloadLen);
+    UINT32 seed = netL4ChecksumSeed(srcIp, dstIp, 6 /* TCP */, (UINT16)tcpLen);
+    netWr16(seg + 16, netChecksum(seg, tcpLen, seed));
+    netSendIpFrame(partition, netGatewayMac, srcIp, dstIp, 6, seg, tcpLen);
+}
+
+void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const unsigned char *tcp, UINT32 tcpLen) {
+    if (tcpLen < 20 || !g_netBackendReady) return;
+    UINT16 srcPort = netRd16(tcp + 0);
+    UINT16 dstPort = netRd16(tcp + 2);
+    UINT32 seq = netRd32(tcp + 4);
+    UINT32 hdrLen = ((tcp[12] >> 4) & 0xF) * 4;
+    unsigned char flags = tcp[13];
+    if (hdrLen < 20 || hdrLen > tcpLen) return;
+    const unsigned char *payload = tcp + hdrLen;
+    UINT32 payloadLen = tcpLen - hdrLen;
+
+    NetTcpSession *s = netFindTcpSession(srcPort);
+
+    if (flags & NET_TCP_RST) {
+        if (s) netCloseTcpSession(s);
+        return;
+    }
+
+    if ((flags & NET_TCP_SYN) && !s) {
+        int i;
+        for (i = 0; i < NET_MAX_TCP_SESSIONS; i++) {
+            if (!g_tcpSessions[i].inUse) { s = &g_tcpSessions[i]; break; }
+        }
+        if (!s) return; // session table full
+
+        netsock_t sock = netCreateNonBlockingSocket(SOCK_STREAM, IPPROTO_TCP);
+        if (sock == NETSOCK_INVALID) return;
+        struct sockaddr_in dst = netMakeSockAddr(dstIp, dstPort);
+        connect(sock, (struct sockaddr *)&dst, sizeof(dst)); // non-blocking: completes async, polled below
+
+        memset(s, 0, sizeof(*s));
+        s->inUse = 1;
+        s->state = NET_TCP_CONNECTING;
+        s->guestPort = srcPort;
+        s->realDstIp = dstIp;
+        s->realDstPort = dstPort;
+        s->sock = sock;
+        s->guestSeq = seq + 1; // SYN consumes one sequence number
+        s->hostSeq = 1000;     // arbitrary ISN
+        return;
+    }
+
+    if (!s) return; // packet for a connection we don't know about -- drop rather than RST, out of scope
+
+    if (payloadLen > 0) {
+        send(s->sock, (const char *)payload, (int)payloadLen, 0);
+        s->guestSeq += payloadLen;
+        netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                           s->hostSeq, s->guestSeq, NET_TCP_ACK, NULL, 0);
+    }
+
+    if (flags & NET_TCP_FIN) {
+        s->guestSeq += 1; // FIN consumes a sequence number
+        shutdown(s->sock, SD_SEND); // half-close: no more data to the real peer, but keep reading any reply
+        netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                           s->hostSeq, s->guestSeq, NET_TCP_ACK, NULL, 0);
+    }
+}
+
+// Polls every connecting/established TCP session, non-blocking, same
+// per-iteration pattern as netPollUdpSessions.
+void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
+    if (!g_netBackendReady) return;
+    int i;
+    for (i = 0; i < NET_MAX_TCP_SESSIONS; i++) {
+        NetTcpSession *s = &g_tcpSessions[i];
+        if (!s->inUse) continue;
+
+        if (s->state == NET_TCP_CONNECTING) {
+            fd_set writeSet, exceptSet;
+            FD_ZERO(&writeSet);
+            FD_ZERO(&exceptSet);
+            FD_SET(s->sock, &writeSet);
+            FD_SET(s->sock, &exceptSet);
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 0;
+            if (select(0, NULL, &writeSet, &exceptSet, &tv) > 0) {
+                if (FD_ISSET(s->sock, &exceptSet)) {
+                    netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                       s->hostSeq, s->guestSeq, NET_TCP_RST | NET_TCP_ACK, NULL, 0);
+                    netCloseTcpSession(s);
+                } else if (FD_ISSET(s->sock, &writeSet)) {
+                    s->state = NET_TCP_ESTABLISHED;
+                    netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                       s->hostSeq, s->guestSeq, NET_TCP_SYN | NET_TCP_ACK, NULL, 0);
+                    s->hostSeq += 1;
+                }
+            }
+            continue;
+        }
+
+        if (s->state == NET_TCP_ESTABLISHED) {
+            unsigned char buf[1400];
+            int n = recv(s->sock, (char *)buf, sizeof(buf), 0);
+            if (n > 0) {
+                netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                   s->hostSeq, s->guestSeq, NET_TCP_PSH | NET_TCP_ACK, buf, (UINT32)n);
+                s->hostSeq += (UINT32)n;
+            } else if (n == 0) {
+                netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                   s->hostSeq, s->guestSeq, NET_TCP_FIN | NET_TCP_ACK, NULL, 0);
+                netCloseTcpSession(s);
+            }
+            // n < 0: non-blocking socket, no data available right now -- nothing to do.
+        }
+    }
+}
+
+// IPv4 dispatcher. This recognizes ICMP echo (addressed to the gateway/
+// DNS), DHCP (addressed to the broadcast, since the client doesn't know
+// the server's IP yet during DISCOVER), and routes UDP/TCP through the
+// general NAT paths above.
+void netHandleIpv4(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    const unsigned char *ip = frame + 14;
+    UINT32 ipLen = len - 14;
+    if (ipLen < 20) return;
+    UINT32 ihl = (ip[0] & 0x0F) * 4;
+    if (ihl < 20 || ipLen < ihl) return;
+
+    unsigned char proto = ip[9];
+    UINT32 srcIp = netRd32(ip + 12);
+    UINT32 dstIp = netRd32(ip + 16);
+    const unsigned char *l4 = ip + ihl;
+    UINT32 l4Len = ipLen - ihl;
+
+    if (proto == 1 && (dstIp == NET_GATEWAY_IP || dstIp == NET_DNS_IP)) {
+        netHandleIcmp(partition, srcIp, dstIp, l4, l4Len);
+        return;
+    }
+    if (proto == 17 && l4Len >= 8) {
+        UINT16 dstPort = netRd16(l4 + 2);
+        if (dstPort == 67) {
+            netHandleDhcp(partition, l4 + 8, l4Len - 8);
+        } else {
+            netHandleUdpGuestPacket(dstIp, l4, l4Len);
+        }
+        return;
+    }
+    if (proto == 6) {
+        netHandleTcpGuestPacket(partition, dstIp, l4, l4Len);
+        return;
+    }
+
+    printf("[net] IPv4 proto=%u src=%d.%d.%d.%d dst=%d.%d.%d.%d len=%u (unhandled)\n",
+           proto, (srcIp >> 24) & 0xFF, (srcIp >> 16) & 0xFF, (srcIp >> 8) & 0xFF, srcIp & 0xFF,
+           (dstIp >> 24) & 0xFF, (dstIp >> 16) & 0xFF, (dstIp >> 8) & 0xFF, dstIp & 0xFF, l4Len);
+    fflush(stdout);
+}
+
+// This backend's implementation of "transmit one guest frame": learns the
+// guest's MAC (needed so synthesized ARP/DHCP/etc. replies can address it
+// directly -- a bridged backend wouldn't need this, since a real switch
+// handles addressing), then dispatches by ethertype. Registered as
+// g_netTransmit below; rtl8139TransmitFrame itself never calls this by
+// name, only through that pointer.
+void netSlirpTransmit(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    if (!netGuestMacKnown) {
+        memcpy(netGuestMac, frame + 6, 6);
+        netGuestMacKnown = 1;
+    }
+
+    UINT16 ethertype = netRd16(frame + 12);
+    if (ethertype == 0x0806) {
+        netHandleArp(partition, frame, len);
+        return;
+    }
+    if (ethertype == 0x0800) {
+        netHandleIpv4(partition, frame, len);
+        return;
+    }
+
+    printf("[rtl8139] TX %u bytes, dst=%02X:%02X:%02X:%02X:%02X:%02X src=%02X:%02X:%02X:%02X:%02X:%02X ethertype=0x%04X\n",
+           len, frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+           frame[6], frame[7], frame[8], frame[9], frame[10], frame[11], ethertype);
+    fflush(stdout);
+}
+
+// Device-level TX entry point, called by the TSDx write handler -- this is
+// the seam a future bridged or host-only backend plugs into. It only
+// validates the frame and hands off to whichever backend is registered in
+// g_netTransmit; it has no protocol knowledge of its own and never needs
+// to change when the backend does.
+void rtl8139TransmitFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    if (len < 14) {
+        printf("[rtl8139] TX %u bytes (too short for a full Ethernet header)\n", len);
+        fflush(stdout);
+        return;
+    }
+    if (g_netTransmit) g_netTransmit(partition, frame, len);
+}
+
+// Backend/test entry point (Phase 2): writes one frame into the RX ring as
+// real hardware would on receipt, and raises ROK. Bounds-checked against
+// the driver's real allocation (ring size + the 16-byte overflow pad real
+// hardware relies on for near-boundary packets) -- if a frame wouldn't fit
+// even using that pad, we wrap to the start rather than risk writing past
+// what the guest actually allocated; this is a simplification of the exact
+// hardware wraparound corner case (undocumented without a spec on hand)
+// made in favor of never writing outside guest memory.
+void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    unsigned char cr = rtl8139Regs[0x37];
+    if (!(cr & 0x08)) return; // RE (receiver enable) not set
+    UINT32 rxBase = *(UINT32 *)&rtl8139Regs[0x30];
+    if (rxBase == 0 || !guestMemory) return;
+
+    UINT32 ringSize = rtl8139RxRingSize();
+    UINT32 avail = ringSize + 16;
+    UINT32 totalLen = 4 + len; // 4-byte status+length header + frame bytes
+    UINT32 alignedLen = (totalLen + 3) & ~3u; // next packet is 4-byte aligned
+    if (totalLen > avail || rxBase + avail > guestMemSize) return; // can't fit / would leave guest RAM
+
+    UINT32 pos = rtl8139RxWritePos % ringSize;
+    if (pos + totalLen > avail) pos = 0; // wouldn't fit before the pad ends -- wrap to start
+
+    unsigned char *ring = (unsigned char *)guestMemory + rxBase;
+    UINT16 rxStatus = 0x0001; // ROK
+    UINT16 rxLen = (UINT16)(len + 4); // real hardware includes the 4-byte CRC it doesn't actually store
+    ring[pos + 0] = (unsigned char)(rxStatus & 0xFF);
+    ring[pos + 1] = (unsigned char)(rxStatus >> 8);
+    ring[pos + 2] = (unsigned char)(rxLen & 0xFF);
+    ring[pos + 3] = (unsigned char)(rxLen >> 8);
+    memcpy(ring + pos + 4, frame, len);
+
+    rtl8139RxWritePos = (pos + alignedLen) % ringSize;
+    *(UINT16 *)&rtl8139Regs[0x3A] = (UINT16)rtl8139RxWritePos; // CBR
+    rtl8139Regs[0x37] &= ~0x01; // BUFE clear -- data now available
+
+    *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0001; // ISR: ROK
+    rtl8139MaybeInjectIrq(partition);
+
+    printf("[rtl8139] RX %u bytes at ring offset 0x%X\n", len, pos);
+    fflush(stdout);
+}
+// PxIS is architecturally RWC (spec 3.3.16) -- clearable by the guest
+// writing 1 to a set bit. Our ABAR is plain, untrapped guest RAM (no MMIO
+// decode, see ahciProcessPendingCommands), so we can't detect that write
+// directly; instead, stale bits from the previous command get cleared when
+// the next command starts processing (see ahciProcessPendingCommands),
+// which is both simpler and more robust than an earlier "pulse" approach
+// that auto-cleared DHRS on the very next host poll -- fast enough that
+// the guest's own (much slower, real-time-paced) polling could miss the
+// bit being set entirely.
+
+void pciInitConfigSpaces(void) {
+    pciHostBridgeConfig[0x00] = 0x86; pciHostBridgeConfig[0x01] = 0x80; // vendor 0x8086
+    pciHostBridgeConfig[0x02] = 0x37; pciHostBridgeConfig[0x03] = 0x12; // device 0x1237 (i440fx)
+    pciHostBridgeConfig[0x08] = 0x02; // revision ID
+    pciHostBridgeConfig[0x0A] = 0x00; // subclass: host bridge
+    pciHostBridgeConfig[0x0B] = 0x06; // base class: bridge device
+    pciHostBridgeConfig[0x0E] = 0x00; // header type 0, single-function
+
+    pciIsaBridgeConfig[0x00] = 0x86; pciIsaBridgeConfig[0x01] = 0x80; // vendor 0x8086
+    pciIsaBridgeConfig[0x02] = 0x00; pciIsaBridgeConfig[0x03] = 0x70; // device 0x7000 (PIIX3)
+    pciIsaBridgeConfig[0x0A] = 0x01; // subclass: ISA bridge
+    pciIsaBridgeConfig[0x0B] = 0x06; // base class: bridge device
+    pciIsaBridgeConfig[0x0E] = 0x80; // header type 0 + multi-function bit (so func 3 gets probed)
+
+    pciPmConfig[0x00] = 0x86; pciPmConfig[0x01] = 0x80; // vendor 0x8086
+    pciPmConfig[0x02] = 0x13; pciPmConfig[0x03] = 0x71; // device 0x7113 (PIIX4 PM)
+    pciPmConfig[0x0A] = 0x80; // subclass: other bridge type
+    pciPmConfig[0x0B] = 0x06; // base class: bridge device
+    pciPmConfig[0x0E] = 0x00;
+
+    // Matches a real ICH9 AHCI controller's IDs -- class-code binding means
+    // the exact vendor/device mostly doesn't matter to a driver, but
+    // matching a real one avoids tripping any vendor-ID-keyed quirk table.
+    pciAhciConfig[0x00] = 0x86; pciAhciConfig[0x01] = 0x80; // vendor 0x8086
+    pciAhciConfig[0x02] = 0x22; pciAhciConfig[0x03] = 0x29; // device 0x2922 (ICH9 AHCI)
+    pciAhciConfig[0x08] = 0x02; // revision ID
+    pciAhciConfig[0x09] = 0x01; // prog IF: AHCI 1.0
+    pciAhciConfig[0x0A] = 0x06; // subclass: SATA controller
+    pciAhciConfig[0x0B] = 0x01; // base class: mass storage controller
+    pciAhciConfig[0x0E] = 0x00; // header type 0, single-function
+
+    // Real Realtek RTL8139 IDs -- same reasoning as AHCI above, matches a
+    // real chip so nothing keyed off vendor/device ID gets confused.
+    pciRtl8139Config[0x00] = 0xEC; pciRtl8139Config[0x01] = 0x10; // vendor 0x10EC (Realtek)
+    pciRtl8139Config[0x02] = 0x39; pciRtl8139Config[0x03] = 0x81; // device 0x8139
+    pciRtl8139Config[0x08] = 0x10; // revision ID (RTL8139C-family)
+    pciRtl8139Config[0x0A] = 0x00; // subclass: ethernet controller
+    pciRtl8139Config[0x0B] = 0x02; // base class: network controller
+    pciRtl8139Config[0x0E] = 0x00; // header type 0, single-function
+    pciRtl8139Config[0x3D] = 0x01; // interrupt pin: INTA#
+
+    pciConfigSpacesInit = 1;
+}
+
+unsigned char *pciSelectConfigSpace(UINT32 bus, UINT32 dev, UINT32 func) {
+    if (bus != 0) return NULL;
+    if (dev == 0 && func == 0) return pciHostBridgeConfig;
+    if (dev == 1 && func == 0) return pciIsaBridgeConfig;
+    if (dev == 1 && func == 3) return pciPmConfig;
+    if (dev == 2 && func == 0) return pciAhciConfig;
+    if (dev == 3 && func == 0) return pciRtl8139Config;
+    return NULL;
+}
+
+// Registers that stay fixed no matter what's written: Vendor/Device ID
+// (0x00-0x03), Revision/Class (0x08-0x0B), and Header Type (0x0E) -- the
+// true identity/class fields per the PCI Type 0 header spec -- plus the six
+// BARs (0x10-0x27, unimplemented in this stub), the expansion ROM base
+// (0x30), the capabilities pointer (0x34, fixed at 0 -- terminates the list
+// immediately, i.e. "no capabilities," so nothing goes looking for a
+// capability chain we don't model), and the interrupt pin (0x3D, "uses no
+// interrupt"). Command/Status (0x04-0x07), Cache Line Size/Latency Timer
+// (0x0C-0x0D), and BIST (0x0F) are genuinely writable on real hardware --
+// software needs Command, in particular, to enable I/O/memory/bus-master
+// decode -- and were previously (incorrectly) swept into the same
+// "0x00-0x0F is read-only" rule as the identity fields, silently
+// discarding writes to it.
+int pciRegisterIsReadOnly(UINT32 offset) {
+    if (offset <= 0x03) return 1;
+    if (offset >= 0x08 && offset <= 0x0B) return 1;
+    if (offset == 0x0E) return 1;
+    if (offset >= 0x10 && offset <= 0x27) return 1;
+    if (offset == 0x30 || offset == 0x31 || offset == 0x32 || offset == 0x33) return 1;
+    if (offset == 0x34) return 1;
+    if (offset == 0x3D) return 1;
+    return 0;
+}
+
+// Fills a freshly-allocated ABAR buffer with the HBA/port0 register reset
+// state a real AHCI 1.3 controller with one SATA disk attached would show:
+// one port implemented (PI), that port already showing a communicated,
+// present SATA (non-ATAPI) device (PxSSTS/PxSIG) so the driver doesn't need
+// to run a real COMRESET/link-training sequence, and PxTFD matching the
+// legacy ATA path's own idle status (DRDY|DSC, no error).
+void ahciInitAbarRegisters(unsigned char *abar) {
+    memset(abar, 0, AHCI_BAR_SIZE);
+    *(UINT32 *)(abar + 0x00) = 0x00200001; // CAP: ISS=Gen2, NCS=0(1 slot), NP=0(1 port)
+    *(UINT32 *)(abar + 0x04) = 0x00000000; // GHC: AE/HR/IE all clear until guest sets them
+    *(UINT32 *)(abar + 0x0C) = 0x00000001; // PI: port 0 implemented
+    *(UINT32 *)(abar + 0x10) = 0x00010301; // VS: AHCI 1.3.1
+
+    unsigned char *port = abar + 0x100;
+    *(UINT32 *)(port + 0x20) = 0x00000050; // PxTFD: DRDY|DSC, no error
+    *(UINT32 *)(port + 0x24) = 0x00000101; // PxSIG: SATA (non-ATAPI) device
+    *(UINT32 *)(port + 0x28) = 0x00000123; // PxSSTS: DET=3(present), SPD=2(3Gbps), IPM=1(active)
+}
+
+// Implements the real PCI BAR-sizing protocol for BAR5 (offset 0x24) --
+// write 0xFFFFFFFF to probe the size (read back a size mask), write a real
+// aligned address to program it. On the first real address write, lazily
+// allocates and maps the ABAR backing buffer at that GPA. Every other
+// register on this device uses the generic per-function byte array (see
+// pciHandleConfigAccess); this one needs real protocol behavior because,
+// unlike the host bridge/PIIX3/PIIX4 (which have no real BARs at all), the
+// AHCI driver needs to actually find this device's register block.
+void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS_CONTEXT *io,
+                           UINT32 baseOffset, UINT32 accessSize, UINT64 *rax) {
+    if (io->AccessInfo.IsWrite) {
+        if (baseOffset == 0x24 && accessSize >= 4) {
+            UINT32 written = (UINT32)io->Rax;
+            if (written == 0xFFFFFFFF) {
+                ahciBar5Sizing = 1;
+            } else {
+                ahciBar5Sizing = 0;
+                UINT32 newBase = written & ~(UINT32)(AHCI_BAR_SIZE - 1);
+                if (newBase != 0 && !ahciAbarMapped) {
+                    ahciAbarBase = newBase;
+                    ahciAbarMemory = VirtualAlloc(NULL, AHCI_BAR_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                    if (ahciAbarMemory) {
+                        ahciInitAbarRegisters((unsigned char *)ahciAbarMemory);
+                        // INSTRUMENTATION (2026-07-18, boot-regression diag): the
+                        // HRESULT of this map was previously ignored. When SeaBIOS
+                        // places BAR5 at 0xFEBFC000 (sub-4GB MMIO hole near the
+                        // APIC/IOAPIC region) instead of 0xC0000000, the disk is
+                        // mis-probed as ATAPI and boot fails -- hypothesis is that
+                        // this map silently fails at that GPA. Log the result to
+                        // confirm/deny. No behavioral change (still sets the flag
+                        // and prints as before) -- purely adds the HRESULT to the log.
+                        HRESULT abarMapHr = WHvMapGpaRange(partition, ahciAbarMemory, ahciAbarBase, AHCI_BAR_SIZE,
+                                       WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite);
+                        ahciAbarMapped = 1;
+                        printf("[ahci] ABAR mapped at 0x%X (WHvMapGpaRange hr=0x%lX %s)\n",
+                               ahciAbarBase, (unsigned long)abarMapHr,
+                               SUCCEEDED(abarMapHr) ? "OK" : "FAILED");
+                        fflush(stdout);
+                    }
+                }
+            }
+        }
+        // Sub-dword writes to a BAR aren't a pattern real firmware uses; ignored.
+    } else {
+        UINT32 currentValue = ahciBar5Sizing ? ~(UINT32)(AHCI_BAR_SIZE - 1) : ahciAbarBase;
+        UINT32 shift = (baseOffset - 0x24) * 8;
+        UINT64 mask = (accessSize >= 4) ? 0xFFFFFFFFULL : (accessSize >= 2 ? 0xFFFFULL : 0xFFULL);
+        *rax = (currentValue >> shift) & mask;
+    }
+}
+
+// Fills the RTL8139 register file with real chip power-on-reset defaults:
+// MAC address (IDR0-5, normally EEPROM-loaded on real hardware -- we just
+// preload it directly), and BMSR reporting link-up (bit 2) so a driver
+// polling for link doesn't spin forever waiting for autonegotiation we
+// don't emulate. Called both at startup and whenever the guest issues a
+// software reset via CR (see rtl8139HandleIoAccess).
+void rtl8139InitRegs(void) {
+    memset(rtl8139Regs, 0, RTL8139_IO_SIZE);
+    memcpy(rtl8139Regs + 0x00, rtl8139Mac, 6); // IDR0-5
+    rtl8139Regs[0x37] = 0x01; // CR: BUFE (RX buffer empty) set, TE/RE/RST clear
+    rtl8139Regs[0x76] = 0x04; // BMSR: bit2 = link status up
+    rtl8139RxWritePos = 0;
+    pendingRtl8139Irq = 0;
+}
+
+// Implements the real PCI BAR-sizing protocol for BAR0 (offset 0x10), the
+// same write-0xFFFFFFFF-to-probe / write-a-real-address-to-program pattern
+// as ahciHandleBar5Access, but for an I/O-space BAR rather than a memory
+// BAR: bit 0 of both the address and the size mask is fixed at 1 (the PCI
+// "this BAR decodes I/O space" indicator), and there's no guest-memory
+// backing to allocate/map -- register accesses at the programmed base are
+// handled directly by rtl8139HandleIoAccess through the normal io-port
+// dispatch switch instead.
+void rtl8139HandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset, UINT32 accessSize, UINT64 *rax) {
+    if (io->AccessInfo.IsWrite) {
+        if (baseOffset == 0x10 && accessSize >= 4) {
+            UINT32 written = (UINT32)io->Rax;
+            if (written == 0xFFFFFFFF) {
+                rtl8139Bar0Sizing = 1;
+            } else {
+                rtl8139Bar0Sizing = 0;
+                // Standard PCI BAR discovery writes 0 first (to disable/
+                // clear the BAR) before the real probe-then-program
+                // sequence -- must not latch that as the final address
+                // (same guard AHCI's BAR5 handler uses via its own
+                // "newBase != 0" check).
+                UINT32 addrPart = written & ~(UINT32)(RTL8139_IO_SIZE - 1);
+                if (addrPart != 0 && rtl8139IoBase == 0) {
+                    rtl8139IoBase = addrPart | 0x1;
+                    rtl8139InitRegs();
+                    printf("[rtl8139] I/O BAR mapped at 0x%X\n", rtl8139IoBase & ~0x3);
+                    fflush(stdout);
+                }
+            }
+        }
+    } else {
+        UINT32 currentValue = rtl8139Bar0Sizing ? (~(UINT32)(RTL8139_IO_SIZE - 1) | 0x1) : rtl8139IoBase;
+        UINT32 shift = (baseOffset - 0x10) * 8;
+        UINT64 mask = (accessSize >= 4) ? 0xFFFFFFFFULL : (accessSize >= 2 ? 0xFFFFULL : 0xFFULL);
+        *rax = (currentValue >> shift) & mask;
+    }
+}
+
+// Handles the actual register file at the guest-programmed BAR0 I/O base
+// (rtl8139IoBase & ~0x3, since bit0 is the I/O-space indicator, not part of
+// the real address). Most registers are plain read/write storage in
+// rtl8139Regs; a handful need real side effects.
+void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT32 base = rtl8139IoBase & ~0x3;
+    UINT32 offset = io->PortNumber - base;
+    UINT32 accessSize = io->AccessInfo.AccessSize ? io->AccessInfo.AccessSize : 1;
+    UINT64 rax = 0;
+
+    if (io->AccessInfo.IsWrite) {
+        UINT64 written = io->Rax;
+        if (offset == 0x37 && accessSize >= 1) {
+            // CR: RST (bit4) resets instantly and clears itself; TE/RE
+            // (bits 2-3) are just tracked. BUFE (bit0) is a status bit the
+            // NIC controls (see rtl8139ReceiveFrame / the CAPR handling
+            // below), not something the driver's write should change --
+            // preserve whatever we currently have there.
+            unsigned char val = (unsigned char)written;
+            if (val & 0x10) {
+                rtl8139InitRegs();
+                printf("[rtl8139] software reset (CR)\n"); fflush(stdout);
+            } else {
+                unsigned char oldCr = rtl8139Regs[0x37];
+                unsigned char newCr = (val & ~(unsigned char)0x11) | (oldCr & 0x01);
+                rtl8139Regs[0x37] = newCr;
+                if (!(oldCr & 0x08) && (newCr & 0x08)) {
+                    // RE freshly enabled -- real hardware resets ring state.
+                    rtl8139RxWritePos = 0;
+                    rtl8139Regs[0x37] |= 0x01; // BUFE set, ring empty
+                    printf("[rtl8139] receiver enabled\n"); fflush(stdout);
+                }
+            }
+        } else if (offset == 0x3E) {
+            // ISR: write-1-to-clear, not a plain overwrite.
+            UINT32 i;
+            for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+                rtl8139Regs[offset + i] &= ~(unsigned char)((written >> (i * 8)) & 0xFF);
+            }
+        } else if ((offset == 0x10 || offset == 0x14 || offset == 0x18 || offset == 0x1C) && accessSize >= 4) {
+            // TSDx: the real "submit this frame" trigger. Store the write
+            // first, then synchronously DMA-read the frame via the
+            // corresponding TSADx (always 0x10 above its TSDx) and hand it
+            // to the backend, matching how fast real hardware transmits
+            // relative to any driver completion poll -- there's no
+            // meaningful "in progress" state to model here.
+            UINT32 i;
+            for (i = 0; i < 4; i++) rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
+
+            UINT32 tsd = *(UINT32 *)&rtl8139Regs[offset];
+            UINT32 size = tsd & 0x1FFF; // bits 0-12
+            UINT32 txAddr = *(UINT32 *)&rtl8139Regs[offset + 0x10]; // TSADx
+
+            if (size > 0 && size <= 1792 && guestMemory && (UINT64)txAddr + size <= guestMemSize) {
+                unsigned char frameBuf[1792];
+                memcpy(frameBuf, (unsigned char *)guestMemory + txAddr, size);
+                rtl8139TransmitFrame(partition, frameBuf, size);
+                *(UINT32 *)&rtl8139Regs[offset] = (tsd & ~(UINT32)0x1FFF) | size | 0x8000 /* TOK */ | 0x2000 /* OWN */;
+                *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0004; // ISR: TOK
+                rtl8139MaybeInjectIrq(partition);
+            }
+        } else if (offset == 0x38 && accessSize >= 2) {
+            // CAPR: guest's RX read pointer, conventionally written as
+            // (consumed_offset - 16). If that catches up to our write
+            // pointer, the ring is drained -- set BUFE.
+            UINT32 i;
+            for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+                rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
+            }
+            UINT16 capr = *(UINT16 *)&rtl8139Regs[0x38];
+            UINT32 ringSize = rtl8139RxRingSize();
+            UINT32 consumedPos = ((UINT32)capr + 16) % ringSize;
+            if (consumedPos == (rtl8139RxWritePos % ringSize)) {
+                rtl8139Regs[0x37] |= 0x01; // BUFE set -- caught up
+            }
+        } else {
+            UINT32 i;
+            for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+                rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
+            }
+        }
+    } else {
+        UINT32 i;
+        for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+            rax |= (UINT64)rtl8139Regs[offset + i] << (i * 8);
+        }
+    }
+
+    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[2] = { 0 };
+    values[0].Reg64 = io->AccessInfo.IsWrite ? 0 : rax;
+    values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+}
+
+// Handles I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC-0xCFF (CONFIG_DATA) --
+// see pciSelectConfigSpace above for what this stub does and doesn't model.
+int pciConfigAccessLogCount = 0;
+
+// Post-2026-07-16-part-10 investigation (see
+// docs/investigations/post-vppt-boot-stall.md): the capped logging below
+// (first 300, then every 50000th) misses whatever PCI config traffic
+// immediately precedes a later, rarer stall -- total access counts by
+// then are in the tens of thousands, landing in the gap. Keep a small
+// ring buffer of the most recent accesses instead, always up to date
+// regardless of total count, so the stall watchdog can dump exactly what
+// led up to a freeze.
+#define PCI_CFG_RING_SIZE 512
+typedef struct { UINT32 bus, dev, func, offset; UINT32 isWrite; UINT64 val; } PciCfgRingEntry;
+PciCfgRingEntry g_pciCfgRing[PCI_CFG_RING_SIZE];
+int g_pciCfgRingPos = 0;
+int g_pciCfgRingCount = 0;
+
+void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    if (!pciConfigSpacesInit) pciInitConfigSpaces();
+
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT16 port = io->PortNumber;
+    UINT64 rax = io->Rax;
+
+    if (port == 0xCF8) {
+        if (io->AccessInfo.IsWrite) {
+            pciConfigAddress = (UINT32)io->Rax;
+        } else {
+            rax = pciConfigAddress;
+        }
+    } else { // 0xCFC-0xCFF
+        UINT32 bus = (pciConfigAddress >> 16) & 0xFF;
+        UINT32 dev = (pciConfigAddress >> 11) & 0x1F;
+        UINT32 func = (pciConfigAddress >> 8) & 0x7;
+        UINT32 baseOffset = (pciConfigAddress & 0xFC) + (port - 0xCFC);
+        UINT32 accessSize = io->AccessInfo.AccessSize ? io->AccessInfo.AccessSize : 4;
+        unsigned char *cfg = pciSelectConfigSpace(bus, dev, func);
+
+        if (cfg == pciAhciConfig && baseOffset >= 0x24 && baseOffset <= 0x27) {
+            ahciHandleBar5Access(partition, io, baseOffset, accessSize, &rax);
+        } else if (cfg == pciRtl8139Config && baseOffset >= 0x10 && baseOffset <= 0x13) {
+            rtl8139HandleBar0Access(io, baseOffset, accessSize, &rax);
+        } else if (cfg != NULL && baseOffset <= 255) {
+            if (io->AccessInfo.IsWrite) {
+                UINT32 i;
+                for (i = 0; i < accessSize && baseOffset + i <= 255; i++) {
+                    if (!pciRegisterIsReadOnly(baseOffset + i)) {
+                        cfg[baseOffset + i] = (unsigned char)((io->Rax >> (i * 8)) & 0xFF);
+                    }
+                }
+            } else {
+                UINT64 value = 0;
+                UINT32 i;
+                for (i = 0; i < accessSize && baseOffset + i <= 255; i++) {
+                    value |= (UINT64)cfg[baseOffset + i] << (i * 8);
+                }
+                rax = value;
+            }
+        } else if (!io->AccessInfo.IsWrite) {
+            rax = 0xFFFFFFFFULL; // no device here
+        }
+        // Writes to a nonexistent bus/device/function are simply dropped.
+
+        g_pciCfgRing[g_pciCfgRingPos].bus = bus;
+        g_pciCfgRing[g_pciCfgRingPos].dev = dev;
+        g_pciCfgRing[g_pciCfgRingPos].func = func;
+        g_pciCfgRing[g_pciCfgRingPos].offset = baseOffset;
+        g_pciCfgRing[g_pciCfgRingPos].isWrite = io->AccessInfo.IsWrite;
+        g_pciCfgRing[g_pciCfgRingPos].val = rax;
+        g_pciCfgRingPos = (g_pciCfgRingPos + 1) % PCI_CFG_RING_SIZE;
+        if (g_pciCfgRingCount < PCI_CFG_RING_SIZE) g_pciCfgRingCount++;
+
+        // TEMP DIAGNOSTIC: understand a heavy, sustained burst of 0xCFC
+        // traffic during Windows 10 boot (millions of exits, PCI enumeration
+        // territory) -- log detailed bus/dev/func/offset for the first N
+        // accesses, then periodically, to see whether it's a genuinely huge
+        // (but bounded/normal) enumeration or something stuck cycling the
+        // same slot.
+        pciConfigAccessLogCount++;
+        if (pciConfigAccessLogCount <= 300 || pciConfigAccessLogCount % 50000 == 0) {
+            printf("[pcicfg #%d] bus=%u dev=%u func=%u off=0x%02X size=%u write=%d val=0x%llX cfg=%s\n",
+                   pciConfigAccessLogCount, bus, dev, func, baseOffset, accessSize, io->AccessInfo.IsWrite,
+                   (unsigned long long)rax, cfg ? "present" : "absent");
+            fflush(stdout);
+        }
+    }
+
+    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[2] = { 0 };
+    values[0].Reg64 = rax;
+    values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+}
+
+// --- AHCI command processing ---
+// A real SATA/AHCI driver requires LBA48 ("48-bit Address feature set")
+// support to be advertised in IDENTIFY DEVICE before it will issue
+// READ/WRITE DMA EXT at all -- without it, AhciBusDxe (or any comparable
+// driver) will complete IDENTIFY successfully and then simply never issue
+// a follow-up read, exactly as observed empirically. ataFillIdentify()
+// itself can't be changed to add this: it's shared with the legacy PIO
+// path, whose ataHandleCommand only implements the 28-bit READ/WRITE
+// SECTORS commands -- if SeaBIOS saw an LBA48-capable drive it could
+// reasonably switch to 48-bit commands that path doesn't handle, and would
+// have no other reason to notice this now-24-bit-limited-in-practice
+// behavior since it currently works precisely because LBA48 isn't
+// advertised. This wrapper overlays only the extra capability words the
+// AHCI path needs, layered on top of the same shared base fields.
+void ahciFillIdentify(unsigned char *buf, UINT64 sectors) {
+    ataFillIdentify(buf, sectors);
+    UINT16 *id = (UINT16 *)buf;
+    id[49] |= 0x0100;  // bit8: DMA supported (bit9 LBA already set by ataFillIdentify)
+    id[76] = 0x0106;   // SATA capabilities: Gen1 (bit1) + Gen2 (bit2) signaling, NCQ (bit8)
+    id[83] = 0x4400;   // bit14: word-valid marker (fixed), bit10: LBA48 supported
+    id[86] = 0x0400;   // bit10: LBA48 supported-and-enabled
+    id[100] = (UINT16)(sectors & 0xFFFF);
+    id[101] = (UINT16)((sectors >> 16) & 0xFFFF);
+    id[102] = (UINT16)((sectors >> 32) & 0xFFFF);
+    id[103] = (UINT16)((sectors >> 48) & 0xFFFF);
+
+    // Word 106 (PHYSICAL/LOGICAL SECTOR SIZE): bit15=0/bit14=1 (fixed,
+    // marks the field valid), bit12=1 (logical sector size exceeds 256
+    // words/512 bytes -- words 117-118 give the real size). Real EDK2
+    // reads exactly these fields this way (AtaAtapiPassThru.c,
+    // BlockSize computation): "(phy_logic_sector_support & (BIT14|BIT15))
+    // == BIT14" then "& BIT12", then logic_sector_size_hi/lo (words
+    // 117-118, a WORD count) * 2 for bytes. Needed so BlockIo->Media->
+    // BlockSize comes out as 2048 for an ISO instead of the 512 default --
+    // EDK2's El Torito parser (PartitionDxe/ElTorito.c) hard-requires
+    // BlockSize==2048 before it will even attempt to recognize a CD-ROM
+    // boot catalog, which is how Windows installer media conventionally
+    // gets consumed.
+    if (ataSectorSize != 512) {
+        UINT32 sectorSizeWords = ataSectorSize / 2;
+        id[106] = 0x4000 | 0x1000; // bit14 | bit12 (bit15 stays 0)
+        id[117] = (UINT16)(sectorSizeWords & 0xFFFF);
+        id[118] = (UINT16)((sectorSizeWords >> 16) & 0xFFFF);
+    }
+}
+
+// Copies data out to (scatter) or in from (gather) the PRDT (Physical
+// Region Descriptor Table) scatter/gather list a command table points to.
+// Each 16-byte PRDT entry is {DBA (low 32 bits of the data buffer GPA),
+// DBAU (high 32 bits -- always 0 here, see the CAP.S64A=0 comment in
+// ahciInitAbarRegisters), Reserved, DBC (byte count - 1, bits 21-0)}.
+UINT32 ahciScatterToPrdt(unsigned char *prdt, UINT16 prdtl, unsigned char *src, UINT32 srcLen) {
+    UINT32 copied = 0;
+    UINT16 i;
+    for (i = 0; i < prdtl && copied < srcLen; i++) {
+        unsigned char *entry = prdt + (UINT64)i * 16;
+        UINT32 dba = *(UINT32 *)(entry + 0x00);
+        UINT32 dbc = (*(UINT32 *)(entry + 0x0C) & 0x3FFFFF) + 1;
+        if (dba == 0 || dba >= guestMemSize) break;
+        UINT32 chunk = dbc;
+        if (chunk > srcLen - copied) chunk = srcLen - copied;
+        if ((UINT64)dba + chunk > guestMemSize) chunk = (UINT32)(guestMemSize - dba);
+        memcpy((unsigned char *)guestMemory + dba, src + copied, chunk);
+        copied += chunk;
+    }
+    return copied;
+}
+
+UINT32 ahciGatherFromPrdt(unsigned char *prdt, UINT16 prdtl, unsigned char *dst, UINT32 dstCap) {
+    UINT32 copied = 0;
+    UINT16 i;
+    for (i = 0; i < prdtl && copied < dstCap; i++) {
+        unsigned char *entry = prdt + (UINT64)i * 16;
+        UINT32 dba = *(UINT32 *)(entry + 0x00);
+        UINT32 dbc = (*(UINT32 *)(entry + 0x0C) & 0x3FFFFF) + 1;
+        if (dba == 0 || dba >= guestMemSize) break;
+        UINT32 chunk = dbc;
+        if (chunk > dstCap - copied) chunk = dstCap - copied;
+        if ((UINT64)dba + chunk > guestMemSize) chunk = (UINT32)(guestMemSize - dba);
+        memcpy(dst + copied, (unsigned char *)guestMemory + dba, chunk);
+        copied += chunk;
+    }
+    return copied;
+}
+
+// Called once per main-loop iteration (like deliverPendingAtaIrq). Checked
+// from the host side rather than trapped per-MMIO-access -- see the design
+// note in the AHCI plan: WHV's MemoryAccess exit doesn't decode the
+// faulting instruction the way IoPortAccess does, so trapping every
+// register touch would need a small x86 instruction decoder. Backing ABAR
+// with real RAM and polling it here instead works because EDK2's AHCI
+// driver itself polls PxCI/PxTFD for command completion during boot rather
+// than relying on interrupts.
+void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
+    if (!ahciAbarMapped || !ataDiskFile) return;
+    unsigned char *abar = (unsigned char *)ahciAbarMemory;
+
+    UINT32 ghc = *(UINT32 *)(abar + 0x04);
+    if (ghc & 0x1) { // GHC.HR: HBA reset requested -- completes instantly
+        ahciInitAbarRegisters(abar);
+        return;
+    }
+    if (!(ghc & 0x80000000)) return; // GHC.AE not set, controller not enabled yet
+    {
+        static int aeLogged = 0;
+        if (!aeLogged) { aeLogged = 1; printf("[ahci] GHC.AE set -- controller enabled\n"); fflush(stdout); }
+    }
+
+    unsigned char *port = abar + 0x100; // port 0 register block
+    UINT32 cmd = *(UINT32 *)(port + 0x18); // PxCMD
+
+    // Mirror ST<->CR and FRE<->FR in both directions so "wait for engine
+    // running" AND "wait for engine stopped" polling loops both see the
+    // state they expect. AhciStopCommand() (called by EDK2's AHCI driver
+    // after every single ATA command, including IDENTIFY) clears ST and
+    // then polls CR waiting for it to clear -- missing the clear-on-stop
+    // direction here left CR stuck at 1 forever once first set, hanging
+    // that poll for its full real timeout after every command and
+    // preventing any command after the first from ever being reached.
+    UINT32 newCmd = cmd;
+    if ((cmd & 0x1) && !(cmd & 0x8000)) newCmd |= 0x8000;  // ST -> CR
+    else if (!(cmd & 0x1) && (cmd & 0x8000)) {
+        newCmd &= ~0x8000u; // !ST -> !CR
+        // The driver only clears ST (via AhciStopCommand) *after* it has
+        // already read/consumed whatever PxIS state mattered for the
+        // command that just ran -- so this transition is the correct,
+        // guest-observable moment to clear DHRS too. Doing it here instead
+        // of on a fixed real-time delay or "next command" boundary avoids
+        // a race we hit with both of those: a fast guest-side retry loop
+        // (Stop -> Disable -> Build -> Start, all effectively instant
+        // relative to real time) could restart a new command before either
+        // a short timer or our own next poll ever got to clear the old
+        // bit, so AhciCheckFisReceived kept reading the *previous*
+        // command's stale DHRS as this new command's completion, saw the
+        // resulting byte count mismatch, and retried forever.
+        *(UINT32 *)(port + 0x10) = 0;
+    }
+    if ((cmd & 0x10) && !(cmd & 0x4000)) newCmd |= 0x4000; // FRE -> FR
+    else if (!(cmd & 0x10) && (cmd & 0x4000)) newCmd &= ~0x4000u; // !FRE -> !FR
+    if (newCmd != cmd) { *(UINT32 *)(port + 0x18) = newCmd; cmd = newCmd; }
+
+    if (!(cmd & 0x1)) return; // ST not set, port not started
+    {
+        static int stLogged = 0;
+        if (!stLogged) { stLogged = 1; printf("[ahci] PxCMD.ST set -- port 0 started\n"); fflush(stdout); }
+    }
+
+    UINT32 ci = *(UINT32 *)(port + 0x38); // PxCI
+    if (ci == 0) return;
+
+    int slot = -1, i;
+    for (i = 0; i < 32; i++) { if (ci & (1u << i)) { slot = i; break; } }
+    if (slot < 0) return;
+
+    // Clear any stale PxIS bits left over from the previous command before
+    // processing this one -- see the DHRS comment at the end of this
+    // function for why this replaced the old "pulse" approach.
+    *(UINT32 *)(port + 0x10) = 0;
+
+    UINT32 clb = *(UINT32 *)(port + 0x00); // PxCLB (32-bit only -- CAP.S64A=0)
+    if (clb == 0 || clb >= guestMemSize) { *(UINT32 *)(port + 0x38) &= ~(1u << slot); return; }
+
+    unsigned char *cmdHeader = (unsigned char *)guestMemory + clb + (UINT64)slot * 32;
+    UINT16 prdtl = *(UINT16 *)(cmdHeader + 0x02);
+    UINT32 ctba = *(UINT32 *)(cmdHeader + 0x08);
+
+    if (ctba == 0 || ctba >= guestMemSize) { *(UINT32 *)(port + 0x38) &= ~(1u << slot); return; }
+    unsigned char *cmdTable = (unsigned char *)guestMemory + ctba;
+    unsigned char *cfis = cmdTable; // Register H2D FIS at command table offset 0
+    unsigned char ataCmd = cfis[2]; // byte 2 of a Register H2D FIS: the ATA command
+    UINT32 lbaLow = (UINT32)cfis[4] | ((UINT32)cfis[5] << 8) | ((UINT32)cfis[6] << 16);
+    UINT32 lbaHigh = (UINT32)cfis[8] | ((UINT32)cfis[9] << 8) | ((UINT32)cfis[10] << 16);
+    UINT32 sectorCount = (UINT32)cfis[12] | ((UINT32)cfis[13] << 8);
+    // ATA's classic "0 means max" sector-count convention -- but the max
+    // differs by addressing mode: 28-bit commands (0x20/0x30/0xC8/0xCA) use
+    // an 8-bit-derived count where 0 means 256; 48-bit EXT commands
+    // (0x24/0x34/0x25/0x35) use the full 16-bit field where 0 means 65536.
+    // Treating every 0 as "1 sector" (the previous behavior) silently
+    // under-delivered on any request that legitimately meant the max size
+    // -- confirmed via a captured PRDT expecting 131072 bytes (256
+    // sectors) for a request whose CFIS sector count was 0, while we were
+    // only transferring 512 bytes and leaving the rest of the guest's
+    // buffer untouched (effectively garbage), corrupting real file reads.
+    if (sectorCount == 0) {
+        int is48Bit = (ataCmd == 0x24 || ataCmd == 0x34 || ataCmd == 0x25 || ataCmd == 0x35);
+        sectorCount = is48Bit ? 65536 : 256;
+    }
+    UINT64 lba = ((UINT64)lbaHigh << 24) | lbaLow;
+
+    unsigned char *prdt = cmdTable + 0x80; // PRDT starts at command table offset 0x80
+    UINT32 bytesTransferred = 0;
+    int ok = 1;
+
+    {
+        ahciCmdLogCount++;
+        if (ahciCmdLogCount < 200) {
+            printf("[ahci] cmd #%d: ataCmd=0x%02X lba=%llu count=%u prdtl=%u\n",
+                   ahciCmdLogCount, ataCmd, (unsigned long long)lba, sectorCount, prdtl);
+            fflush(stdout);
+        }
+    }
+
+    if (ataCmd == 0xEC) { // IDENTIFY DEVICE
+        unsigned char idBuf[512];
+        ahciFillIdentify(idBuf, ataDiskSectors);
+        bytesTransferred = ahciScatterToPrdt(prdt, prdtl, idBuf, 512);
+    } else if (ataCmd == 0x25 || ataCmd == 0xC8 || ataCmd == 0x20 || ataCmd == 0x24) {
+        // READ DMA EXT / READ DMA / READ SECTORS / READ SECTORS EXT -- AHCI
+        // always moves data via the PRDT regardless of which ATA command
+        // nominally requested it (there's no real distinction between "PIO"
+        // and "DMA" at the AHCI protocol level, only in what the driver
+        // calls it), so 0x20/0x24 need the same real read as 0x25/0xC8.
+        // AtaBusDxe uses 0x20 for its own PIO-mode reads once it's done its
+        // own device probing/mode negotiation -- confirmed via trace after
+        // fixing the DHRS staleness bug: without this, those reads
+        // silently returned no data at all.
+        if ((lba + sectorCount) > ataDiskSectors || (UINT64)sectorCount * ataSectorSize > ATA_MAX_TRANSFER) {
+            ok = 0;
+        } else {
+            _fseeki64(ataDiskFile, (long long)lba * ataSectorSize, SEEK_SET);
+            fread(ataDataBuffer, 1, (size_t)sectorCount * ataSectorSize, ataDiskFile);
+            bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, sectorCount * ataSectorSize);
+        }
+    } else if (ataCmd == 0x35 || ataCmd == 0xCA || ataCmd == 0x30 || ataCmd == 0x34) {
+        // WRITE DMA EXT / WRITE DMA / WRITE SECTORS / WRITE SECTORS EXT -- see
+        // the read-side comment above for why the PIO opcodes need the same
+        // handling as their DMA counterparts here.
+        if ((lba + sectorCount) > ataDiskSectors || (UINT64)sectorCount * ataSectorSize > ATA_MAX_TRANSFER) {
+            ok = 0;
+        } else {
+            UINT32 gathered = ahciGatherFromPrdt(prdt, prdtl, ataDataBuffer, sectorCount * ataSectorSize);
+            _fseeki64(ataDiskFile, (long long)lba * ataSectorSize, SEEK_SET);
+            fwrite(ataDataBuffer, 1, gathered, ataDiskFile);
+            fflush(ataDiskFile);
+            bytesTransferred = gathered;
+        }
+    } else if (ataCmd == 0xEA || ataCmd == 0xE7) { // FLUSH CACHE EXT / FLUSH CACHE
+        fflush(ataDiskFile);
+    }
+    // Other commands (e.g. SET FEATURES) are silently accepted as no-ops --
+    // matches how the boot-time driver doesn't strictly need them to succeed.
+
+    *(UINT32 *)(cmdHeader + 0x04) = bytesTransferred; // PRDBC: bytes actually transferred
+    *(UINT32 *)(port + 0x38) &= ~(1u << slot);         // PxCI: clear -- command complete
+    *(UINT32 *)(port + 0x20) = ok ? 0x00000050 : 0x00000451; // PxTFD: DRDY|DSC, or ERR|ABRT
+    // PxIS: DHRS. Left set (not auto-cleared on the next poll) until the
+    // next command starts, unlike the earlier "pulse" approach -- ABAR is
+    // untrapped guest RAM polled once per host main-loop iteration, which
+    // can run many times faster than the guest's own polling interval
+    // (EDK2's AhciWaitUntilFisReceived polls every 100us). Clearing the bit
+    // that fast risked the guest never sampling it set at all, which -- for
+    // AhciPioTransfer's PIO-read wait on SataFisPioSetup specifically,
+    // which AhciCheckFisReceived accepts DHRS as satisfying -- meant
+    // IDENTIFY DEVICE's own completion wait timed out, AhciIdentify
+    // returned EFI_TIMEOUT, and AhciModeInitialization's per-port loop
+    // treated that as EFI_ERROR and skipped the device via `continue`
+    // before ever reaching SetFeature or CreateNewDeviceInfo -- the actual
+    // root cause of "no READ command after IDENTIFY", confirmed against
+    // EDK2's real AhciMode.c source rather than guessed.
+    *(UINT32 *)(port + 0x10) |= 0x1;
+}
+
+// Handles I/O ports 0x3F8-0x3FF (COM1) -- see uartIer's comment above for
+// what this stub does and doesn't model. DLAB (Line Control Register bit
+// 7) is honored so baud-rate divisor programming doesn't get misread as
+// characters to transmit: while set, 0x3F8/0x3F9 address the divisor
+// latch instead of THR/RBR and IER.
+void uartHandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT16 port = io->PortNumber;
+    UINT64 rax = io->Rax;
+    int dlab = (uartLcr & 0x80) != 0;
+
+    if (io->AccessInfo.IsWrite) {
+        unsigned char val = (unsigned char)io->Rax;
+        switch (port) {
+            case 0x3F8: if (dlab) uartDivisorLow = val; else appendToLog((char)val); break;
+            case 0x3F9: if (dlab) uartDivisorHigh = val; else uartIer = val; break;
+            case 0x3FA: break; // FCR: FIFO control, no real FIFO to configure
+            case 0x3FB: uartLcr = val; break;
+            case 0x3FC: uartMcr = val; break;
+            case 0x3FF: uartScr = val; break;
+            default: break; // 0x3FD (LSR), 0x3FE (MSR) are read-only status
+        }
+    } else {
+        switch (port) {
+            case 0x3F8: rax = dlab ? uartDivisorLow : 0x00; break; // RBR: no received data available
+            case 0x3F9: rax = dlab ? uartDivisorHigh : uartIer; break;
+            case 0x3FA: rax = 0x01; break; // IIR: no interrupt pending
+            case 0x3FB: rax = uartLcr; break;
+            case 0x3FC: rax = uartMcr; break;
+            case 0x3FD: rax = 0x60; break; // LSR: THRE|TEMT set, always ready to transmit
+            case 0x3FE: rax = 0xB0; break; // MSR: CTS|DSR|DCD asserted
+            case 0x3FF: rax = uartScr; break;
+            default: rax = 0xFF; break;
+        }
+    }
+
+    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[2] = { 0 };
+    values[0].Reg64 = rax;
+    values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+}
+
+// Runs for the lifetime of the process once a debug session is enabled.
+// ConnectNamedPipe blocks (synchronously, on this dedicated thread) until
+// WinDbg attaches, then ReadFile blocks until either more bytes arrive or
+// the pipe breaks (debugger detached) -- at which point it loops back to
+// wait for a fresh connection, so a WinDbg restart doesn't require
+// restarting the hypervisor.
+DWORD WINAPI kdPipeReaderThread(LPVOID param) {
+    (void)param;
+    unsigned char buf[256];
+    static int outerLoopCount = 0;
+    for (;;) {
+        outerLoopCount++;
+        if (outerLoopCount <= 20) {
+            printf("[kd-reader] outer loop #%d: calling ConnectNamedPipe\n", outerLoopCount);
+            fflush(stdout);
+        }
+        BOOL connected = ConnectNamedPipe(kdPipe, NULL);
+        DWORD connectErr = connected ? 0 : GetLastError();
+        if (!connected && connectErr != ERROR_PIPE_CONNECTED) {
+            if (outerLoopCount <= 20) {
+                printf("[kd-reader] ConnectNamedPipe failed, err=%lu -- sleeping\n", connectErr);
+                fflush(stdout);
+            }
+            Sleep(200);
+            continue;
+        }
+        if (outerLoopCount <= 20) {
+            printf("[kd-reader] connected (connectErr=%lu), entering read loop\n", connectErr);
+            fflush(stdout);
+        }
+        printf("[kd] WinDbg connected via \\\\.\\pipe\\LocalHostKD\n");
+        fflush(stdout);
+        kdClientConnected = 1;
+        int innerReadCount = 0;
+        for (;;) {
+            DWORD bytesRead = 0;
+            BOOL ok = ReadFile(kdPipe, buf, sizeof(buf), &bytesRead, NULL);
+            DWORD readErr = ok ? 0 : GetLastError();
+            innerReadCount++;
+            if (outerLoopCount <= 20 && innerReadCount <= 60) {
+                printf("[kd-reader] ReadFile #%d: ok=%d bytesRead=%lu err=%lu bytes:",
+                       innerReadCount, ok, bytesRead, readErr);
+                for (DWORD bi = 0; bi < bytesRead; bi++) printf(" %02X", buf[bi]);
+                printf("\n");
+                fflush(stdout);
+            }
+            if (!ok || bytesRead == 0) break; // pipe broke -- debugger detached
+            EnterCriticalSection(&kdRxLock);
+            for (DWORD i = 0; i < bytesRead; i++) {
+                int next = (kdRxHead + 1) % (int)sizeof(kdRxBuf);
+                if (next != kdRxTail) { kdRxBuf[kdRxHead] = buf[i]; kdRxHead = next; }
+            }
+            LeaveCriticalSection(&kdRxLock);
+        }
+        kdClientConnected = 0;
+        printf("[kd] WinDbg disconnected -- waiting for reconnect\n");
+        fflush(stdout);
+        DisconnectNamedPipe(kdPipe);
+    }
+    return 0;
+}
+
+// Drains kdTxBuf (filled by the guest's COM2 transmit-register writes) and
+// calls the actual blocking WriteFile on this dedicated thread -- never on
+// the main VM thread. WriteFile on a named pipe with no connected client
+// blocks indefinitely, and doing that on the thread that also services
+// WHvRunVirtualProcessor would freeze the entire guest (and did, before this
+// was split out): the guest kept polling COM2 waiting for a reply while the
+// host was itself stuck inside the write it needed to complete first.
+DWORD WINAPI kdPipeWriterThread(LPVOID param) {
+    (void)param;
+    unsigned char buf[256];
+    for (;;) {
+        WaitForSingleObject(kdTxEvent, INFINITE);
+        for (;;) {
+            int count = 0;
+            EnterCriticalSection(&kdTxLock);
+            while (kdTxTail != kdTxHead && count < (int)sizeof(buf)) {
+                buf[count++] = kdTxBuf[kdTxTail];
+                kdTxTail = (kdTxTail + 1) % (int)sizeof(kdTxBuf);
+            }
+            LeaveCriticalSection(&kdTxLock);
+            if (count == 0) break;
+            DWORD written = 0;
+            WriteFile(kdPipe, buf, count, &written, NULL);
+        }
+    }
+    return 0;
+}
+
+// Handles I/O ports 0x2F8-0x2FF (COM2) -- same 16550 register layout as
+// uartHandleAccess (COM1), but transmit/receive go through the named-pipe
+// bridge to a real debugger instead of our text log. See the kdPipe globals'
+// comment for why this is a separate port range from COM1.
+void uart2HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT16 port = io->PortNumber;
+    UINT64 rax = io->Rax;
+    int dlab = (uart2Lcr & 0x80) != 0;
+
+    // TEMP DIAGNOSTIC: confirm the guest is actually touching COM2 at all
+    // (vs. relying on an ACPI DBG2 table to discover the debug UART, which
+    // we don't provide) before investing further in the KD handshake.
+    static int uart2AccessCount = 0;
+    static int uart2PostConnectCount = 0;
+    int logPostConnect = 0;
+    if (uart2AccessCount < 40) {
+        uart2AccessCount++;
+        printf("[uart2] #%d port=0x%X write=%d val=0x%llX\n", uart2AccessCount, port,
+               io->AccessInfo.IsWrite, (unsigned long long)io->Rax);
+        fflush(stdout);
+    } else if (kdClientConnected && uart2PostConnectCount < 200000) {
+        logPostConnect = 1;
+    }
+
+    if (io->AccessInfo.IsWrite) {
+        unsigned char val = (unsigned char)io->Rax;
+        switch (port) {
+            case 0x2F8:
+                if (dlab) {
+                    uart2DivisorLow = val;
+                } else if (kdPipe != INVALID_HANDLE_VALUE) {
+                    EnterCriticalSection(&kdTxLock);
+                    int next = (kdTxHead + 1) % (int)sizeof(kdTxBuf);
+                    if (next != kdTxTail) { kdTxBuf[kdTxHead] = val; kdTxHead = next; }
+                    LeaveCriticalSection(&kdTxLock);
+                    SetEvent(kdTxEvent);
+                }
+                break;
+            case 0x2F9: if (dlab) uart2DivisorHigh = val; else uart2Ier = val; break;
+            // FCR: honor FIFO-enable (bit0). The guest (both OVMF and, per
+            // the KD investigation, likely the kernel's serial transport
+            // too) probes for 16550A FIFO support via FCR=0x07 -- always
+            // answering IIR as "no FIFO" (a plain 8250/16450) regardless
+            // could push FIFO-aware software onto a more conservative,
+            // more heavily-polled non-FIFO code path than necessary.
+            case 0x2FA: uart2FifoEnabled = (val & 0x01) ? 1 : 0; break;
+            case 0x2FB: uart2Lcr = val; break;
+            case 0x2FC: uart2Mcr = val; break;
+            case 0x2FF: uart2Scr = val; break;
+            default: break;
+        }
+    } else {
+        switch (port) {
+            case 0x2F8:
+                if (dlab) {
+                    rax = uart2DivisorLow;
+                } else {
+                    rax = 0x00;
+                    EnterCriticalSection(&kdRxLock);
+                    if (kdRxTail != kdRxHead) {
+                        rax = kdRxBuf[kdRxTail];
+                        kdRxTail = (kdRxTail + 1) % (int)sizeof(kdRxBuf);
+                    }
+                    LeaveCriticalSection(&kdRxLock);
+                }
+                break;
+            case 0x2F9: rax = dlab ? uart2DivisorHigh : uart2Ier; break;
+            // IIR: bit0=1 (no interrupt pending, matches our polled-only
+            // model), bits7:6=11 when FIFO is enabled (16550A signature) --
+            // 0xC1 vs 0x01, matching real hardware's own IIR encoding.
+            case 0x2FA: rax = uart2FifoEnabled ? 0xC1 : 0x01; break;
+            case 0x2FB: rax = uart2Lcr; break;
+            case 0x2FC: rax = uart2Mcr; break;
+            case 0x2FD: { // LSR: THRE|TEMT always set (writes are synchronous); DR reflects the ring buffer
+                unsigned char lsr = 0x60;
+                EnterCriticalSection(&kdRxLock);
+                if (kdRxTail != kdRxHead) lsr |= 0x01;
+                LeaveCriticalSection(&kdRxLock);
+                rax = lsr;
+                break;
+            }
+            case 0x2FE: rax = 0xB0; break; // MSR: CTS|DSR|DCD asserted
+            case 0x2FF: rax = uart2Scr; break;
+            default: rax = 0xFF; break;
+        }
+    }
+
+    if (logPostConnect) {
+        uart2PostConnectCount++;
+        unsigned char lowByte = (unsigned char)(io->AccessInfo.IsWrite ? io->Rax : rax);
+        char printable = (lowByte >= 0x20 && lowByte < 0x7F) ? (char)lowByte : '.';
+        // Only print the interesting events (RBR access, or LSR showing
+        // Data-Ready) plus periodic heartbeats -- otherwise this floods
+        // with near-identical LSR/MSR poll spam long before anything
+        // relevant happens (confirmed: 400 entries wasn't enough window to
+        // even reach WinDbg's first real response).
+        int interesting = (port == 0x2F8) || (port == 0x2FD && (lowByte & 0x01));
+        if (interesting || uart2PostConnectCount % 20000 == 0) {
+            printf("[uart2-postconnect] #%d port=0x%X write=%d byte=0x%02X '%c'%s\n", uart2PostConnectCount, port,
+                   io->AccessInfo.IsWrite, lowByte, printable, interesting ? " <<<" : "");
+            fflush(stdout);
+        }
+    }
+
+    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[2] = { 0 };
+    values[0].Reg64 = rax;
+    values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+}
+
+// --- fw_cfg device (ports 0x510 selector / 0x511 data) + minimal ACPI ---
+// OVMF does not synthesize ACPI tables itself -- it only builds them from
+// data supplied by the platform via fw_cfg (OvmfPkg's QemuFwCfgAcpi /
+// AcpiPlatformDxe, which reads a "linker/loader" script telling it how to
+// place and cross-link a set of named files). Without fw_cfg present at
+// all, that driver has nothing to load and installs no ACPI tables, which
+// essentially every x86_64 UEFI-booting kernel needs (RSDP/XSDT/FADT/MADT)
+// to enumerate CPUs and fixed hardware. This models just enough of the
+// protocol to deliver a minimal table set: signature/ID probes, the file
+// directory, and three named files (RSDP, a combined XSDT+FADT+MADT+DSDT
+// blob, and the loader script).
+#define FWCFG_KEY_SIGNATURE 0x0000
+#define FWCFG_KEY_ID        0x0001
+#define FWCFG_KEY_FILE_DIR  0x0019
+#define FWCFG_KEY_RSDP      0x0020
+#define FWCFG_KEY_TABLES    0x0021
+#define FWCFG_KEY_LOADER    0x0022
+#define FWCFG_KEY_RAMFB     0x0023
+
+// --- Minimal I/O APIC MMIO emulation ---
+// Added alongside the MADT I/O APIC entry (see acpiBuildTables) once a live
+// guest-memory bugcheck readout (KiBugCheckData via a page-table walk,
+// resolved against the real ntkrnlmp.pdb) confirmed the NT kernel's HAL
+// unconditionally requires one during HalpInitSystemPhase0. This only needs
+// to satisfy that enumeration/initialization contract -- the redirection
+// table starts fully masked (mask bit set, matching real hardware's
+// power-on default) and nothing here actually routes an interrupt; existing
+// IRQ delivery still goes through the direct WHvRegisterPendingInterruption
+// injection hack used everywhere else in this file. Real hardware/QEMU also
+// place the I/O APIC at this exact fixed physical address.
+#define IOAPIC_MMIO_BASE 0xFEC00000ULL
+#define IOAPIC_MMIO_SIZE  0x20
+// Second I/O APIC, GSI 24-47 -- added as an empirical follow-up once the
+// single 24-entry IOAPIC (GSI 0-23) didn't clear bugcheck 0x5C
+// (HAL_INITIALIZATION_FAILED, param3=0x19 unchanged across three unrelated
+// MADT additions, suggesting the failure doesn't depend on MADT override
+// content at all). Hypothesis: something (PCI interrupt routing, absent a
+// real AML _PRT since our DSDT has no namespace content) needs a GSI beyond
+// 23, which no controller could cover with only one 24-entry IOAPIC.
+#define IOAPIC2_MMIO_BASE 0xFEC01000ULL
+#define IOAPIC2_GSI_BASE 24
+
+typedef struct {
+    UINT32 id;
+    UINT32 selectedReg;
+    UINT64 redirTable[24];
+} IoApicState;
+
+IoApicState ioapic1 = { 1, 0, { 0 } };
+IoApicState ioapic2 = { 2, 0, { 0 } };
+
+UINT32 ioapicReadRegister(IoApicState *ap, UINT32 reg) {
+    if (reg == 0x00) return (ap->id & 0xF) << 24;
+    if (reg == 0x01) return (23u << 16) | 0x11u; // Version 0x11, Max Redirection Entry = 23 (24 entries)
+    if (reg == 0x02) return 0; // Arbitration ID
+    if (reg >= 0x10 && reg <= 0x3F) {
+        int entry = (reg - 0x10) / 2;
+        int isHigh = (reg - 0x10) % 2;
+        UINT64 val = ap->redirTable[entry];
+        return isHigh ? (UINT32)(val >> 32) : (UINT32)(val & 0xFFFFFFFFULL);
+    }
+    return 0;
+}
+
+void ioapicWriteRegister(IoApicState *ap, UINT32 reg, UINT32 value) {
+    if (reg == 0x00) { ap->id = (value >> 24) & 0xF; return; }
+    if (reg == 0x01 || reg == 0x02) return; // read-only
+    if (reg >= 0x10 && reg <= 0x3F) {
+        int entry = (reg - 0x10) / 2;
+        int isHigh = (reg - 0x10) % 2;
+        UINT64 old = ap->redirTable[entry];
+        if (isHigh) ap->redirTable[entry] = (old & 0xFFFFFFFFULL) | ((UINT64)value << 32);
+        else ap->redirTable[entry] = (old & 0xFFFFFFFF00000000ULL) | value;
+    }
+}
+
+// Resolves which vector to actually inject for a legacy ISA IRQ that our
+// MADT maps to gsi via an Interrupt Source Override. While the IOAPIC's
+// redirection entry for that GSI is still untouched (fully masked, vector
+// 0 -- the power-on default), keep using the legacy 8259-remap vector,
+// matching real hardware's PIC-compatibility behavior before an OS
+// reprograms IOAPIC-based routing. Once the guest has written anything
+// else to that entry (confirmed via live kernel tracing: HAL successfully
+// configures it, e.g. vector 0xD1 for the clock interrupt, but our
+// injection code was still hardcoding the legacy vector and the
+// programmed one never fired -- see docs/investigations/vppt-synic-blocker.md
+// part 9/10), honor the entry directly: skip injection if masked,
+// otherwise use its own vector field.
+int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outVector) {
+    IoApicState *ap = (gsi < 24) ? &ioapic1 : &ioapic2;
+    int entry = (gsi < 24) ? gsi : (gsi - IOAPIC2_GSI_BASE);
+    UINT64 rte = ap->redirTable[entry];
+    if (rte == 0x10000ULL) {
+        *outVector = legacyVector;
+        return 1;
+    }
+    if (rte & 0x10000ULL) {
+        return 0; // masked -- guest doesn't want this GSI delivered
+    }
+    *outVector = (unsigned char)(rte & 0xFF);
+    return 1;
+}
+
+// Fires the RTC's periodic interrupt (IRQ8) when Register B's PIE bit is
+// set and the programmed rate's interval has elapsed. Must be called from
+// BOTH the halted-CPU wait loop and the main run loop's per-iteration
+// pending-IRQ delivery (alongside deliverPendingAtaIrq/deliverPendingRtl8139Irq)
+// -- calling it only from the halted branch was the reason the very first
+// version of this fix still didn't clear the bugcheck: HalpTimerWaitForPhase0Interrupt
+// (see docs/investigations/vppt-synic-blocker.md part 10) waits via
+// KeStallExecutionProcessor, a busy-spin loop, not HLT, so the guest never
+// enters the halted branch during that exact 3-second window and our
+// injection code never got a chance to run at all.
+int deliverRtcPeriodicIrq(WHV_PARTITION_HANDLE partition) {
+    static int diagCount = 0;
+    static int diagSkippedDisabled = 0;
+    static int diagFired = 0;
+    if (!(cmosRegisters[0x0B] & 0x40)) return 0; // PIE not enabled
+    double intervalMs = rtcPeriodicIntervalMs(cmosRegisters[0x0A]);
+    if (intervalMs <= 0.0) return 0;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsedMs = (double)(now.QuadPart - lastRtcPeriodicTick.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+    if (rtcPeriodicTickArmed && elapsedMs < intervalMs) return 0;
+    lastRtcPeriodicTick = now;
+    rtcPeriodicTickArmed = 1;
+    cmosRegisters[0x0C] |= 0xC0; // PF (0x40) + IRQF (0x80)
+    diagCount++;
+    if (!guestInterruptsEnabled(partition)) {
+        diagSkippedDisabled++;
+        if (diagCount <= 30 || diagCount % 500 == 0) {
+            printf("[rtc-diag] tick #%d SKIPPED (interrupts disabled), skippedTotal=%d firedTotal=%d\n",
+                   diagCount, diagSkippedDisabled, diagFired);
+            fflush(stdout);
+        }
+        return 0;
+    }
+    unsigned char rtcVector;
+    if (ioapicResolveVector(8, 0x70, &rtcVector)) {
+        diagFired++;
+        if (diagCount <= 30 || diagCount % 500 == 0) {
+            printf("[rtc-diag] tick #%d FIRED vector=0x%02X, skippedTotal=%d firedTotal=%d\n",
+                   diagCount, rtcVector, diagSkippedDisabled, diagFired);
+            fflush(stdout);
+        }
+        injectInterrupt(partition, rtcVector);
+        return 1;
+    }
+    return 0;
+}
+
+// PIT timer IRQ0 delivery outside the halted-CPU wait loop. Confirmed live
+// (see docs/investigations/post-vppt-boot-stall.md, PM1a_CNT stall entry):
+// a real-mode SeaBIOS delay/calibration loop that busy-waits on elapsed PIT
+// ticks WITHOUT halting produces zero VM exits of its own, so
+// WHvRunVirtualProcessor never returns and this hypervisor's only IRQ0
+// source (the halted-wait branch, deliverPendingAtaIrq/deliverRtcPeriodicIrq
+// etc. below) never gets a chance to run -- a permanent hang, confirmed
+// reproducible. rtcCancelThread already exists to force periodic returns
+// via WHvCancelRunVirtualProcessor precisely for this "CPU-bound busy-spin
+// with no exits" case, but was previously gated on the RTC's own
+// periodic-interrupt-enable bit, which isn't set this early in POST --
+// broadened below to fire unconditionally so this function actually gets
+// invoked during a plain PIT-based spin too.
+int deliverPitTimerIrq(WHV_PARTITION_HANDLE partition) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double elapsedMs = (double)(now.QuadPart - lastTimerTick.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+    if (elapsedMs < TIMER_TICK_INTERVAL_MS) return 0;
+    lastTimerTick = now;
+    if (!guestInterruptsEnabled(partition)) return 0;
+    injectInterrupt(partition, 0x08); // IRQ0 - timer
+    return 1;
+}
+
+// x86-64 GPR encoding order (as used by ModRM.reg/rm, REX-extended 0-15).
+WHV_REGISTER_NAME ioapicGprNames[16] = {
+    WHvX64RegisterRax, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRbx,
+    WHvX64RegisterRsp, WHvX64RegisterRbp, WHvX64RegisterRsi, WHvX64RegisterRdi,
+    WHvX64RegisterR8,  WHvX64RegisterR9,  WHvX64RegisterR10, WHvX64RegisterR11,
+    WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15
+};
+
+// Decodes just enough of a `mov` touching memory (0x89 store r32->mem, 0x8B
+// load mem->r32, 0xC7 /0 store imm32->mem) to know direction and which
+// register/immediate is involved. Deliberately doesn't interpret the
+// ModRM/SIB addressing computation at all -- WHV already hands us the exact
+// faulting GPA directly, so we only need to walk past those bytes to find
+// where the opcode's own operand (reg field, or the 0xC7 immediate) lives.
+int ioapicDecodeMmio(unsigned char *insn, int len, int *isWrite, int *isImm, int *regNum, UINT32 *immVal, int *totalLen) {
+    int i = 0;
+    int rexR = 0, hasRex = 0;
+    if (i < len && insn[i] >= 0x40 && insn[i] <= 0x4F) {
+        hasRex = 1; rexR = (insn[i] >> 2) & 1; i++;
+    }
+    if (i >= len) return 0;
+    unsigned char opcode = insn[i++];
+    if (opcode != 0x89 && opcode != 0x8B && opcode != 0xC7) return 0;
+    if (i >= len) return 0;
+    unsigned char modrm = insn[i++];
+    unsigned char mod = (modrm >> 6) & 3;
+    unsigned char regField = (modrm >> 3) & 7;
+    unsigned char rm = modrm & 7;
+    if (hasRex && rexR) regField += 8;
+    if (mod != 3 && rm == 4) i++; // SIB byte present
+    if (mod == 1) i += 1;
+    else if (mod == 2) i += 4;
+    else if (mod == 0 && rm == 5) i += 4; // RIP-relative disp32
+
+    if (opcode == 0xC7) {
+        if (i + 4 > len) return 0;
+        *isWrite = 1; *isImm = 1;
+        memcpy(immVal, insn + i, 4);
+        *totalLen = i + 4;
+        return 1;
+    }
+    *isWrite = (opcode == 0x89);
+    *isImm = 0;
+    *regNum = regField;
+    *totalLen = i;
+    return 1;
+}
+
+// Returns 1 if the fault was inside the I/O APIC's MMIO window and was
+// handled (register state updated, RIP advanced); 0 otherwise, so the
+// caller can fall back to its generic unmapped-GPA handling.
+int ioapicAccessLogCount = 0;
+
+int ioapicHandleMmioAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    UINT64 gpa = exitContext->MemoryAccess.Gpa;
+    IoApicState *ap;
+    UINT64 pageOff;
+    if (gpa >= IOAPIC_MMIO_BASE && gpa < IOAPIC_MMIO_BASE + IOAPIC_MMIO_SIZE) {
+        ap = &ioapic1;
+        pageOff = gpa - IOAPIC_MMIO_BASE;
+    } else if (gpa >= IOAPIC2_MMIO_BASE && gpa < IOAPIC2_MMIO_BASE + IOAPIC_MMIO_SIZE) {
+        ap = &ioapic2;
+        pageOff = gpa - IOAPIC2_MMIO_BASE;
+    } else {
+        return 0;
+    }
+
+    ioapicAccessLogCount++;
+    if (ioapicAccessLogCount <= 100 || ioapicAccessLogCount % 100000 == 0) {
+        printf("[ioapic #%d] gpa=0x%llX pageOff=0x%llX rip=0x%llX write=%d insnLen=%d bytes=%d\n",
+               ioapicAccessLogCount, (unsigned long long)gpa, (unsigned long long)pageOff,
+               (unsigned long long)exitContext->VpContext.Rip, exitContext->MemoryAccess.AccessInfo.AccessType,
+               exitContext->VpContext.InstructionLength, exitContext->MemoryAccess.InstructionByteCount);
+        fflush(stdout);
+    }
+
+    int isWrite = 0, isImm = 0, regNum = 0, insnTotalLen = 0;
+    UINT32 immVal = 0;
+    if (!ioapicDecodeMmio(exitContext->MemoryAccess.InstructionBytes,
+                           exitContext->MemoryAccess.InstructionByteCount,
+                           &isWrite, &isImm, &regNum, &immVal, &insnTotalLen)) {
+        printf("[ioapic] failed to decode MMIO instruction at rip=0x%llX (%d bytes):",
+               (unsigned long long)exitContext->VpContext.Rip, exitContext->MemoryAccess.InstructionByteCount);
+        int bi;
+        for (bi = 0; bi < exitContext->MemoryAccess.InstructionByteCount; bi++) {
+            printf(" %02X", exitContext->MemoryAccess.InstructionBytes[bi]);
+        }
+        printf("\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    if (isWrite) {
+        UINT32 value = immVal;
+        if (!isImm) {
+            WHV_REGISTER_VALUE regVal = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+            value = (UINT32)regVal.Reg64;
+        }
+        if (pageOff == 0x00) ap->selectedReg = value & 0xFF;
+        else if (pageOff == 0x10) {
+            ioapicWriteRegister(ap, ap->selectedReg, value);
+            if (ap->selectedReg >= 0x10 && ap->selectedReg <= 0x3F) {
+                static int rteInterestingLogCount = 0;
+                int entry = (ap->selectedReg - 0x10) / 2;
+                UINT64 rte = ap->redirTable[entry];
+                unsigned char vec = (unsigned char)(rte & 0xFF);
+                int masked = (rte & 0x10000ULL) ? 1 : 0;
+                // Skip the noisy early OVMF/BIOS sweep that just masks
+                // every entry with vector 0xFF (mask=1, vector=0xFF) --
+                // only log entries that are unmasked or carry a vector
+                // other than the default sweep value, i.e. genuinely
+                // reprogrammed by something (OVMF's own real routing or,
+                // later, Windows HAL).
+                if ((!masked || vec != 0xFF) && rteInterestingLogCount < 300) {
+                    rteInterestingLogCount++;
+                    printf("[ioapic-rte] controller id=%u entry=%d reg=0x%02X value=0x%08X -> full RTE now 0x%016llX (vector=0x%02X masked=%d)\n",
+                           ap->id, entry, ap->selectedReg, value,
+                           (unsigned long long)rte, vec, masked);
+                    fflush(stdout);
+                }
+            }
+        }
+    } else {
+        UINT32 value = (pageOff == 0x00) ? ap->selectedReg
+                      : (pageOff == 0x10) ? ioapicReadRegister(ap, ap->selectedReg)
+                      : 0;
+        WHV_REGISTER_VALUE regVal = { 0 };
+        regVal.Reg64 = value;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+    }
+
+    // NOTE: exitContext->VpContext.InstructionLength is NOT populated for
+    // MemoryAccess/MMIO exits (confirmed empirically: it read 0 here,
+    // unlike I/O port exits where it's always valid) -- WHV expects the
+    // caller to determine instruction length itself from InstructionBytes
+    // for this exit type. Using it anyway left RIP completely unchanged,
+    // so the exact same faulting instruction re-executed and re-faulted
+    // forever: confirmed via a counter showing 600,000+ identical
+    // [ioapic] log entries all at the same RIP before this fix.
+    WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+    WHV_REGISTER_VALUE ripVal = { 0 };
+    ripVal.Reg64 = exitContext->VpContext.Rip + (UINT64)insnTotalLen;
+    WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &ripVal);
+    return 1;
+}
+
+UINT16 fwCfgSelector = 0;
+UINT32 fwCfgOffset = 0;
+
+unsigned char acpiRsdp[36];
+unsigned char acpiTables[512]; // XSDT(0)+FADT(60)+MADT(176,96)+DSDT(272)+DBG2(308), see acpiBuildTables
+int acpiTablesBuilt = 0;
+
+// "etc/ramfb": unlike every other file here, this one is WRITABLE by the
+// guest -- OVMF's QemuRamfbDxe writes a RAMFB_CONFIG struct (address,
+// FourCC format, flags, width, height, stride, all big-endian) here to
+// tell the host where it allocated its own framebuffer (plain guest RAM
+// it owns via its normal UEFI memory allocator -- no MMIO/BAR needed on
+// our side at all). This is dramatically simpler than a real VBE/Bochs
+// VGA device: we don't need to emulate any mode-setting I/O ports, just
+// remember where the guest says its pixels are so we can paint them.
+// (ramfbConfigWritten/Address/Width/Height/Stride are declared near the
+// top of the file, ahead of WndProc, which also needs them.)
+unsigned char ramfbConfig[28];
+
+// Real struct is { UINT32 Type; union { ...; UINT8 Padding[124]; } Command; }
+// per edk2 OvmfPkg/Include/IndustryStandard/QemuLoader.h -- 4 (Type) + 124
+// (Command, explicitly padded) = 128 bytes total. Using 124 here (an
+// understandable but wrong guess at the union's own size) made our
+// "etc/table-loader" size fail OVMF's `FwCfgSize % sizeof(*LoaderEntry) == 0`
+// sanity check, so InstallQemuFwCfgTables() returned EFI_PROTOCOL_ERROR
+// before ever reading the file's content -- confirmed by cross-referencing
+// the real edk2 source after black-box tracing showed the directory being
+// found/scanned correctly but our RSDP/tables/loader fw_cfg keys never
+// getting selected at all.
+#define ACPI_LOADER_CMD_SIZE 128
+unsigned char acpiLoader[16 * ACPI_LOADER_CMD_SIZE];
+
+unsigned char fwCfgFileDir[4 + 4 * (4 + 2 + 2 + 56)];
+int fwCfgFileDirBuilt = 0;
+
+void acpiPutU16(unsigned char *buf, UINT32 off, UINT16 val) { memcpy(buf + off, &val, 2); }
+void acpiPutU32(unsigned char *buf, UINT32 off, UINT32 val) { memcpy(buf + off, &val, 4); }
+
+// fw_cfg's OWN multi-byte fields (FILE_DIR count/size, unlike everything
+// inside the ACPI tables themselves) are big-endian per spec.
+void fwCfgPutU32BE(unsigned char *buf, UINT32 off, UINT32 val) {
+    buf[off + 0] = (unsigned char)(val >> 24);
+    buf[off + 1] = (unsigned char)(val >> 16);
+    buf[off + 2] = (unsigned char)(val >> 8);
+    buf[off + 3] = (unsigned char)(val);
+}
+
+// Fills in one 36-byte ACPI SDT header (used by XSDT/FADT/MADT/DSDT alike).
+// Checksum is deliberately left 0 -- OVMF's own loader-script interpreter
+// computes and patches real checksums after it copies these bytes into
+// guest memory (see acpiBuildLoaderScript's ADD_CHECKSUM commands), so we
+// never need to compute one ourselves.
+void acpiPutHeader(unsigned char *buf, UINT32 off, const char *sig, UINT32 length, unsigned char revision) {
+    memcpy(buf + off, sig, 4);
+    acpiPutU32(buf, off + 4, length);
+    buf[off + 8] = revision;
+    buf[off + 9] = 0; // checksum, patched by OVMF
+    memcpy(buf + off + 10, "LHOST0", 6);   // OEMID
+    memcpy(buf + off + 16, "LHOSTTBL", 8); // OEM Table ID
+    acpiPutU32(buf, off + 24, 1);          // OEM Revision
+    memcpy(buf + off + 28, "LHV1", 4);     // Creator ID
+    acpiPutU32(buf, off + 32, 1);          // Creator Revision
+}
+
+// Builds the RSDP + combined ACPI table blob. Deferred until the guest
+// actually selects one of these fw_cfg files (rather than built once at
+// startup) because FADT must embed the *real* PM1a event/control/timer
+// I/O port block -- and that address isn't a fixed constant here: it's
+// PIIX4's PM function's PMBA register (pciPmConfig offset 0x40), which
+// OVMF's own platform code assigns dynamically during boot (empirically
+// observed this session settling on 0xB000, not anything we control up
+// front). By the time the guest is far enough into DXE to be loading ACPI
+// tables via fw_cfg, that assignment has already happened, so reading
+// pciPmConfig[0x40] here gets the real value instead of a guess.
+void acpiBuildTables(void) {
+    UINT32 pmBase = (*(UINT32 *)&pciPmConfig[0x40]) & 0xFFC0;
+    printf("[acpi] acpiBuildTables() firing -- pmBase=0x%X\n", pmBase);
+    fflush(stdout);
+
+    memset(acpiRsdp, 0, sizeof(acpiRsdp));
+    memcpy(acpiRsdp + 0, "RSD PTR ", 8);
+    acpiRsdp[8] = 0; // checksum, patched by OVMF
+    memcpy(acpiRsdp + 9, "LHOST0", 6);
+    acpiRsdp[15] = 2; // revision (2 = ACPI 2.0+, XSDT-capable)
+    acpiPutU32(acpiRsdp, 16, 0); // RsdtAddress -- unused, XSDT-only
+    acpiPutU32(acpiRsdp, 20, 36); // Length
+    // bytes 24-31 (XsdtAddress) and 32 (extended checksum) patched by OVMF
+
+    memset(acpiTables, 0, sizeof(acpiTables));
+
+    // XSDT at blob offset 0 (60 bytes: 36-byte header + 3 8-byte entries)
+    acpiPutHeader(acpiTables, 0, "XSDT", 60, 1);
+    acpiPutU32(acpiTables, 36, 60);  // entry0: FADT's blob-relative offset (patched to an absolute address by OVMF)
+    acpiPutU32(acpiTables, 44, 176); // entry1: MADT's blob-relative offset (ditto)
+    acpiPutU32(acpiTables, 52, 308); // entry2: DBG2's blob-relative offset (ditto)
+
+    // FADT ("FACP") at blob offset 60 (116 bytes -- the original ACPI 1.0
+    // layout; every field we need fits within it, and it keeps this to a
+    // single 32-bit DSDT pointer instead of also needing the newer 64-bit
+    // X_DSDT field).
+    acpiPutHeader(acpiTables, 60, "FACP", 116, 1);
+    acpiPutU32(acpiTables, 60 + 36, 0);   // FIRMWARE_CTRL -- no FACS in this pass
+    acpiPutU32(acpiTables, 60 + 40, 272); // DSDT: blob-relative offset (patched to absolute)
+    acpiTables[60 + 45] = 0;              // Preferred_PM_Profile
+    acpiPutU16(acpiTables, 60 + 46, 9);   // SCI_INT
+    acpiPutU32(acpiTables, 60 + 48, 0);   // SMI_CMD = 0 -- tells the OS ACPI mode is already enabled, no SMM handshake needed (we don't emulate SMM at all)
+    acpiPutU32(acpiTables, 60 + 56, pmBase + 0); // PM1a_EVT_BLK
+    acpiPutU32(acpiTables, 60 + 64, pmBase + 4); // PM1a_CNT_BLK
+    acpiPutU32(acpiTables, 60 + 76, pmBase + 8); // PM_TMR_BLK -- matches the existing ACPI PM Timer emulation at PM_BASE+8
+    acpiTables[60 + 88] = 4; // PM1_EVT_LEN
+    acpiTables[60 + 89] = 2; // PM1_CNT_LEN
+    acpiTables[60 + 91] = 4; // PM_TMR_LEN
+    acpiPutU16(acpiTables, 60 + 109, 0x0002); // IAPC_BOOT_ARCH: bit1 = 8042 present (we emulate one)
+    // Flags: WBINVD supported (bit0) | TMR_VAL_EXT (bit8) -- our PM_TMR_BLK
+    // emulation (see the ACPI PM Timer read handler) returns a genuine free-
+    // running 32-bit counter, never masked to 24 bits. Leaving TMR_VAL_EXT
+    // clear told Windows to treat it as a 24-bit counter (wrapping every
+    // ~4.69s at 3.579545MHz) while it actually behaves as 32-bit -- the
+    // HAL's PM-timer-based TSC calibration compares successive reads
+    // expecting 24-bit wraparound, so the mismatched upper bits broke its
+    // convergence, manifesting as an indefinite stall (guest spinning
+    // inside a single WHvRunVirtualProcessor call, no further port traps)
+    // immediately after a PM Timer read.
+    acpiPutU32(acpiTables, 60 + 112, 0x00000101);
+
+    // MADT ("APIC") at blob offset 176 (64 bytes: 36-byte header + 4+4
+    // fixed fields + one 8-byte Processor Local APIC entry for vCPU 0 + one
+    // 12-byte I/O APIC entry). The I/O APIC entry was originally omitted
+    // ("advertising a non-functional one would be worse than omitting it")
+    // but that turned out to be wrong: the real NT kernel's HAL
+    // unconditionally expects to find and initialize at least one I/O APIC
+    // during early boot (confirmed via the kernel's own symbols --
+    // HalpInterruptParseMadt, HalpApicInitializeIoUnit,
+    // HalpInterruptIoApicCount all exist and run during HalpInitSystemPhase0)
+    // -- its total absence, not a non-functional one, is what bugchecked
+    // 0x5C HAL_INITIALIZATION_FAILED (param4=STATUS_INVALID_PARAMETER),
+    // confirmed by walking the guest's own page tables to read RIP/KiBugCheckData
+    // live out of guest memory during the resulting stall and resolving them
+    // against the exact matching ntkrnlmp.pdb from Microsoft's symbol server.
+    // The redirection table entries themselves (see ioapicRedirTable) start
+    // fully masked, matching real hardware's power-on state, so this doesn't
+    // need to be interrupt-functional yet -- existing IRQs still go through
+    // the direct WHvRegisterPendingInterruption injection hack; this only
+    // needs to satisfy HAL's enumeration/initialization contract.
+    acpiPutHeader(acpiTables, 176, "APIC", 96, 3);
+    acpiPutU32(acpiTables, 176 + 36, 0xFEE00000); // Local APIC Address (standard default)
+    acpiPutU32(acpiTables, 176 + 40, 0x00000001); // Flags: PCAT_COMPAT (legacy dual-8259 also present)
+    acpiTables[176 + 44] = 0; // Type 0: Processor Local APIC
+    acpiTables[176 + 45] = 8; // Length
+    acpiTables[176 + 46] = 0; // ACPI Processor UID
+    acpiTables[176 + 47] = 0; // APIC ID (vCPU 0)
+    acpiPutU32(acpiTables, 176 + 48, 0x00000001); // Flags: Enabled
+    acpiTables[176 + 52] = 1;  // Type 1: I/O APIC
+    acpiTables[176 + 53] = 12; // Length
+    acpiTables[176 + 54] = 1;  // I/O APIC ID (distinct from Local APIC ID 0)
+    acpiTables[176 + 55] = 0;  // Reserved
+    acpiPutU32(acpiTables, 176 + 56, IOAPIC_MMIO_BASE); // I/O APIC Address
+    acpiPutU32(acpiTables, 176 + 60, 0); // Global System Interrupt Base
+    // Type 2: Interrupt Source Override, for the SCI (FADT.SCI_INT=9 below).
+    // Every real ACPI BIOS includes one of these for the SCI: IOAPIC pins
+    // default to ISA/EISA conformance (edge-triggered, active-high) but the
+    // ACPI SCI is electrically level-triggered/active-low, so without this
+    // override HAL's SCI interrupt setup has a mismatched polarity/trigger
+    // mode. Added after two rounds of empirical bugcheck 0x5C
+    // (HAL_INITIALIZATION_FAILED) evidence -- adding the I/O APIC itself
+    // fixed the first failure (params changed from
+    // param3=0/param4=STATUS_INVALID_PARAMETER to
+    // param3=0x19/param4=STATUS_UNSUCCESSFUL, a different, later check in
+    // the same HAL routine, per KiBugCheckData read live from guest memory)
+    // but didn't fully resolve HAL init -- this is the next concrete,
+    // standard-ACPI gap to close.
+    acpiTables[176 + 64] = 2;  // Type 2: Interrupt Source Override
+    acpiTables[176 + 65] = 10; // Length
+    acpiTables[176 + 66] = 0;  // Bus: 0 = ISA
+    acpiTables[176 + 67] = 9;  // Source: ISA IRQ 9 (matches FADT SCI_INT)
+    acpiPutU32(acpiTables, 176 + 68, 9); // Global System Interrupt: 9 (same number, only polarity/trigger differ)
+    acpiPutU16(acpiTables, 176 + 72, 0x000F); // Flags: Polarity=Active Low(3) | Trigger=Level(3)
+    // Type 2: Interrupt Source Override, ISA IRQ0 (PIT) -> GSI 2. Another
+    // near-universal real MADT entry: standard PC chipsets don't actually
+    // wire the PIT to the I/O APIC's pin 0, so every real BIOS/QEMU MADT
+    // reroutes it to pin 2 instead. Flags=0 (conforms to bus -- ISA IRQ0 is
+    // genuinely edge-triggered/active-high, unlike the SCI override above).
+    acpiTables[176 + 74] = 2;  // Type 2: Interrupt Source Override
+    acpiTables[176 + 75] = 10; // Length
+    acpiTables[176 + 76] = 0;  // Bus: 0 = ISA
+    acpiTables[176 + 77] = 0;  // Source: ISA IRQ 0 (PIT)
+    acpiPutU32(acpiTables, 176 + 78, 2); // Global System Interrupt: 2
+    acpiPutU16(acpiTables, 176 + 82, 0x0000); // Flags: conforms to bus spec
+    // Type 1: second I/O APIC, GSI 24-47 (see IoApicState ioapic2's comment
+    // for why -- empirical follow-up to the still-unresolved bugcheck 0x5C
+    // param3=0x19, hypothesizing something needs a GSI beyond the first
+    // IOAPIC's 0-23 range).
+    acpiTables[176 + 84] = 1;  // Type 1: I/O APIC
+    acpiTables[176 + 85] = 12; // Length
+    acpiTables[176 + 86] = 2;  // I/O APIC ID (distinct from Local APIC ID 0 and IOAPIC1's ID 1)
+    acpiTables[176 + 87] = 0;  // Reserved
+    acpiPutU32(acpiTables, 176 + 88, IOAPIC2_MMIO_BASE); // I/O APIC Address
+    acpiPutU32(acpiTables, 176 + 92, IOAPIC2_GSI_BASE);  // Global System Interrupt Base
+
+    // DSDT at blob offset 272 (36 bytes -- header only, no AML namespace
+    // content in this pass; still a legal, if functionally empty,
+    // definition block).
+    acpiPutHeader(acpiTables, 272, "DSDT", 36, 2);
+
+    // DBG2 ("Debug Port Table 2") at blob offset 308 (84 bytes; shifted from
+    // 264 by the MADT's +12-byte growth above). Windows' BlInitializeLibrary
+    // very likely discovers its bootdebug serial UART through this table
+    // rather than assuming a fixed legacy COM2 address -- confirmed our
+    // COM2 emulation was receiving real 16550 register traffic
+    // (scratch-register probe, baud divisor programming) but what the guest
+    // actually transmitted turned out to be plain ANSI console text
+    // (`\x1B[2J`), not the KD wire protocol, meaning bootdebug never
+    // actually engaged that port at all without this table telling it to.
+    // Layout (offsets relative to the DBG2 table's own start at 308):
+    //   0-35   ACPI SDT header
+    //   36-39  OffsetDbgDeviceInfo (=44, i.e. right after these two fields)
+    //   40-43  NumberDbgDeviceInfo (=1)
+    //   44-65  Debug Device Information structure (22-byte fixed part)
+    //   66-77  BaseAddressRegister: one Generic Address Structure (12 bytes)
+    //   78-81  AddressSize: one UINT32 (=8, the 0x2F8-0x2FF port range)
+    //   82-83  NamespaceString: "." + NUL (no ACPI namespace device exists
+    //          for this port -- our DSDT has no AML content -- which the
+    //          spec explicitly allows via this single-period placeholder)
+    acpiPutHeader(acpiTables, 308, "DBG2", 84, 0);
+    acpiPutU32(acpiTables, 308 + 36, 44); // OffsetDbgDeviceInfo (table-relative)
+    acpiPutU32(acpiTables, 308 + 40, 1);  // NumberDbgDeviceInfo
+    acpiTables[308 + 44] = 0;              // Revision
+    acpiPutU16(acpiTables, 308 + 45, 40); // Length (of this Debug Device Information structure)
+    acpiTables[308 + 47] = 1;              // NumberofGenericAddressRegisters
+    acpiPutU16(acpiTables, 308 + 48, 2);  // NameSpaceStringLength (including NUL)
+    acpiPutU16(acpiTables, 308 + 50, 38); // NameSpaceStringOffset (relative to this structure's start, i.e. offset 44)
+    acpiPutU16(acpiTables, 308 + 52, 0);  // OemDataLength
+    acpiPutU16(acpiTables, 308 + 54, 0);  // OemDataOffset
+    acpiPutU16(acpiTables, 308 + 56, 0x8000); // PortType: Serial
+    acpiPutU16(acpiTables, 308 + 58, 0x0000); // PortSubtype: Full 16550
+    acpiPutU16(acpiTables, 308 + 60, 0);      // Reserved
+    acpiPutU16(acpiTables, 308 + 62, 22); // BaseAddressRegisterOffset (relative to structure start)
+    acpiPutU16(acpiTables, 308 + 64, 34); // AddressSizeOffset (relative to structure start)
+    // Generic Address Structure at struct-relative offset 22 (blob offset 308+44+22=342)
+    acpiTables[308 + 66] = 1; // AddressSpaceId: SystemIO
+    acpiTables[308 + 67] = 8; // RegisterBitWidth
+    acpiTables[308 + 68] = 0; // RegisterBitOffset
+    acpiTables[308 + 69] = 1; // AccessSize: Byte
+    { UINT64 comBase = 0x2F8; memcpy(acpiTables + 308 + 70, &comBase, 8); } // Address
+    // AddressSize at struct-relative offset 34 (blob offset 308+44+34=354)
+    acpiPutU32(acpiTables, 308 + 78, 8);
+    // NamespaceString at struct-relative offset 38 (blob offset 308+44+38=358)
+    acpiTables[308 + 82] = '.';
+    acpiTables[308 + 83] = 0;
+
+    acpiTablesBuilt = 1;
+}
+
+// Emits one 124-byte bios-linker-loader command record (QEMU's fw_cfg ACPI
+// linker/loader protocol -- see acpiBuildTables for why we let OVMF do the
+// actual pointer/checksum patching instead of precomputing final values
+// ourselves: it decides where each blob actually lands in guest memory).
+void acpiLoaderAllocate(unsigned char *cmd, const char *file, UINT32 align, unsigned char zone) {
+    memset(cmd, 0, ACPI_LOADER_CMD_SIZE);
+    acpiPutU32(cmd, 0, 1); // BIOS_LINKER_LOADER_COMMAND_ALLOCATE
+    strncpy((char *)cmd + 4, file, 55);
+    acpiPutU32(cmd, 4 + 56, align);
+    cmd[4 + 56 + 4] = zone; // 1 = high memory
+}
+
+void acpiLoaderAddPointer(unsigned char *cmd, const char *destFile, const char *srcFile, UINT32 offset, unsigned char size) {
+    memset(cmd, 0, ACPI_LOADER_CMD_SIZE);
+    acpiPutU32(cmd, 0, 2); // BIOS_LINKER_LOADER_COMMAND_ADD_POINTER
+    strncpy((char *)cmd + 4, destFile, 55);
+    strncpy((char *)cmd + 4 + 56, srcFile, 55);
+    acpiPutU32(cmd, 4 + 56 + 56, offset);
+    cmd[4 + 56 + 56 + 4] = size;
+}
+
+void acpiLoaderAddChecksum(unsigned char *cmd, const char *file, UINT32 offset, UINT32 start, UINT32 length) {
+    memset(cmd, 0, ACPI_LOADER_CMD_SIZE);
+    acpiPutU32(cmd, 0, 3); // BIOS_LINKER_LOADER_COMMAND_ADD_CHECKSUM
+    strncpy((char *)cmd + 4, file, 55);
+    acpiPutU32(cmd, 4 + 56, offset);
+    acpiPutU32(cmd, 4 + 56 + 4, start);
+    acpiPutU32(cmd, 4 + 56 + 4 + 4, length);
+}
+
+void acpiBuildLoaderScript(void) {
+    unsigned char *c = acpiLoader;
+    acpiLoaderAllocate(c, "etc/acpi/rsdp", 16, 1); c += ACPI_LOADER_CMD_SIZE;
+    acpiLoaderAllocate(c, "etc/acpi/tables", 64, 1); c += ACPI_LOADER_CMD_SIZE;
+
+    // RSDP.XsdtAddress = base of "etc/acpi/tables" (XSDT sits at blob offset 0)
+    acpiLoaderAddPointer(c, "etc/acpi/rsdp", "etc/acpi/tables", 24, 8); c += ACPI_LOADER_CMD_SIZE;
+    // XSDT entry0/entry1/entry2: patch the blob-relative FADT/MADT/DBG2
+    // offsets we pre-filled into absolute addresses (same file as both src
+    // and dest -- an internal, self-referential pointer within one blob).
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 36, 8); c += ACPI_LOADER_CMD_SIZE;
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 44, 8); c += ACPI_LOADER_CMD_SIZE;
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 52, 8); c += ACPI_LOADER_CMD_SIZE;
+    // FADT.DSDT (32-bit field, unlike the 64-bit XSDT entries above)
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 60 + 40, 4); c += ACPI_LOADER_CMD_SIZE;
+
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", 9, 0, 60); c += ACPI_LOADER_CMD_SIZE;           // XSDT
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", 60 + 9, 60, 116); c += ACPI_LOADER_CMD_SIZE;    // FADT
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", 176 + 9, 176, 96); c += ACPI_LOADER_CMD_SIZE;   // MADT
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", 272 + 9, 272, 36); c += ACPI_LOADER_CMD_SIZE;   // DSDT
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", 308 + 9, 308, 84); c += ACPI_LOADER_CMD_SIZE;   // DBG2
+    acpiLoaderAddChecksum(c, "etc/acpi/rsdp", 8, 0, 20); c += ACPI_LOADER_CMD_SIZE;             // RSDP (ACPI 1.0 checksum)
+    acpiLoaderAddChecksum(c, "etc/acpi/rsdp", 32, 0, 36); c += ACPI_LOADER_CMD_SIZE;            // RSDP (extended checksum)
+}
+
+void fwCfgBuildFileDir(void) {
+    unsigned char *d = fwCfgFileDir;
+    fwCfgPutU32BE(d, 0, 4); // 4 files
+    d += 4;
+    struct { const char *name; UINT32 size; UINT16 select; } files[4] = {
+        { "etc/acpi/rsdp",   sizeof(acpiRsdp),   FWCFG_KEY_RSDP },
+        { "etc/acpi/tables", sizeof(acpiTables), FWCFG_KEY_TABLES },
+        { "etc/table-loader", sizeof(acpiLoader), FWCFG_KEY_LOADER },
+        { "etc/ramfb", sizeof(ramfbConfig), FWCFG_KEY_RAMFB },
+    };
+    int i;
+    for (i = 0; i < 4; i++) {
+        fwCfgPutU32BE(d, 0, files[i].size);
+        UINT16 selectBE = (UINT16)((files[i].select >> 8) | (files[i].select << 8));
+        memcpy(d + 4, &selectBE, 2);
+        d[6] = 0; d[7] = 0; // reserved
+        memset(d + 8, 0, 56);
+        strncpy((char *)d + 8, files[i].name, 55);
+        d += 64;
+    }
+    fwCfgFileDirBuilt = 1;
+}
+
+// Resolves the currently-selected fw_cfg key to a data buffer + length.
+// fw_cfg's own multi-byte integer fields (size/select in the file
+// directory, and the two 32-bit header fields below) are big-endian per
+// spec, unlike everything else in this file.
+void fwCfgSelectItem(unsigned char **outData, UINT32 *outLen) {
+    static const unsigned char sigBytes[4] = { 'Q', 'E', 'M', 'U' };
+    static unsigned char idBytes[4] = { 1, 0, 0, 0 }; // bit0 only: traditional PIO interface, no DMA
+
+    if (!fwCfgFileDirBuilt) fwCfgBuildFileDir();
+
+    switch (fwCfgSelector) {
+        case FWCFG_KEY_SIGNATURE:
+            *outData = (unsigned char *)sigBytes; *outLen = 4;
+            break;
+        case FWCFG_KEY_ID:
+            *outData = idBytes; *outLen = 4;
+            break;
+        case FWCFG_KEY_FILE_DIR:
+            *outData = fwCfgFileDir; *outLen = sizeof(fwCfgFileDir);
+            break;
+        case FWCFG_KEY_RSDP:
+            if (!acpiTablesBuilt) { acpiBuildTables(); acpiBuildLoaderScript(); }
+            *outData = acpiRsdp; *outLen = sizeof(acpiRsdp);
+            break;
+        case FWCFG_KEY_TABLES:
+            if (!acpiTablesBuilt) { acpiBuildTables(); acpiBuildLoaderScript(); }
+            *outData = acpiTables; *outLen = sizeof(acpiTables);
+            break;
+        case FWCFG_KEY_LOADER:
+            if (!acpiTablesBuilt) { acpiBuildTables(); acpiBuildLoaderScript(); }
+            *outData = acpiLoader; *outLen = sizeof(acpiLoader);
+            break;
+        case FWCFG_KEY_RAMFB:
+            *outData = ramfbConfig; *outLen = sizeof(ramfbConfig);
+            break;
+        default:
+            *outData = NULL; *outLen = 0;
+            break;
+    }
+}
+
+// Handles I/O ports 0x510 (selector) and 0x511 (data). Data reads support
+// both plain `in al, dx` and `rep insb`-style string reads -- fw_cfg is
+// explicitly a sequential-read register and real firmware commonly bulk
+// -reads with a rep-prefixed string instruction rather than one byte at a
+// time, the same reasoning that made ataHandlePioDataPort need both forms.
+void fwCfgHandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext, void *guestMemPtr) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT16 port = io->PortNumber;
+
+    if (port == 0x510) {
+        UINT64 rax = 0;
+        if (io->AccessInfo.IsWrite) {
+            fwCfgSelector = (UINT16)io->Rax;
+            fwCfgOffset = 0;
+            {
+                static int selLogCount = 0;
+                if (selLogCount < 40) {
+                    selLogCount++;
+                    printf("[fwcfg] select #%d: selector=0x%X\n", selLogCount, fwCfgSelector);
+                    fflush(stdout);
+                }
+            }
+        }
+        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+        WHV_REGISTER_VALUE values[2] = { 0 };
+        values[0].Reg64 = rax;
+        values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+        return;
+    }
+
+    // port == 0x511
+    unsigned char *data = NULL;
+    UINT32 dataLen = 0;
+    fwCfgSelectItem(&data, &dataLen);
+
+    {
+        static int readLogCount = 0;
+        if (readLogCount < 60) {
+            readLogCount++;
+            printf("[fwcfg] read #%d: selector=0x%X offset=%u dataLen=%u stringOp=%d rep=%d\n",
+                   readLogCount, fwCfgSelector, fwCfgOffset, dataLen,
+                   io->AccessInfo.StringOp, io->AccessInfo.RepPrefix);
+            fflush(stdout);
+        }
+    }
+
+    if (!io->AccessInfo.StringOp) {
+        UINT64 word = 0;
+        if (!io->AccessInfo.IsWrite && data && fwCfgOffset < dataLen) word = data[fwCfgOffset++];
+        else if (io->AccessInfo.IsWrite && data && fwCfgOffset < dataLen) data[fwCfgOffset++] = (unsigned char)(io->Rax & 0xFF);
+        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+        WHV_REGISTER_VALUE values[2] = { 0 };
+        values[0].Reg64 = word;
+        values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+        return;
+    }
+
+    UINT32 count = io->AccessInfo.RepPrefix ? (UINT32)io->Rcx : 1;
+    if (count == 0) count = 1;
+    UINT64 rdiOut = io->Rdi;
+    UINT64 rsiOut = io->Rsi;
+    if (!io->AccessInfo.IsWrite) {
+        UINT64 destAddr = ((UINT64)io->Es.Base + io->Rdi) & 0xFFFFFFFFULL;
+        if (destAddr < guestMemSize) {
+            unsigned char *guestPtr = (unsigned char *)guestMemPtr + destAddr;
+            UINT32 i;
+            UINT32 maxCount = (UINT32)((guestMemSize - destAddr < count) ? (guestMemSize - destAddr) : count);
+            for (i = 0; i < maxCount; i++) {
+                guestPtr[i] = (data && fwCfgOffset < dataLen) ? data[fwCfgOffset++] : 0;
+            }
+            rdiOut += maxCount;
+        }
+    } else {
+        // rep outsb -- QemuFwCfgWriteBytes()'s non-DMA path (the only path
+        // available here, since we advertise no DMA support). Used for
+        // "etc/ramfb": OVMF writes a RAMFB_CONFIG struct describing where
+        // it allocated its own framebuffer.
+        UINT64 srcAddr = ((UINT64)io->Ds.Base + io->Rsi) & 0xFFFFFFFFULL;
+        if (srcAddr < guestMemSize && data) {
+            unsigned char *guestPtr = (unsigned char *)guestMemPtr + srcAddr;
+            UINT32 i;
+            UINT32 maxCount = (UINT32)((guestMemSize - srcAddr < count) ? (guestMemSize - srcAddr) : count);
+            for (i = 0; i < maxCount && fwCfgOffset < dataLen; i++) {
+                data[fwCfgOffset++] = guestPtr[i];
+            }
+            rsiOut += maxCount;
+
+            if (fwCfgSelector == FWCFG_KEY_RAMFB && fwCfgOffset >= dataLen) {
+                ramfbConfigWritten = 1;
+                // RAMFB_CONFIG fields are big-endian (the driver explicitly
+                // SwapBytes64/32's them before writing) -- see ramfbConfig's
+                // declaration.
+                ramfbAddress = ((UINT64)ramfbConfig[0] << 56) | ((UINT64)ramfbConfig[1] << 48) |
+                               ((UINT64)ramfbConfig[2] << 40) | ((UINT64)ramfbConfig[3] << 32) |
+                               ((UINT64)ramfbConfig[4] << 24) | ((UINT64)ramfbConfig[5] << 16) |
+                               ((UINT64)ramfbConfig[6] << 8)  | (UINT64)ramfbConfig[7];
+                ramfbWidth  = ((UINT32)ramfbConfig[16] << 24) | ((UINT32)ramfbConfig[17] << 16) |
+                              ((UINT32)ramfbConfig[18] << 8)  | (UINT32)ramfbConfig[19];
+                ramfbHeight = ((UINT32)ramfbConfig[20] << 24) | ((UINT32)ramfbConfig[21] << 16) |
+                              ((UINT32)ramfbConfig[22] << 8)  | (UINT32)ramfbConfig[23];
+                ramfbStride = ((UINT32)ramfbConfig[24] << 24) | ((UINT32)ramfbConfig[25] << 16) |
+                              ((UINT32)ramfbConfig[26] << 8)  | (UINT32)ramfbConfig[27];
+                printf("[ramfb] configured: address=0x%llX %ux%u stride=%u\n",
+                       (unsigned long long)ramfbAddress, ramfbWidth, ramfbHeight, ramfbStride);
+                fflush(stdout);
+            }
+        }
+    }
+    WHV_REGISTER_NAME names[4] = { WHvX64RegisterRcx, WHvX64RegisterRdi, WHvX64RegisterRsi, WHvX64RegisterRip };
+    WHV_REGISTER_VALUE values[4] = { 0 };
+    values[0].Reg64 = (io->AccessInfo.StringOp && io->AccessInfo.RepPrefix) ? 0 : io->Rcx;
+    values[1].Reg64 = rdiOut;
+    values[2].Reg64 = rsiOut;
+    values[3].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+    WHvSetVirtualProcessorRegisters(partition, 0, names, 4, values);
+}
+
+// Translates a guest-VIRTUAL address to a guest-PHYSICAL address by walking
+// the guest's own 4-level (PML4/PDPT/PD/PT) page tables from CR3, standard
+// x86-64 paging (handles 1GB/2MB large pages via the PS bit). Needed because
+// once we're executing NT kernel code, RIP is a canonical high half address
+// (0xFFFFF800...) -- unlike the earlier OVMF/bootmgfw.efi diagnostics, which
+// could treat guest memory as flat/identity-mapped, kernel virtual addresses
+// require a real walk to find the backing physical page.
+UINT64 kernelTranslateVA(unsigned char *guestMem, UINT64 cr3, UINT64 va) {
+    UINT64 pml4Base = cr3 & ~0xFFFULL;
+    UINT64 pml4Idx = (va >> 39) & 0x1FF;
+    UINT64 pdptIdx = (va >> 30) & 0x1FF;
+    UINT64 pdIdx   = (va >> 21) & 0x1FF;
+    UINT64 ptIdx   = (va >> 12) & 0x1FF;
+    UINT64 offset  = va & 0xFFF;
+
+    if (pml4Base >= guestMemSize) return (UINT64)-1;
+    UINT64 pml4e = *(UINT64 *)(guestMem + pml4Base + pml4Idx * 8);
+    if (!(pml4e & 1)) return (UINT64)-1;
+
+    UINT64 pdptBase = pml4e & 0x000FFFFFFFFFF000ULL;
+    if (pdptBase >= guestMemSize) return (UINT64)-1;
+    UINT64 pdpte = *(UINT64 *)(guestMem + pdptBase + pdptIdx * 8);
+    if (!(pdpte & 1)) return (UINT64)-1;
+    if (pdpte & 0x80) return (pdpte & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFFULL); // 1GB page
+
+    UINT64 pdBase = pdpte & 0x000FFFFFFFFFF000ULL;
+    if (pdBase >= guestMemSize) return (UINT64)-1;
+    UINT64 pde = *(UINT64 *)(guestMem + pdBase + pdIdx * 8);
+    if (!(pde & 1)) return (UINT64)-1;
+    if (pde & 0x80) return (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL); // 2MB page
+
+    UINT64 ptBase = pde & 0x000FFFFFFFFFF000ULL;
+    if (ptBase >= guestMemSize) return (UINT64)-1;
+    UINT64 pte = *(UINT64 *)(guestMem + ptBase + ptIdx * 8);
+    if (!(pte & 1)) return (UINT64)-1;
+
+    UINT64 physBase = pte & 0x000FFFFFFFFFF000ULL;
+    if (physBase >= guestMemSize) return (UINT64)-1;
+    return physBase | offset;
+}
+
+// Reads `len` bytes starting at guest-virtual `va`, translating page-by-page
+// (a read can span a page boundary whose pages aren't physically adjacent).
+// Returns 0 (and leaves `out` partially written) on any unmapped page.
+int kernelReadVA(unsigned char *guestMem, UINT64 cr3, UINT64 va, void *out, UINT64 len) {
+    UINT64 done = 0;
+    while (done < len) {
+        UINT64 curVA = va + done;
+        UINT64 phys = kernelTranslateVA(guestMem, cr3, curVA);
+        if (phys == (UINT64)-1 || phys >= guestMemSize) return 0;
+        UINT64 pageRemain = 0x1000 - (curVA & 0xFFF);
+        UINT64 chunk = (len - done) < pageRemain ? (len - done) : pageRemain;
+        if (phys + chunk > guestMemSize) return 0;
+        memcpy((unsigned char *)out + done, guestMem + phys, chunk);
+        done += chunk;
+    }
+    return 1;
+}
+
+// Single-byte write through the guest's own page tables -- sufficient
+// for INT3-patching (see the live-breakpoint infrastructure above); no
+// need for a general multi-byte writer since we only ever patch one
+// opcode byte at a time.
+int kernelWriteByteVA(unsigned char *guestMem, UINT64 cr3, UINT64 va, unsigned char val) {
+    UINT64 phys = kernelTranslateVA(guestMem, cr3, va);
+    if (phys == (UINT64)-1 || phys >= guestMemSize) return 0;
+    guestMem[phys] = val;
+    return 1;
+}
+
+// Same technique as rtcDiagIdentifyModule (scan backward for MZ/PE, parse
+// the Debug Directory's RSDS CodeView record for the PDB name), but through
+// kernelReadVA instead of flat offsets, since we're now resolving a paged
+// NT-kernel-mode RIP rather than an identity-mapped pre-kernel one.
+int kernelDiagModuleIdentified = 0;
+UINT64 kernelDiagModuleBase = 0;
+
+void kernelDiagIdentifyModule(unsigned char *guestMem, UINT64 cr3, UINT64 rip) {
+    if (kernelDiagModuleIdentified) return;
+    UINT64 scanStart = (rip > 0x4000000) ? rip - 0x4000000 : 0; // search up to 64MB back
+    UINT64 va;
+    for (va = (rip & ~0xFFFULL); va >= scanStart; va -= 0x1000) {
+        unsigned char hdr[2];
+        if (kernelReadVA(guestMem, cr3, va, hdr, 2) && hdr[0] == 'M' && hdr[1] == 'Z') {
+            UINT32 peOff = 0;
+            if (kernelReadVA(guestMem, cr3, va + 0x3C, &peOff, 4)) {
+                unsigned char sig[4] = { 0 };
+                if (kernelReadVA(guestMem, cr3, va + peOff, sig, 4) &&
+                    sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0) {
+                    kernelDiagModuleBase = va;
+                    printf("[kerneldiag] found PE header for owning module at guest VA 0x%llX (rip=0x%llX, +0x%llX into it)\n",
+                           (unsigned long long)va, (unsigned long long)rip, (unsigned long long)(rip - va));
+                    UINT32 debugDirRva = 0;
+                    kernelReadVA(guestMem, cr3, va + peOff + 184, &debugDirRva, 4);
+                    if (debugDirRva == 0) {
+                        printf("[kerneldiag] no debug directory RVA in this module's PE header\n");
+                        fflush(stdout);
+                        kernelDiagModuleIdentified = 1;
+                        return;
+                    }
+                    unsigned char dbgDirBytes[28] = { 0 };
+                    kernelReadVA(guestMem, cr3, va + debugDirRva, dbgDirBytes, sizeof(dbgDirBytes));
+                    UINT32 dbgType = *(UINT32 *)(dbgDirBytes + 0xC);
+                    UINT32 cvRva = *(UINT32 *)(dbgDirBytes + 0x14);
+                    printf("[kerneldiag] debug directory: type=%u codeViewRva=0x%X\n", dbgType, cvRva);
+                    if (dbgType == 2 /* IMAGE_DEBUG_TYPE_CODEVIEW */ && cvRva != 0) {
+                        unsigned char cv[24] = { 0 };
+                        kernelReadVA(guestMem, cr3, va + cvRva, cv, sizeof(cv));
+                        if (cv[0] == 'R' && cv[1] == 'S' && cv[2] == 'D' && cv[3] == 'S') {
+                            unsigned char guidAge[20] = { 0 }; // 16-byte GUID + 4-byte Age
+                            kernelReadVA(guestMem, cr3, va + cvRva + 4, guidAge, sizeof(guidAge));
+                            char pdbName[128] = { 0 };
+                            kernelReadVA(guestMem, cr3, va + cvRva + 4 + 16 + 4, pdbName, sizeof(pdbName) - 1);
+                            pdbName[sizeof(pdbName) - 1] = 0;
+                            UINT32 g1 = *(UINT32 *)(guidAge + 0);
+                            UINT16 g2 = *(UINT16 *)(guidAge + 4);
+                            UINT16 g3 = *(UINT16 *)(guidAge + 6);
+                            UINT32 age = *(UINT32 *)(guidAge + 16);
+                            printf("[kerneldiag] module PDB name: %s guid=%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X age=%u\n",
+                                   pdbName, g1, g2, g3,
+                                   guidAge[8], guidAge[9], guidAge[10], guidAge[11],
+                                   guidAge[12], guidAge[13], guidAge[14], guidAge[15], age);
+                        } else {
+                            printf("[kerneldiag] CodeView record doesn't start with RSDS (got %02X %02X %02X %02X)\n",
+                                   cv[0], cv[1], cv[2], cv[3]);
+                        }
+                    }
+                    fflush(stdout);
+                    kernelDiagModuleIdentified = 1;
+                    return;
+                }
+            }
+        }
+        if (va < 0x1000) break;
+    }
+    printf("[kerneldiag] no PE header found scanning VA back from rip=0x%llX\n", (unsigned long long)rip);
+    fflush(stdout);
+    kernelDiagModuleIdentified = 1;
+}
+
+// Same PE-header-walk-back + PDB-name technique as kernelDiagIdentifyModule,
+// but NOT gated by the one-shot kernelDiagModuleIdentified flag (already
+// consumed identifying the unnamed spin-loop module -- see
+// docs/investigations/post-vppt-boot-stall.md) and returning the found
+// base via an out-param instead of a global, so it can be reused for an
+// arbitrary address (e.g. a candidate return address on the stack)
+// without disturbing that earlier state. Returns 1 and sets *outBase if a
+// PE header was found, 0 otherwise.
+int kernelDiagIdentifyModuleAt(unsigned char *guestMem, UINT64 cr3, UINT64 addr, UINT64 *outBase) {
+    UINT64 scanStart = (addr > 0x4000000) ? addr - 0x4000000 : 0;
+    UINT64 va;
+    for (va = (addr & ~0xFFFULL); va >= scanStart; va -= 0x1000) {
+        unsigned char hdr[2];
+        if (kernelReadVA(guestMem, cr3, va, hdr, 2) && hdr[0] == 'M' && hdr[1] == 'Z') {
+            UINT32 peOff = 0;
+            if (kernelReadVA(guestMem, cr3, va + 0x3C, &peOff, 4)) {
+                unsigned char sig[4] = { 0 };
+                if (kernelReadVA(guestMem, cr3, va + peOff, sig, 4) &&
+                    sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0) {
+                    *outBase = va;
+                    printf("[kerneldiag] candidate address 0x%llX resolves to module base 0x%llX (+0x%llX into it)\n",
+                           (unsigned long long)addr, (unsigned long long)va, (unsigned long long)(addr - va));
+                    UINT32 debugDirRva = 0;
+                    kernelReadVA(guestMem, cr3, va + peOff + 184, &debugDirRva, 4);
+                    if (debugDirRva == 0) {
+                        printf("[kerneldiag] no debug directory RVA in this module's PE header\n");
+                        fflush(stdout);
+                        return 1;
+                    }
+                    unsigned char dbgDirBytes[28] = { 0 };
+                    kernelReadVA(guestMem, cr3, va + debugDirRva, dbgDirBytes, sizeof(dbgDirBytes));
+                    UINT32 dbgType = *(UINT32 *)(dbgDirBytes + 0xC);
+                    UINT32 cvRva = *(UINT32 *)(dbgDirBytes + 0x14);
+                    printf("[kerneldiag] debug directory: type=%u codeViewRva=0x%X\n", dbgType, cvRva);
+                    if (dbgType == 2 && cvRva != 0) {
+                        unsigned char cv[24] = { 0 };
+                        kernelReadVA(guestMem, cr3, va + cvRva, cv, sizeof(cv));
+                        if (cv[0] == 'R' && cv[1] == 'S' && cv[2] == 'D' && cv[3] == 'S') {
+                            unsigned char guidAge[20] = { 0 };
+                            kernelReadVA(guestMem, cr3, va + cvRva + 4, guidAge, sizeof(guidAge));
+                            char pdbName[128] = { 0 };
+                            kernelReadVA(guestMem, cr3, va + cvRva + 4 + 16 + 4, pdbName, sizeof(pdbName) - 1);
+                            pdbName[sizeof(pdbName) - 1] = 0;
+                            UINT32 g1 = *(UINT32 *)(guidAge + 0);
+                            UINT16 g2 = *(UINT16 *)(guidAge + 4);
+                            UINT16 g3 = *(UINT16 *)(guidAge + 6);
+                            UINT32 age = *(UINT32 *)(guidAge + 16);
+                            printf("[kerneldiag] module PDB name: %s guid=%08X-%04X-%04X-%02X%02X%02X%02X%02X%02X%02X%02X age=%u\n",
+                                   pdbName, g1, g2, g3,
+                                   guidAge[8], guidAge[9], guidAge[10], guidAge[11],
+                                   guidAge[12], guidAge[13], guidAge[14], guidAge[15], age);
+                        }
+                    }
+                    fflush(stdout);
+                    return 1;
+                }
+            }
+        }
+        if (va < 0x1000) break;
+    }
+    printf("[kerneldiag] no PE header found scanning VA back from 0x%llX\n", (unsigned long long)addr);
+    fflush(stdout);
+    return 0;
+}
+
+// Stall watchdog: WHvGetVirtualProcessorRegisters is documented-safe to call
+// from a thread other than the one blocked inside WHvRunVirtualProcessor, so
+// this thread periodically samples exitCount (updated by the main loop) and,
+// if it hasn't moved, reads live RIP/RSP/RAX/RCX/RDX/RBX so we can identify
+// what code the guest is actually spinning in during an indefinite stall --
+// otherwise invisible, since a stall with zero port traps produces no exits
+// at all to log from the main loop itself.
+volatile LONG64 g_watchdogExitCount = 0;
+WHV_PARTITION_HANDLE g_watchdogPartition = NULL;
+
+// Post-bugcheck-fix (2026-07-16 part 10) follow-up investigation: the new
+// stall's RIP sits in a snapshot-and-spin loop polling a single live VA.
+// Set once (stall tick 2) so later ticks can re-poll it and show whether
+// it's genuinely frozen or just slow -- see the stallWatchdogThread body.
+UINT64 g_spinWaitTargetVA = 0;
+UINT64 g_spinWaitCr3 = 0;
+
+// See the CreateThread call site's comment for why this exists: forces
+// WHvRunVirtualProcessor to return periodically so the RTC periodic
+// interrupt (deliverRtcPeriodicIrq) can actually be delivered even while
+// the guest is CPU-bound in a busy-spin with no VM exits of its own.
+//
+// A broadened version of this (unconditionally forcing a cancel every 10ms
+// regardless of RTC state, to also cover deliverPitTimerIrq) was tried and
+// reverted: it made an unrelated early-boot stall (SeaBIOS spinning on
+// PM1a_CNT, port 0x604) reproduce 100% of the time instead of the
+// pre-existing intermittent behavior, and bisection proved the stall isn't
+// in any of this hypervisor's own per-iteration handlers -- strong evidence
+// that calling WHvCancelRunVirtualProcessor this aggressively and
+// continuously (not just while something is actually pending) perturbs WHV
+// itself rather than helping. Left gated on RTC periodic mode only, as
+// originally designed.
+DWORD WINAPI rtcCancelThread(LPVOID param) {
+    (void)param;
+    for (;;) {
+        if ((cmosRegisters[0x0B] & 0x40) && rtcPeriodicIntervalMs(cmosRegisters[0x0A]) > 0.0 && g_watchdogPartition) {
+            WHvCancelRunVirtualProcessor(g_watchdogPartition, 0, 0);
+            Sleep(1);
+        } else {
+            Sleep(50);
+        }
+    }
+    return 0;
+}
+
+DWORD WINAPI stallWatchdogThread(LPVOID param) {
+    (void)param;
+    LONG64 lastSeen = -1;
+    int stallTicks = 0;
+    for (;;) {
+        Sleep(2000);
+        if (!g_watchdogPartition) continue;
+        LONG64 current = g_watchdogExitCount;
+        if (current == lastSeen && current > 0) {
+            stallTicks++;
+            // CR8 (added 2026-07-16, post-VPPT-fix stall investigation --
+            // see docs/investigations/post-vppt-boot-stall.md): on x64,
+            // CR8 directly holds the current IRQL (TPR). Cheapest possible
+            // discriminator between the three live hypotheses for that
+            // stall -- IRQL >= DISPATCH_LEVEL (2) means the spinning code
+            // itself is blocking DPC delivery (points at DPC/scheduler
+            // starvation); IRQL <= APC_LEVEL (1) means DPCs would run fine
+            // if queued, shifting weight toward a missing interrupt source
+            // or a wait on state only some other, unscheduled thread can
+            // set. No new hardware emulation, just one more register in
+            // this already-existing read.
+            WHV_REGISTER_NAME names[8] = {
+                WHvX64RegisterRip, WHvX64RegisterRsp, WHvX64RegisterRax,
+                WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRbx, WHvX64RegisterCr3,
+                WHvX64RegisterCr8
+            };
+            WHV_REGISTER_VALUE values[8] = { 0 };
+            HRESULT hr = WHvGetVirtualProcessorRegisters(g_watchdogPartition, 0, names, 8, values);
+            if (SUCCEEDED(hr)) {
+                UINT64 irql = values[7].Reg64;
+                const char *irqlName = (irql == 0) ? "PASSIVE_LEVEL" :
+                                        (irql == 1) ? "APC_LEVEL" :
+                                        (irql == 2) ? "DISPATCH_LEVEL" :
+                                        (irql < 13) ? "DIRQL(device)" :
+                                        (irql == 13) ? "CLOCK_LEVEL" :
+                                        (irql == 14) ? "IPI_LEVEL" :
+                                        (irql == 15) ? "HIGH_LEVEL" : "unknown";
+                printf("[watchdog] STALL #%d (exitCount=%lld unchanged for %ds): "
+                       "rip=0x%llX rsp=0x%llX rax=0x%llX rcx=0x%llX rdx=0x%llX rbx=0x%llX cr3=0x%llX cr8(irql)=0x%llX(%s)\n",
+                       stallTicks, (long long)current, stallTicks * 2,
+                       (unsigned long long)values[0].Reg64, (unsigned long long)values[1].Reg64,
+                       (unsigned long long)values[2].Reg64, (unsigned long long)values[3].Reg64,
+                       (unsigned long long)values[4].Reg64, (unsigned long long)values[5].Reg64,
+                       (unsigned long long)values[6].Reg64, (unsigned long long)irql, irqlName);
+                if (stallTicks == 2 && guestMemory) {
+                    kernelDiagIdentifyModule((unsigned char *)guestMemory, values[6].Reg64, values[0].Reg64);
+
+                    // Ring buffer of the most recent PCI config accesses --
+                    // see its declaration for why this exists. Print in
+                    // chronological order (oldest of the retained entries
+                    // first).
+                    if (g_pciCfgRingCount > 0) {
+                        printf("[kerneldiag] last %d PCI config accesses before this stall:\n", g_pciCfgRingCount);
+                        int ri;
+                        int startIdx = (g_pciCfgRingCount < PCI_CFG_RING_SIZE) ? 0 : g_pciCfgRingPos;
+                        for (ri = 0; ri < g_pciCfgRingCount; ri++) {
+                            int idx = (startIdx + ri) % PCI_CFG_RING_SIZE;
+                            PciCfgRingEntry *e = &g_pciCfgRing[idx];
+                            printf("  bus=%u dev=%u func=%u off=0x%02X write=%u val=0x%llX\n",
+                                   e->bus, e->dev, e->func, e->offset, e->isWrite, (unsigned long long)e->val);
+                        }
+                        fflush(stdout);
+                    }
+
+                    // Post-2026-07-16-part-10 stall investigation: this is
+                    // a NEW stall (the RTC-interrupt fix resolved the
+                    // original bugcheck 0x5C) -- everything below this
+                    // block assumes a bugchecked/halted kernel, which no
+                    // longer applies. Dump raw bytes around the live RIP
+                    // directly (no symbol resolution needed/available --
+                    // kernelDiagIdentifyModule already reported "no debug
+                    // directory" for whatever module this RIP is in) so we
+                    // can disassemble offline and see what's actually
+                    // executing.
+                    {
+                        UINT64 dumpStart = (values[0].Reg64 >= 0x40) ? values[0].Reg64 - 0x40 : values[0].Reg64;
+                        unsigned char ripBuf[0x300] = { 0 };
+                        if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, dumpStart, ripBuf, sizeof(ripBuf))) {
+                            char path[512];
+                            _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                        "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\NewStallRip.bin");
+                            FILE *f = fopen(path, "wb");
+                            if (f) { fwrite(ripBuf, 1, sizeof(ripBuf), f); fclose(f); }
+                            printf("[kerneldiag] dumped %llu bytes around live RIP (starting 0x%llX, RIP itself at offset 0x%llX) to %s\n",
+                                   (unsigned long long)sizeof(ripBuf), (unsigned long long)dumpStart,
+                                   (unsigned long long)(values[0].Reg64 - dumpStart), path);
+                        } else {
+                            printf("[kerneldiag] failed to read bytes around live RIP 0x%llX\n", (unsigned long long)values[0].Reg64);
+                        }
+                        fflush(stdout);
+                    }
+
+                    // Disassembly of the dump above (offline) showed RIP
+                    // sitting in a snapshot-and-spin loop: capture a live
+                    // value once into a local, then busy-poll that SAME
+                    // address on every iteration (pause; jmp back) waiting
+                    // for it to differ from the snapshot. Both reads
+                    // resolve (worked out by hand from the RIP-relative
+                    // displacements) to VA = RIP + 0x1060, where RIP here
+                    // is this exact tick-2 sample, empirically always
+                    // caught at the loop's `jmp` instruction. Record that
+                    // address once so later ticks (below) can poll the
+                    // live value over time and show whether it's genuinely
+                    // frozen or just slow.
+                    g_spinWaitTargetVA = values[0].Reg64 + 0x1060;
+                    g_spinWaitCr3 = values[6].Reg64;
+                    UINT64 initialSpinVal = 0;
+                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, g_spinWaitTargetVA, &initialSpinVal, 8)) {
+                        printf("[kerneldiag] spin-wait target VA=0x%llX initial value=0x%llX -- will re-poll on later stall ticks\n",
+                               (unsigned long long)g_spinWaitTargetVA, (unsigned long long)initialSpinVal);
+
+                        // Per an explicit user request: identify where the
+                        // watched address is allocated from -- a known
+                        // kernel object, driver-owned pool memory, or a
+                        // static/global region. It's at a FIXED RVA from
+                        // the module base (RIP+0x1060, and RIP is always
+                        // module_base+0x1188, so the target is always
+                        // module_base+0x21E8 -- same offset every boot,
+                        // only the base itself moves with KASLR). A fixed,
+                        // small offset directly into the module's own
+                        // image -- not a far-away pool address -- is
+                        // already suggestive of a static global rather
+                        // than a dynamically allocated kernel object.
+                        // Confirm precisely by reading the module's own PE
+                        // section table and finding which section (and
+                        // whether it's a zero-fill/.bss-style region)
+                        // contains this RVA.
+                        if (kernelDiagModuleBase != 0) {
+                            UINT32 peOff = 0;
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, kernelDiagModuleBase + 0x3C, &peOff, 4)) {
+                                UINT16 numSections = 0, sizeOfOptHdr = 0;
+                                kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, kernelDiagModuleBase + peOff + 4 + 2, &numSections, 2);
+                                kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, kernelDiagModuleBase + peOff + 4 + 16, &sizeOfOptHdr, 2);
+                                UINT64 sectionTableVA = kernelDiagModuleBase + peOff + 4 + 20 + sizeOfOptHdr;
+                                UINT64 targetRVA = g_spinWaitTargetVA - kernelDiagModuleBase;
+                                printf("[kerneldiag] module PE: %u sections, watched target RVA=0x%llX\n",
+                                       numSections, (unsigned long long)targetRVA);
+                                int si;
+                                for (si = 0; si < numSections && si < 20; si++) {
+                                    unsigned char sec[40] = { 0 };
+                                    if (!kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, sectionTableVA + (UINT64)si * 40, sec, 40)) break;
+                                    char secName[9] = { 0 };
+                                    memcpy(secName, sec, 8);
+                                    UINT32 virtSize = *(UINT32 *)&sec[8];
+                                    UINT32 virtAddr = *(UINT32 *)&sec[12];
+                                    UINT32 rawSize = *(UINT32 *)&sec[16];
+                                    UINT32 rawPtr = *(UINT32 *)&sec[20];
+                                    UINT32 characteristics = *(UINT32 *)&sec[36];
+                                    int containsTarget = (targetRVA >= virtAddr && targetRVA < (UINT64)virtAddr + virtSize);
+                                    int targetInZeroFillTail = containsTarget && rawSize < virtSize &&
+                                                                (targetRVA - virtAddr) >= rawSize;
+                                    printf("[kerneldiag] section[%d] name=%s VA=0x%X VSize=0x%X RawPtr=0x%X RawSize=0x%X chars=0x%08X%s%s\n",
+                                           si, secName, virtAddr, virtSize, rawPtr, rawSize, characteristics,
+                                           containsTarget ? "  <-- CONTAINS WATCHED TARGET" : "",
+                                           targetInZeroFillTail ? " (in the zero-fill tail beyond SizeOfRawData -- .bss-style, never had explicit initialized content in the image)" : "");
+                                }
+                            }
+                            fflush(stdout);
+                        }
+
+                        // No debug directory means no PDB-based symbol
+                        // resolution is possible for this module -- dump a
+                        // larger chunk from its base so we can grep it
+                        // offline for readable strings (driver name,
+                        // copyright, etc.), the next best identification
+                        // technique available.
+                        if (kernelDiagModuleBase != 0) {
+                            unsigned char *modBuf = (unsigned char *)malloc(0x4000);
+                            if (modBuf && kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, kernelDiagModuleBase, modBuf, 0x4000)) {
+                                char path[512];
+                                _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                            "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\NewStallModule.bin");
+                                FILE *mf = fopen(path, "wb");
+                                if (mf) { fwrite(modBuf, 1, 0x4000, mf); fclose(mf); }
+                                printf("[kerneldiag] dumped 0x4000 bytes of unidentified module (base=0x%llX) to %s\n",
+                                       (unsigned long long)kernelDiagModuleBase, path);
+                            }
+                            if (modBuf) free(modBuf);
+                        }
+
+                        // Evidence-driven follow-up per the user's explicit
+                        // direction: only inspect the watched address's
+                        // surrounding memory if CR8 says DPCs are actually
+                        // permitted right now (irql <= APC_LEVEL) -- if
+                        // IRQL were raised, that alone would already
+                        // explain the stall (DPC/scheduler starvation) and
+                        // this extra step wouldn't be needed to distinguish
+                        // further. Otherwise, dump enough bytes to
+                        // recognize a DISPATCHER_HEADER (Type/flags +
+                        // SignalState in the first 8 bytes, a WaitListHead
+                        // Flink/Blink pair -- two consecutive plausible
+                        // kernel pointers -- in the next 16) versus a plain
+                        // shared flag/counter (no such structure, likely
+                        // zeros or unrelated data around it).
+                        if (irql <= 1) {
+                            UINT64 ctxStart = (g_spinWaitTargetVA >= 0x10) ? g_spinWaitTargetVA - 0x10 : g_spinWaitTargetVA;
+                            unsigned char ctxBuf[0x40] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, ctxStart, ctxBuf, sizeof(ctxBuf))) {
+                                printf("[kerneldiag] memory around spin-wait target (IRQL permits DPCs, irql=0x%llX):\n", (unsigned long long)irql);
+                                int mi;
+                                for (mi = 0; mi < (int)sizeof(ctxBuf); mi += 16) {
+                                    printf("  target%+d:", mi - 0x10);
+                                    int mj;
+                                    for (mj = 0; mj < 16; mj++) printf(" %02X", ctxBuf[mi + mj]);
+                                    printf("\n");
+                                }
+                                UINT64 possibleFlink = *(UINT64 *)&ctxBuf[0x18];
+                                UINT64 possibleBlink = *(UINT64 *)&ctxBuf[0x20];
+                                int flinkLooksLikePointer = (possibleFlink >= 0xFFFF800000000000ULL);
+                                int blinkLooksLikePointer = (possibleBlink >= 0xFFFF800000000000ULL);
+                                printf("[kerneldiag] bytes at target+0x08/+0x10 (candidate WaitListHead Flink/Blink) = 0x%llX / 0x%llX -- %s\n",
+                                       (unsigned long long)possibleFlink, (unsigned long long)possibleBlink,
+                                       (flinkLooksLikePointer && blinkLooksLikePointer) ? "BOTH look like plausible kernel pointers -- consistent with a real dispatcher object (KEVENT/KTIMER/etc.)"
+                                       : "does NOT look like a pointer pair -- more consistent with a plain shared flag/counter, not a dispatcher object");
+                            } else {
+                                printf("[kerneldiag] failed to read memory around spin-wait target\n");
+                            }
+                        } else {
+                            printf("[kerneldiag] IRQL 0x%llX (%s) does not permit DPCs -- deferring memory inspection, this alone may explain the stall\n",
+                                   (unsigned long long)irql, irqlName);
+                        }
+
+                        // Who raised IRQL to HIGH_LEVEL and called into
+                        // this spin routine? The function's own prologue
+                        // (already disassembled: push rbp; mov rbp,rsp;
+                        // sub rsp,0x10) means the return address sits at
+                        // [rsp+0x18] relative to wherever we sampled RSP
+                        // inside the loop body (rbp = sampled_rsp+0x10,
+                        // return address = [rbp+8]). Resolve its owning
+                        // module -- if it's ntoskrnl (which has full PDB
+                        // symbols, unlike the unnamed spin-loop module),
+                        // this identifies the actual calling routine by
+                        // name via the same dbghelp toolchain used
+                        // throughout the earlier VPPT investigation.
+                        {
+                            UINT64 returnAddr = 0;
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, values[1].Reg64 + 0x18, &returnAddr, 8)) {
+                                printf("[kerneldiag] candidate return address (caller) at [rsp+0x18] = 0x%llX\n", (unsigned long long)returnAddr);
+                                UINT64 callerModuleBase = 0;
+                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, values[6].Reg64, returnAddr, &callerModuleBase)) {
+                                    unsigned char *callerBuf = (unsigned char *)malloc(0x300);
+                                    UINT64 callerDumpStart = (returnAddr >= 0x100) ? returnAddr - 0x100 : returnAddr;
+                                    if (callerBuf && kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, callerDumpStart, callerBuf, 0x300)) {
+                                        char path[512];
+                                        _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                                    "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\CallerContext.bin");
+                                        FILE *cf = fopen(path, "wb");
+                                        if (cf) { fwrite(callerBuf, 1, 0x300, cf); fclose(cf); }
+                                        printf("[kerneldiag] dumped 0x300 bytes around return address (starting 0x%llX, retaddr at offset 0x%llX, module base 0x%llX, RVA of retaddr 0x%llX) to %s\n",
+                                               (unsigned long long)callerDumpStart, (unsigned long long)(returnAddr - callerDumpStart),
+                                               (unsigned long long)callerModuleBase, (unsigned long long)(returnAddr - callerModuleBase), path);
+                                    }
+                                    if (callerBuf) free(callerBuf);
+
+                                    // Per an explicit user request: continuing
+                                    // the producer trace by checking the
+                                    // OTHER slots in the same registration
+                                    // object our watched driver's callback
+                                    // lives in. Offline disassembly (hand-
+                                    // verified with PowerShell arithmetic,
+                                    // not error-prone manual hex math)
+                                    // confirmed three call sites -- offsets
+                                    // +0x10 (leads to our watched driver),
+                                    // +0x28, +0x40 -- all load their object
+                                    // pointer from the SAME RIP-relative
+                                    // global, resolving to caller-module RVA
+                                    // 0xCA9008. Read that pointer live, then
+                                    // dump a broad range of the object's own
+                                    // fields directly -- faster and more
+                                    // complete than continuing to manually
+                                    // catalog individual call sites from
+                                    // static disassembly.
+                                    UINT64 regObjPtrVA = callerModuleBase + 0xCA9008;
+                                    UINT64 regObjAddr = 0;
+                                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, regObjPtrVA, &regObjAddr, 8)) {
+                                        printf("[kerneldiag] registration object pointer at caller+0xCA9008 (VA=0x%llX) = 0x%llX\n",
+                                               (unsigned long long)regObjPtrVA, (unsigned long long)regObjAddr);
+                                        if (regObjAddr != 0) {
+                                            unsigned char regObj[0x200] = { 0 };
+                                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, regObjAddr, regObj, sizeof(regObj))) {
+                                                printf("[kerneldiag] registration object @0x%llX, slots (offset: value):\n", (unsigned long long)regObjAddr);
+                                                int oi;
+                                                for (oi = 0; oi < (int)sizeof(regObj); oi += 8) {
+                                                    UINT64 slotVal = *(UINT64 *)&regObj[oi];
+                                                    if (slotVal != 0) {
+                                                        printf("  +0x%03X = 0x%016llX%s\n", oi, (unsigned long long)slotVal,
+                                                               (oi == 0x10) ? "  <-- confirmed: leads to our watched driver" :
+                                                               (oi == 0x28 || oi == 0x40) ? "  <-- confirmed slot (different callback)" : "");
+                                                    }
+                                                }
+                                            } else {
+                                                printf("[kerneldiag] failed to read registration object at 0x%llX\n", (unsigned long long)regObjAddr);
+                                            }
+                                        }
+                                    } else {
+                                        printf("[kerneldiag] failed to read registration object pointer at 0x%llX\n", (unsigned long long)regObjPtrVA);
+                                    }
+                                    fflush(stdout);
+
+                                    // Continuing the producer trace: the
+                                    // three confirmed dispatcher wrapper
+                                    // blocks (offsets +0x10/+0x28/+0x40)
+                                    // are spaced roughly 0x74-0x88 bytes
+                                    // apart in the caller's code, suggesting
+                                    // many more exist nearby covering the
+                                    // rest of the registration object's
+                                    // slots, including the two null-slot
+                                    // gaps found (+0x048-+0x088,
+                                    // +0x158-+0x1A8). Dump a much wider
+                                    // stretch of this same function (8KB,
+                                    // comfortably covering ~48+ blocks at
+                                    // that spacing) for offline
+                                    // disassembly, to find which specific
+                                    // offsets have their own dispatcher
+                                    // block (real, defined callback types
+                                    // that are simply unregistered) versus
+                                    // offsets never referenced at all.
+                                    if (callerModuleBase != 0) {
+                                        unsigned char *wideBuf = (unsigned char *)malloc(0x2000);
+                                        UINT64 wideDumpStart = callerModuleBase + 0x36D000;
+                                        if (wideBuf && kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, wideDumpStart, wideBuf, 0x2000)) {
+                                            char path[512];
+                                            _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                                        "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\CallerWideDump.bin");
+                                            FILE *wf = fopen(path, "wb");
+                                            if (wf) { fwrite(wideBuf, 1, 0x2000, wf); fclose(wf); }
+                                            printf("[kerneldiag] dumped 0x2000 bytes of caller dispatcher code (starting caller+0x36D000, VA=0x%llX) to %s\n",
+                                                   (unsigned long long)wideDumpStart, path);
+                                        } else {
+                                            printf("[kerneldiag] failed to read wide caller dump at 0x%llX\n", (unsigned long long)wideDumpStart);
+                                        }
+                                        if (wideBuf) free(wideBuf);
+                                    }
+                                    fflush(stdout);
+                                }
+                            } else {
+                                printf("[kerneldiag] failed to read candidate return address at [rsp+0x18]\n");
+                            }
+
+                            // Neither the watched routine's own .text
+                            // (exhaustively checked -- zero `mov cr8` and
+                            // zero `call` instructions anywhere in its
+                            // 4096-byte section) nor the immediate
+                            // dispatch-wrapper caller (cli/sti only, no
+                            // CR8 touch) raise IRQL. Rather than guessing
+                            // among the many CR8-touching helper routines
+                            // found in the wide static dump, walk the
+                            // guest's own live stack and resolve every
+                            // candidate kernel-mode return address to its
+                            // owning module + RVA -- this shows exactly
+                            // which functions are really on the call
+                            // chain, no speculation needed.
+                            {
+                                printf("[kerneldiag] scanning stack from rsp=0x%llX for candidate return addresses:\n",
+                                       (unsigned long long)values[1].Reg64);
+                                int si;
+                                for (si = 0; si < 192; si++) {
+                                    UINT64 slotVA = values[1].Reg64 + (UINT64)si * 8;
+                                    UINT64 qval = 0;
+                                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, slotVA, &qval, 8) &&
+                                        qval >= 0xFFFF800000000000ULL) {
+                                        UINT64 candModuleBase = 0;
+                                        printf("  [rsp+0x%03X] = 0x%llX", si * 8, (unsigned long long)qval);
+                                        if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, values[6].Reg64, qval, &candModuleBase)) {
+                                            printf("    ^ [rsp+0x%03X] module base 0x%llX RVA 0x%llX\n",
+                                                   si * 8, (unsigned long long)candModuleBase, (unsigned long long)(qval - candModuleBase));
+                                            // Dump a code window around every
+                                            // resolved candidate -- cheap
+                                            // (small reads), and lets us
+                                            // offline-disassemble whichever
+                                            // ones turn out to belong to a
+                                            // named module (e.g. one with a
+                                            // real PDB) after the fact.
+                                            unsigned char candBuf[0x180];
+                                            UINT64 candDumpStart = (qval >= 0x100) ? qval - 0x100 : qval;
+                                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candDumpStart, candBuf, sizeof(candBuf))) {
+                                                char cpath[512];
+                                                _snprintf_s(cpath, sizeof(cpath), _TRUNCATE,
+                                                            "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\StackCand_0x%X.bin",
+                                                            si * 8);
+                                                FILE *cfp = fopen(cpath, "wb");
+                                                if (cfp) { fwrite(candBuf, 1, sizeof(candBuf), cfp); fclose(cfp); }
+                                                printf("    ^ dumped 0x180 bytes (starting 0x%llX, candidate at offset 0x100) to %s\n",
+                                                       (unsigned long long)candDumpStart, cpath);
+                                            }
+                                        } else {
+                                            printf("\n");
+                                        }
+                                    }
+                                }
+                                fflush(stdout);
+                            }
+                            fflush(stdout);
+                        }
+                    } else {
+                        printf("[kerneldiag] failed to read spin-wait target VA=0x%llX\n", (unsigned long long)g_spinWaitTargetVA);
+                        g_spinWaitTargetVA = 0;
+                    }
+                    fflush(stdout);
+                }
+
+                if (stallTicks > 2 && g_spinWaitTargetVA != 0 && guestMemory) {
+                    UINT64 spinVal = 0;
+                    if (kernelReadVA((unsigned char *)guestMemory, g_spinWaitCr3, g_spinWaitTargetVA, &spinVal, 8)) {
+                        printf("[kerneldiag] spin-wait target value at tick %d = 0x%llX\n", stallTicks, (unsigned long long)spinVal);
+                    }
+                    fflush(stdout);
+                }
+
+                static int stackDumpRanOnce = 0;
+                if (stallTicks == 3 && !stackDumpRanOnce && guestMemory) {
+                    stackDumpRanOnce = 1;
+                    // HaliHaltSystem is normally reached via a `call`, not a
+                    // `jmp` -- dump the stack to recover the return address
+                    // chain and find out what actually decided to halt.
+                    printf("[kerneldiag] stack dump from rsp=0x%llX (cr3=0x%llX):\n",
+                           (unsigned long long)values[1].Reg64, (unsigned long long)values[6].Reg64);
+                    int qi;
+                    for (qi = 0; qi < 64; qi++) {
+                        UINT64 slotVA = values[1].Reg64 + (UINT64)qi * 8;
+                        UINT64 qval = 0;
+                        if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, slotVA, &qval, 8) &&
+                            qval >= 0xFFFF800000000000ULL) {
+                            printf("  [rsp+0x%02X] = 0x%llX\n", qi * 8, (unsigned long long)qval);
+                        }
+                    }
+                    // KiBugCheckData RVA (resolved offline via ntkrnlmp.pdb +
+                    // dbghelp, same GUID/age this kernel build reported
+                    // earlier): a fixed 5x UINT64 global -- [0]=bugcheck
+                    // code, [1..4]=its four parameters. The stack showed
+                    // KeBugCheck2/KiBugCheckProgress frames, meaning this
+                    // ISN'T a calibration stall -- the kernel bugchecked and
+                    // HaliHaltSystem is the terminal halt loop that follows.
+                    if (kernelDiagModuleBase != 0) {
+                        UINT64 bugCheckData[5] = { 0 };
+                        UINT64 kiBugCheckDataVA = kernelDiagModuleBase + 0xC2B3E0;
+                        if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, kiBugCheckDataVA, bugCheckData, sizeof(bugCheckData))) {
+                            printf("[kerneldiag] KiBugCheckData: code=0x%llX params=[0x%llX, 0x%llX, 0x%llX, 0x%llX]\n",
+                                   (unsigned long long)bugCheckData[0], (unsigned long long)bugCheckData[1],
+                                   (unsigned long long)bugCheckData[2], (unsigned long long)bugCheckData[3],
+                                   (unsigned long long)bugCheckData[4]);
+                        } else {
+                            printf("[kerneldiag] failed to read KiBugCheckData at VA 0x%llX\n", (unsigned long long)kiBugCheckDataVA);
+                        }
+
+                        // Bugcheck 0x139 (KERNEL_SECURITY_CHECK_FAILURE)
+                        // seen after the experimental port-0x64/0xFE reset
+                        // handler: per its documented parameter layout,
+                        // param1=Type (0x3 = FAST_FAIL_CORRUPT_LIST_ENTRY),
+                        // param2=trap frame address, param3=EXCEPTION_RECORD
+                        // address, param4=reserved. Parse the exception
+                        // record directly to find the exact instruction
+                        // that detected the corruption -- far more precise
+                        // than guessing which reset-incomplete device state
+                        // is at fault.
+                        if (bugCheckData[0] == 0x139 && bugCheckData[3] != 0) {
+                            unsigned char er[0x30] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, bugCheckData[3], er, sizeof(er))) {
+                                UINT32 exCode = *(UINT32 *)&er[0x00];
+                                UINT64 exAddress = *(UINT64 *)&er[0x10];
+                                UINT32 numParams = *(UINT32 *)&er[0x18];
+                                UINT64 exInfo0 = *(UINT64 *)&er[0x20];
+                                UINT64 exInfo1 = *(UINT64 *)&er[0x28];
+                                printf("[kerneldiag] EXCEPTION_RECORD @0x%llX: code=0x%X address=0x%llX numParams=%u info[0]=0x%llX info[1]=0x%llX\n",
+                                       (unsigned long long)bugCheckData[3], exCode, (unsigned long long)exAddress,
+                                       numParams, (unsigned long long)exInfo0, (unsigned long long)exInfo1);
+
+                                UINT64 exModuleBase = 0;
+                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, values[6].Reg64, exAddress, &exModuleBase)) {
+                                    printf("[kerneldiag] fast-fail site: module base 0x%llX, RVA 0x%llX%s\n",
+                                           (unsigned long long)exModuleBase, (unsigned long long)(exAddress - exModuleBase),
+                                           (exModuleBase == kernelDiagModuleBase) ? "  <-- inside ntoskrnl.exe (real symbol resolvable offline)" : "");
+
+                                    // Dump live guest code around the actual
+                                    // fail site so it can be disassembled
+                                    // offline with the trustworthy
+                                    // ntkrnlmp.pdb -- this tells us exactly
+                                    // which register/parameter the
+                                    // safe-unlink check was validating,
+                                    // which is what we actually need to find
+                                    // the corrupted structure itself (the
+                                    // EXCEPTION_RECORD's own info[] array
+                                    // carries no extra pointer for this
+                                    // fast-fail subtype).
+                                    unsigned char failSiteBuf[0x200] = { 0 };
+                                    UINT64 failSiteStart = (exAddress >= 0x100) ? exAddress - 0x100 : exAddress;
+                                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, failSiteStart, failSiteBuf, sizeof(failSiteBuf))) {
+                                        char fpath[512];
+                                        _snprintf_s(fpath, sizeof(fpath), _TRUNCATE,
+                                                    "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\FailSite.bin");
+                                        FILE *ffp = fopen(fpath, "wb");
+                                        if (ffp) { fwrite(failSiteBuf, 1, sizeof(failSiteBuf), ffp); fclose(ffp); }
+                                        printf("[kerneldiag] dumped 0x200 bytes around fail site (starting RVA 0x%llX, module base 0x%llX) to %s\n",
+                                               (unsigned long long)(failSiteStart - exModuleBase), (unsigned long long)exModuleBase, fpath);
+                                    }
+                                }
+
+                                // Trap frame (param2): the offset-guessing
+                                // approach (assume the classic public
+                                // KTRAP_FRAME layout: Rax@0x30, Rcx@0x38,
+                                // Rdx@0x40, R8@0x48, R9@0x50, R10@0x58...)
+                                // put R10 -- the one register the fail-site
+                                // disassembly proves is NEVER reassigned
+                                // after function entry (r10 = original rcx,
+                                // the subsegment pointer) across all three
+                                // safe-unlink checks, so it should still
+                                // hold a live, dereferenceable pointer at
+                                // the fault -- at an offset that read back
+                                // as exactly zero. A zero there for a
+                                // register the code demonstrably still
+                                // needs means that offset guess is wrong.
+                                // Print every qword (not just nonzero ones)
+                                // and auto-flag anything that looks like a
+                                // real canonical kernel pointer, then dump
+                                // a small window of ITS OWN memory content
+                                // -- a genuine LIST_ENTRY's Flink/Blink
+                                // pair will show two adjacent pointer-sized
+                                // fields, letting the actual data identify
+                                // itself instead of trusting an offset
+                                // guess.
+                                if (bugCheckData[2] != 0) {
+                                    unsigned char tf[0x200] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, bugCheckData[2], tf, sizeof(tf))) {
+                                        printf("[kerneldiag] trap frame @0x%llX, ALL qwords:\n", (unsigned long long)bugCheckData[2]);
+                                        int ti;
+                                        for (ti = 0; ti < (int)sizeof(tf); ti += 8) {
+                                            UINT64 qv = *(UINT64 *)&tf[ti];
+                                            int looksLikePointer = (qv >= 0xFFFF800000000000ULL);
+                                            printf("  +0x%03X = 0x%016llX%s\n", ti, (unsigned long long)qv,
+                                                   looksLikePointer ? "  <-- canonical kernel pointer" : "");
+                                            if (looksLikePointer) {
+                                                unsigned char nearby[0x30] = { 0 };
+                                                if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, qv, nearby, sizeof(nearby))) {
+                                                    UINT64 f0 = *(UINT64 *)&nearby[0x00];
+                                                    UINT64 f8 = *(UINT64 *)&nearby[0x08];
+                                                    printf("      -> memory there: +0x00=0x%016llX +0x08=0x%016llX%s\n",
+                                                           (unsigned long long)f0, (unsigned long long)f8,
+                                                           (f0 >= 0xFFFF800000000000ULL && f8 >= 0xFFFF800000000000ULL) ? "  <-- both look like pointers, plausible LIST_ENTRY" : "");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                printf("[kerneldiag] failed to read EXCEPTION_RECORD at 0x%llX\n", (unsigned long long)bugCheckData[3]);
+                            }
+                            fflush(stdout);
+                        }
+
+                        // Byte-pattern scanning for the call site (direct
+                        // KeBugCheckEx, direct HalBugCheckSystem, and a raw
+                        // "mov edx,0x110" search) all came back empty or
+                        // pointed only at an unrelated AuthZ/security-
+                        // subsystem cold path -- disabled now that it's
+                        // served its purpose (confirmed param1=0x110 is a
+                        // generic, reused bugcheck-component ID, not
+                        // HAL-specific, so it can't disambiguate the real
+                        // call site by itself). Trying a different angle
+                        // instead: param2 is a POINTER (consistently in the
+                        // 0xFFFFF7xxxxxxxxxx range across every capture) --
+                        // dump what it actually points to, in case it's a
+                        // struct/string that names the failing component.
+                        if (bugCheckData[2] != 0) {
+                            // Widened from 0x80 to 0x120 bytes (falsification
+                            // experiment B, see docs/roadmap.md): the earlier
+                            // dump stopped short of offset +0xb8, the one
+                            // byte that directly answers "did
+                            // HalpTimerInitialize's success path run" --
+                            // bit 2 (0x4) is set there ONLY by the
+                            // "or dword ptr [rbx+0xb8], 4" instruction right
+                            // after HalpTimerInitialize returns non-negative
+                            // (confirmed in ColdPath2.disasm.txt). Zero risk
+                            // (read-only, reuses the already-proven
+                            // kernelReadVA path) versus live INT3 tracing,
+                            // which would need the guest kernel's randomized
+                            // load base known *before* the target function
+                            // runs -- something only discoverable reactively
+                            // today, after a stall, i.e. too late to plant a
+                            // breakpoint ahead of time without new proactive
+                            // module-discovery infrastructure.
+                            unsigned char param2Mem[0x120] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, bugCheckData[2], param2Mem, sizeof(param2Mem))) {
+                                printf("[kerneldiag] memory at param2 (0x%llX):\n", (unsigned long long)bugCheckData[2]);
+                                int pi;
+                                for (pi = 0; pi < (int)sizeof(param2Mem); pi += 16) {
+                                    printf("  +0x%02X:", pi);
+                                    int pj;
+                                    for (pj = 0; pj < 16; pj++) printf(" %02X", param2Mem[pi + pj]);
+                                    printf("  ");
+                                    for (pj = 0; pj < 16; pj++) {
+                                        unsigned char c = param2Mem[pi + pj];
+                                        printf("%c", (c >= 0x20 && c < 0x7F) ? c : '.');
+                                    }
+                                    printf("\n");
+                                }
+                                unsigned char flagsB8 = param2Mem[0xB8];
+                                printf("[kerneldiag] descriptor+0xB8 = 0x%02X -- bit2 (HalpTimerInitialize succeeded) is %s\n",
+                                       flagsB8, (flagsB8 & 0x04) ? "SET" : "clear");
+
+                                // Narrow investigation (2026-07-16),
+                                // continued: HalpInterruptRemap.disasm.txt
+                                // showed its result register defaults to
+                                // STATUS_UNSUCCESSFUL at entry and is only
+                                // overwritten if the interrupt descriptor's
+                                // type field (offset 0 of the structure
+                                // pointed to by descriptor+0x120) equals 0
+                                // or 3 -- any other value falls straight
+                                // through to the untouched default. Chase
+                                // that pointer and read the actual type
+                                // field to confirm directly.
+                                UINT64 remapInfoPtr = *(UINT64 *)&param2Mem[0x120];
+                                printf("[kerneldiag] descriptor+0x120 (remap-info pointer) = 0x%llX\n",
+                                       (unsigned long long)remapInfoPtr);
+                                if (remapInfoPtr != 0) {
+                                    unsigned char remapInfo[16] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, remapInfoPtr, remapInfo, sizeof(remapInfo))) {
+                                        UINT32 typeField = *(UINT32 *)&remapInfo[0];
+                                        printf("[kerneldiag] remap-info+0x00 (type field HalpInterruptRemap switches on) = 0x%X (expects 0 or 3; anything else -> unhandled default STATUS_UNSUCCESSFUL)\n",
+                                               typeField);
+                                        printf("[kerneldiag] remap-info raw: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                                               remapInfo[0], remapInfo[1], remapInfo[2], remapInfo[3], remapInfo[4], remapInfo[5], remapInfo[6], remapInfo[7],
+                                               remapInfo[8], remapInfo[9], remapInfo[10], remapInfo[11], remapInfo[12], remapInfo[13], remapInfo[14], remapInfo[15]);
+                                    } else {
+                                        printf("[kerneldiag] failed to read remap-info at 0x%llX\n", (unsigned long long)remapInfoPtr);
+                                    }
+                                }
+                            } else {
+                                printf("[kerneldiag] failed to read memory at param2 (0x%llX)\n", (unsigned long long)bugCheckData[2]);
+                            }
+                        }
+
+                        // HalpTimerInitSystem (dispatched by a "phase"
+                        // parameter) confirmed phase 25 == our param3, with
+                        // logic "if (HalpWatchdogTimer != 0) goto <cold
+                        // path that bugchecks>". Read HalpWatchdogTimer's
+                        // actual live value (real pointer vs. garbage tells
+                        // us whether something legitimately registered a
+                        // watchdog vs. memory corruption), and dump
+                        // HalpTimerInitializeSystemWatchdog (the most
+                        // obviously-named candidate for what sets it) plus
+                        // the original two orchestrator functions.
+                        {
+                            UINT64 halpWatchdogTimerVA = kernelDiagModuleBase + 0xC4BE68;
+                            UINT64 watchdogTimerValue = 0;
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, halpWatchdogTimerVA, &watchdogTimerValue, 8)) {
+                                printf("[kerneldiag] HalpWatchdogTimer = 0x%llX\n", (unsigned long long)watchdogTimerValue);
+                            } else {
+                                printf("[kerneldiag] failed to read HalpWatchdogTimer\n");
+                            }
+                            fflush(stdout);
+                        }
+                        // Confirmed (via disassembling HalpTimerConfigureInterrupt
+                        // and its cold-path failure trampoline) that param3
+                        // is HalpTimerLastProblem (RVA 0xC4C2B4), a SHARED
+                        // "last recorded problem code" global reused by many
+                        // different HAL timer/interrupt failure checks --
+                        // meaning multiple different root causes could
+                        // produce this exact bugcheck signature, and the
+                        // only way to disambiguate which ACTUAL check fired
+                        // is to find what specifically wrote the literal
+                        // value 25 (0x19) into it. Scan for `mov dword ptr
+                        // [rip+disp32], 0x19` (opcode C7 05) resolving to
+                        // that exact address.
+                        {
+                            UINT64 targetVA = kernelDiagModuleBase + 0xC4C2B4;
+                            UINT64 scanBase = kernelDiagModuleBase;
+                            UINT64 scanLen = 0x2000000;
+                            unsigned char *scanBuf = (unsigned char *)malloc(0x1000);
+                            int hits = 0;
+                            UINT64 pg;
+                            for (pg = 0; pg < scanLen && hits < 20; pg += 0x1000) {
+                                if (!scanBuf) break;
+                                if (!kernelReadVA((unsigned char *)guestMemory, values[6].Reg64,
+                                                   scanBase + pg, scanBuf, 0x1000)) {
+                                    continue;
+                                }
+                                int bi;
+                                for (bi = 0; bi < 0x1000 - 10 && hits < 20; bi++) {
+                                    if (scanBuf[bi] == 0xC7 && scanBuf[bi+1] == 0x05) {
+                                        INT32 disp32;
+                                        memcpy(&disp32, scanBuf + bi + 2, 4);
+                                        UINT32 imm32;
+                                        memcpy(&imm32, scanBuf + bi + 6, 4);
+                                        UINT64 insnVA = scanBase + pg + bi;
+                                        UINT64 nextInsnVA = insnVA + 10;
+                                        UINT64 resolvedTarget = nextInsnVA + (INT64)disp32;
+                                        if (resolvedTarget == targetVA && imm32 == 0x19) {
+                                            UINT64 rva = insnVA - kernelDiagModuleBase;
+                                            printf("[kerneldiag] FOUND: 'mov [HalpTimerLastProblem], 0x19' at RVA 0x%llX\n",
+                                                   (unsigned long long)rva);
+                                            unsigned char ctx[64] = { 0 };
+                                            kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, insnVA - 32, ctx, 64);
+                                            int ci;
+                                            printf("  bytes:");
+                                            for (ci = 0; ci < 64; ci++) printf(" %02X", ctx[ci]);
+                                            printf("\n");
+                                            hits++;
+                                        }
+                                    }
+                                }
+                            }
+                            if (scanBuf) free(scanBuf);
+                            printf("[kerneldiag] HalpTimerLastProblem=0x19 setter scan complete: %d hit(s)\n", hits);
+                        }
+
+                        // Narrow investigation (2026-07-16), continued:
+                        // descriptor+0xB8 bit6 already set means the
+                        // HalpInterruptRemap call at RVA 0x4A4CE7 gets
+                        // skipped entirely (test al,0x40; jne <skip> right
+                        // before it) -- so descriptor+0x120 being NULL
+                        // (confirmed above) is a dead end, not the real
+                        // path. Execution actually falls through to
+                        // HalpInterruptSetLineState, whose hot path (RVA
+                        // 0x3A3AE8, already dumped/disassembled) calls
+                        // HalpInterruptLookupController (our IOAPIC) then
+                        // HalpInterruptSetLineStateInternal -- but every
+                        // failure landing pad is in a cold-path region
+                        // around RVA 0x4A5BE0-0x4A5E00, outside that dump.
+                        // Dumping that cold-path tail plus
+                        // HalpInterruptSetLineStateInternal itself (the
+                        // actual hardware-touching call) to find exactly
+                        // what it checks.
+                        //
+                        // Part 5 (2026-07-16): HalpInterruptSetLineStateInternal
+                        // dispatches through a function pointer stored at
+                        // the *live* interrupt-controller object's own
+                        // +0x70 offset (a vtable-style callback). That
+                        // object is resolved by HalpInterruptLookupController
+                        // (RVA 0x378DD0), never yet dumped itself -- add it
+                        // here first so its own disassembly reveals how it
+                        // finds the controller object (expected: a
+                        // RIP-relative global list/array), which tells us
+                        // how to walk to the live object and read +0x70
+                        // directly, without any live breakpoint/tracing.
+                        {
+                            struct { const char *name; UINT64 rva; UINT64 len; } vdumps[] = {
+                                { "HalpInterruptSetLineState_ColdPath", 0x4A5BE8, 0x500 },
+                                { "HalpInterruptSetLineStateInternal", 0x378C7C, 0x400 },
+                                { "HalpInterruptLookupController", 0x378DD0, 0x300 },
+                                // Part 6 (2026-07-16): HalpApicSetLineState
+                                // (the controller+0x70 callback, dumped live
+                                // above) has two failure-relevant cold
+                                // branches displaced into this far region:
+                                // RVA 0x4957C2 (a mismatch between the line
+                                // descriptor's first field and the "self"
+                                // context's +8 field -- the leading
+                                // candidate for our actual failure) and
+                                // 0x4957CC (a different negative-eax case).
+                                // Several other HalpApicConvertToRte cold
+                                // targets also cluster here (0x495806,
+                                // 0x495843, 0x495881, 0x4958F7, 0x495916,
+                                // 0x495934, 0x495973). Dump generously to
+                                // capture all of them in one pass.
+                                { "HalpApicSetLineState_ColdPath", 0x4957C0, 0x400 },
+                                // Part 6, continued: HalpInterruptSetLineStateInternal's
+                                // OWN failure landing pad (reached when the
+                                // controller+0x70 dispatch call, i.e.
+                                // HalpApicSetLineState, returns negative) is
+                                // at RVA 0x49462E -- never directly
+                                // disassembled, only assumed to propagate
+                                // the return value unmodified. Confirm that
+                                // directly instead of assuming it.
+                                { "HalpInterruptSetLineStateInternal_ColdPath", 0x49462E, 0x100 },
+                                // Part 8 (2026-07-16): ColdPath.disasm.txt
+                                // (captured way back in part 1 of this
+                                // investigation, RVA ~0x4A8F00+) shows a
+                                // SECOND, separate failure block at RVA
+                                // 0x4A9010, gated on descriptor+0xB8 bit4
+                                // (clear for us, confirmed since part 3) --
+                                // falling straight to "mov eax,0xC0000001"
+                                // then storing HalpTimerLastProblem=0x19 --
+                                // matching our exact observed values,
+                                // without going through
+                                // HalpInterruptSetLineState at all. Never
+                                // yet dumped HalpTimerInitializeClock's own
+                                // HOT path (RVA 0x3AFBF4) to see how/when
+                                // this block is reached relative to the
+                                // HalpTimerConfigureInterrupt call already
+                                // confirmed in part 2 -- do that now to
+                                // resolve which failure path is real.
+                                { "HalpTimerInitializeClock_HotPath", 0x3AFBF4, 0x400 },
+                            };
+                            int di;
+                            for (di = 0; di < 6; di++) {
+                                unsigned char *buf = (unsigned char *)malloc(vdumps[di].len);
+                                if (!buf) continue;
+                                if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64,
+                                                  kernelDiagModuleBase + vdumps[di].rva, buf, vdumps[di].len)) {
+                                    char path[512];
+                                    _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                                "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\%s.bin",
+                                                vdumps[di].name);
+                                    FILE *f = fopen(path, "wb");
+                                    if (f) { fwrite(buf, 1, vdumps[di].len, f); fclose(f); }
+                                    printf("[kerneldiag] dumped %s (%llu bytes) to %s\n", vdumps[di].name,
+                                           (unsigned long long)vdumps[di].len, path);
+                                } else {
+                                    printf("[kerneldiag] failed to read %s\n", vdumps[di].name);
+                                }
+                                free(buf);
+                            }
+                        }
+
+                        // Part 5, continued: HalpInterruptLookupController's
+                        // own disassembly (confirmed live above) is:
+                        //   mov rax, [rip+0x8D2B39]   ; rax = list head Flink (global LIST_ENTRY)
+                        //   lea r8,  [rip+0x8D2B32]   ; r8  = &list head itself (loop terminator)
+                        //   cmp rax, r8 ; je <empty>
+                        //   loop: cmp [rax+0xE8], ecx ; jne <next via [rax]>
+                        //   match -> return rax
+                        // The list head global resolves to RVA 0xC4B910
+                        // (0x378DD7 + 0x8D2B39). Walk it live: since our
+                        // emulated hardware only ever registers one IOAPIC
+                        // controller, the first real (non-head) node is
+                        // almost certainly the one HalpInterruptSetLineState
+                        // resolves to -- read it directly rather than
+                        // reproducing the ecx match key, and sanity-check
+                        // via the +0xE8/+0xDC fields already known from
+                        // disassembly. Then read +0x70 (callback) and +0x10
+                        // (self/context) and dump the callback target
+                        // directly from its live pointer -- no live
+                        // breakpoint/tracing needed, consistent with the
+                        // read-only technique used throughout this
+                        // investigation.
+                        {
+                            UINT64 listHeadVA = kernelDiagModuleBase + 0xC4B910;
+                            UINT64 flink = 0, blink = 0;
+                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, listHeadVA, &flink, 8) &&
+                                kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, listHeadVA + 8, &blink, 8)) {
+                                printf("[kerneldiag] HalpInterruptControllerList head @0x%llX: Flink=0x%llX Blink=0x%llX%s\n",
+                                       (unsigned long long)listHeadVA, (unsigned long long)flink, (unsigned long long)blink,
+                                       (flink != blink) ? " -- MORE THAN ONE controller registered, walking all entries" : " -- single entry");
+                                // Part 7 (2026-07-16): Flink != Blink means
+                                // more than one controller object is
+                                // registered -- walk the WHOLE list (not
+                                // just the first entry) and dump every
+                                // distinct +0x70 callback, since the earlier
+                                // single-entry assumption may have picked
+                                // the wrong controller for the clock
+                                // interrupt's specific GSI.
+                                UINT64 cur = flink;
+                                int nodeIndex = 0;
+                                UINT64 seenCallbacks[8] = { 0 };
+                                int seenCount = 0;
+                                while (cur != 0 && cur != listHeadVA && nodeIndex < 8) {
+                                    UINT64 controllerVA = cur;
+                                    UINT32 idField = 0, flagsDC = 0;
+                                    UINT64 selfField = 0, callbackPtr = 0;
+                                    UINT64 nextNode = 0;
+                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, controllerVA, &nextNode, 8);
+                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, controllerVA + 0xE8, &idField, 4);
+                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, controllerVA + 0xDC, &flagsDC, 4);
+                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, controllerVA + 0x10, &selfField, 8);
+                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, controllerVA + 0x70, &callbackPtr, 8);
+                                    printf("[kerneldiag] controller[%d] @0x%llX: +0xE8(id)=0x%X +0xDC(flags)=0x%X +0x10(self)=0x%llX +0x70(callback)=0x%llX\n",
+                                           nodeIndex, (unsigned long long)controllerVA, idField, flagsDC,
+                                           (unsigned long long)selfField, (unsigned long long)callbackPtr);
+                                    // Part 8 (2026-07-16): read the
+                                    // controller's OWN embedded routing-
+                                    // candidate LIST_ENTRY at +0x100 --
+                                    // the exact list HalpInterruptFindBestRouting
+                                    // walks (part 7 finding) -- directly,
+                                    // to confirm empty vs. populated rather
+                                    // than continuing to hypothesize.
+                                    {
+                                        UINT64 candListHeadVA = controllerVA + 0x100;
+                                        UINT64 candFlink = 0, candBlink = 0;
+                                        if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candListHeadVA, &candFlink, 8) &&
+                                            kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candListHeadVA + 8, &candBlink, 8)) {
+                                            int isEmpty = (candFlink == candListHeadVA);
+                                            printf("[kerneldiag] controller[%d] +0x100 (routing-candidate list) @0x%llX: Flink=0x%llX Blink=0x%llX -- %s\n",
+                                                   nodeIndex, (unsigned long long)candListHeadVA,
+                                                   (unsigned long long)candFlink, (unsigned long long)candBlink,
+                                                   isEmpty ? "EMPTY" : "has entries");
+                                            if (!isEmpty) {
+                                                UINT64 candCur = candFlink;
+                                                int candIdx = 0;
+                                                while (candCur != 0 && candCur != candListHeadVA && candIdx < 8) {
+                                                    UINT32 f10 = 0, f14 = 0, f18 = 0;
+                                                    UINT64 candNext = 0;
+                                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candCur, &candNext, 8);
+                                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candCur + 0x10, &f10, 4);
+                                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candCur + 0x14, &f14, 4);
+                                                    kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, candCur + 0x18, &f18, 4);
+                                                    printf("[kerneldiag] controller[%d] candidate[%d] @0x%llX: +0x10(dest)=0x%X +0x14(prioLo)=0x%X +0x18(prioHi)=0x%X\n",
+                                                           nodeIndex, candIdx, (unsigned long long)candCur, f10, f14, f18);
+                                                    candCur = candNext;
+                                                    candIdx++;
+                                                }
+                                            }
+                                        } else {
+                                            printf("[kerneldiag] controller[%d] failed to read +0x100 list head\n", nodeIndex);
+                                        }
+                                    }
+                                    if (callbackPtr != 0) {
+                                        INT64 callbackRvaSigned = (INT64)callbackPtr - (INT64)kernelDiagModuleBase;
+                                        printf("[kerneldiag] controller[%d] callback RVA = 0x%llX (%s)\n", nodeIndex,
+                                               (unsigned long long)callbackRvaSigned,
+                                               (callbackRvaSigned > 0 && callbackRvaSigned < 0x2000000) ? "in-module" : "OUTSIDE module range -- likely a different module");
+                                        int alreadyDumped = 0, si;
+                                        for (si = 0; si < seenCount; si++) {
+                                            if (seenCallbacks[si] == callbackPtr) { alreadyDumped = 1; break; }
+                                        }
+                                        if (!alreadyDumped && seenCount < 8) {
+                                            seenCallbacks[seenCount++] = callbackPtr;
+                                            unsigned char cbBuf[0x400];
+                                            if (kernelReadVA((unsigned char *)guestMemory, values[6].Reg64, callbackPtr, cbBuf, sizeof(cbBuf))) {
+                                                char path[512];
+                                                _snprintf_s(path, sizeof(path), _TRUNCATE,
+                                                            "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\5bed7398-339c-497a-9383-821cf9d2769e\\scratchpad\\InterruptControllerCallback_%d.bin",
+                                                            nodeIndex);
+                                                FILE *f = fopen(path, "wb");
+                                                if (f) { fwrite(cbBuf, 1, sizeof(cbBuf), f); fclose(f); }
+                                                printf("[kerneldiag] dumped controller[%d] callback (%llu bytes from live pointer 0x%llX) to %s\n",
+                                                       nodeIndex, (unsigned long long)sizeof(cbBuf), (unsigned long long)callbackPtr, path);
+                                            } else {
+                                                printf("[kerneldiag] failed to read controller[%d] callback target at 0x%llX\n", nodeIndex, (unsigned long long)callbackPtr);
+                                            }
+                                        } else if (alreadyDumped) {
+                                            printf("[kerneldiag] controller[%d] callback matches an already-dumped one, skipping\n", nodeIndex);
+                                        }
+                                    }
+                                    cur = nextNode;
+                                    nodeIndex++;
+                                }
+                                if (nodeIndex == 0) {
+                                    printf("[kerneldiag] HalpInterruptControllerList is empty -- no controller registered\n");
+                                }
+                            } else {
+                                printf("[kerneldiag] failed to read HalpInterruptControllerList head\n");
+                            }
+                        }
+                    }
+                    fflush(stdout);
+                }
+            } else {
+                printf("[watchdog] STALL #%d but WHvGetVirtualProcessorRegisters failed: 0x%lx\n", stallTicks, hr);
+            }
+            fflush(stdout);
+        } else {
+            stallTicks = 0;
+        }
+        lastSeen = current;
+    }
+    return 0;
+}
+
+// Measures the HOST's real TSC frequency via a QueryPerformanceCounter-timed
+// busy-wait window, so it can be reported to the guest via a synthesized
+// CPUID leaf 0x15 (see call site in main). This host CPU's own CPUID leaf
+// 0x15 has no crystal-clock Hz value (confirmed empirically: ecx=0, leaf
+// 0x16 entirely empty -- see check_cpuid15.c from the RTC-slowdown
+// investigation), which is exactly why Windows falls back to a slow,
+// real-time RTC-second-rollover calibration loop during boot (observed as
+// a multi-minute stall with the guest spinning inside a single
+// WHvRunVirtualProcessor call, no port traps, host CPU time climbing).
+// Since our hypervisor fully controls what CPUID the guest sees, we can
+// supply a directly-measured, accurate frequency and let Windows skip that
+// slow path entirely.
+UINT64 measureTscFrequency(void) {
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    unsigned __int64 tsc0 = __rdtsc();
+    LARGE_INTEGER now;
+    do {
+        QueryPerformanceCounter(&now);
+    } while ((now.QuadPart - t0.QuadPart) * 1000 / freq.QuadPart < 100);
+    unsigned __int64 tsc1 = __rdtsc();
+    QueryPerformanceCounter(&t1);
+    double elapsedSec = (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart;
+    return (UINT64)((double)(tsc1 - tsc0) / elapsedSec);
+}
+
+int main(int argc, char *argv[]) {
+    netBackendInit();
+
+    // argv[1]: VM name shown in the window title (defaults to "Guest Display")
+    // argv[2]: path to the BIOS image to load (defaults to "bios.bin")
+    // argv[3]: path to the raw disk image backing the primary ATA drive (optional)
+    const char *biosPath = "bios.bin";
+    const char *diskPath = NULL;
+    if (argc > 1) {
+        _snprintf_s(g_windowTitle, sizeof(g_windowTitle), _TRUNCATE,
+                    "LocalHost Hypervisor -- %s", argv[1]);
+    }
+    if (argc > 2) {
+        biosPath = argv[2];
+    }
+    if (argc > 3) {
+        diskPath = argv[3];
+    }
+
+    // UEFI firmware (OVMF/edk2) is identified by a ".fd" extension on the
+    // supplied firmware image -- anything else keeps the existing legacy
+    // BIOS boot path (1MB guest RAM, firmware loaded at 0xC0000, real-mode
+    // reset vector at the top of the first 1MB) completely unchanged.
+    int uefiMode = 0;
+    size_t biosPathLen = strlen(biosPath);
+    if (biosPathLen >= 3 && _stricmp(biosPath + biosPathLen - 3, ".fd") == 0) {
+        uefiMode = 1;
+    }
+    guestMemSize = uefiMode ? (SIZE_T)UEFI_GUEST_RAM_SIZE : 0x100000;
+
+    if (diskPath) {
+        // Open .iso images read-only: installer/boot media should never
+        // legitimately be written to this early (UdfDxe + the boot
+        // manager only need to read it), and opening read-write would
+        // risk actually corrupting a multi-GB source ISO if anything
+        // upstream ever issues an unexpected write. Any real write
+        // command against a read-only FILE* just fails harmlessly (we
+        // don't check fwrite's return value on that path) rather than
+        // touching the file.
+        size_t diskPathLen = strlen(diskPath);
+        int isIso = diskPathLen >= 4 && _stricmp(diskPath + diskPathLen - 4, ".iso") == 0;
+        ataSectorSize = isIso ? 2048 : 512;
+        ataDiskFile = fopen(diskPath, isIso ? "rb" : "r+b");
+        if (ataDiskFile) {
+            _fseeki64(ataDiskFile, 0, SEEK_END);
+            UINT64 fileSize = (UINT64)_ftelli64(ataDiskFile);
+            ataDiskSectors = fileSize / ataSectorSize;
+
+            // Fixed-format VHDs append a 512-byte "conectix" footer after
+            // the real disk data. We do no VHD-format parsing elsewhere --
+            // disk I/O is plain fseek+fread at lba*ataSectorSize -- so
+            // without this check that footer gets presented to the guest
+            // as one extra, bogus final sector: IDENTIFY would report a
+            // capacity one sector too large, and any guest read of the
+            // true last LBA would return VHD metadata instead of real (or
+            // absent) disk content, rather than the disk's actual last
+            // data sector. Not applicable to ISOs (they're never VHDs).
+            if (!isIso && fileSize >= 512) {
+                unsigned char footerCookie[8];
+                _fseeki64(ataDiskFile, -512, SEEK_END);
+                if (fread(footerCookie, 1, 8, ataDiskFile) == 8 &&
+                    memcmp(footerCookie, "conectix", 8) == 0) {
+                    ataDiskSectors -= 1;
+                    printf("Detected Fixed VHD footer -- excluding it from disk geometry\n");
+                }
+            }
+
+            printf("Attached disk %s (%llu sectors of %u bytes)\n", diskPath, (unsigned long long)ataDiskSectors, ataSectorSize);
+        } else {
+            printf("Failed to open disk image %s -- booting without a disk\n", diskPath);
+        }
+    }
+
+    QueryPerformanceFrequency(&perfFrequency);
+    QueryPerformanceCounter(&lastToggleTime);
+    lastTimerTick = lastToggleTime;
+    lastRtcPeriodicTick = lastToggleTime;
+
+    InitializeCriticalSection(&logLock);
+    createWindowThread();
+
+    g_font = CreateFontA(18, 9, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                          ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                          DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+
+    if (uefiMode) {
+        // Standard CMOS extended-memory registers: 0x17/0x18 and their
+        // POST-time mirror 0x30/0x31 report KB of RAM above 1MB (capped at
+        // 0xFFFF), 0x34/0x35 report 64KB blocks of RAM above 16MB. This is
+        // the conventional fallback OVMF's PlatformPei reads for memory
+        // size when it isn't running under real QEMU fw_cfg.
+        UINT32 ramBytes = (UINT32)guestMemSize;
+        UINT32 extKB = (ramBytes > 0x100000) ? (ramBytes - 0x100000) / 1024 : 0;
+        UINT16 ext1MTo16M = (UINT16)(extKB > 0xFFFF ? 0xFFFF : extKB);
+        cmosRegisters[0x17] = (unsigned char)(ext1MTo16M & 0xFF);
+        cmosRegisters[0x18] = (unsigned char)(ext1MTo16M >> 8);
+        cmosRegisters[0x30] = cmosRegisters[0x17];
+        cmosRegisters[0x31] = cmosRegisters[0x18];
+
+        UINT32 above16M = (ramBytes > 0x1000000) ? (ramBytes - 0x1000000) / 65536 : 0;
+        UINT16 above16M64K = (UINT16)(above16M > 0xFFFF ? 0xFFFF : above16M);
+        cmosRegisters[0x34] = (unsigned char)(above16M64K & 0xFF);
+        cmosRegisters[0x35] = (unsigned char)(above16M64K >> 8);
+        // RTC status registers -- see cmosReadRtcField's comment for why
+        // these matter (OVMF's PcRtc.c GetTime() driver returns
+        // EFI_DEVICE_ERROR, which Windows Boot Manager's BlpTimeInitialize
+        // propagates as STATUS_IO_DEVICE_ERROR/0xC0000185, if Register D's
+        // VRT bit is clear or the time/date fields don't decode to a valid
+        // calendar date). Register A: UIP=0 (bit 7), a plausible divisor/
+        // rate in the low bits. Register B: 24-hour + binary mode (bits
+        // 1/2 set) -- picked because it needs no BCD encoding, not because
+        // real hardware defaults to it; cmosReadRtcField reads this same
+        // register live on every access so a guest write to it changes
+        // future time reads accordingly. Register D: VRT=1 (bit 7).
+        cmosRegisters[0x0A] = 0x26;
+        cmosRegisters[0x0B] = 0x06;
+        cmosRegisters[0x0D] = 0x80;
+    } else {
+        cmosRegisters[0x17] = 0x00;
+        cmosRegisters[0x18] = 0x00;
+        cmosRegisters[0x30] = 0x00;
+        cmosRegisters[0x31] = 0x00;
+    }
+
+    WHV_PARTITION_HANDLE partition;
+    HRESULT hr = WHvCreatePartition(&partition);
+    if (FAILED(hr)) { printf("Failed to create partition. HRESULT: 0x%lx\n", hr); return 1; }
+
+    WHV_PARTITION_PROPERTY processorCount = { 0 };
+    processorCount.ProcessorCount = 1;
+    hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeProcessorCount, &processorCount, sizeof(processorCount));
+    if (FAILED(hr)) { printf("Failed to set processor count. HRESULT: 0x%lx\n", hr); return 1; }
+
+    // Legacy path: no LAPIC emulation needed at all. IRQ delivery for our
+    // emulated devices (ATA, keyboard, PIT) goes through direct
+    // WHvRegisterPendingInterruption injection for now -- routing it
+    // through the LAPIC properly is follow-on work, see the plan's
+    // out-of-scope section.
+    //
+    // UEFI path: OVMF's SEC/PEI phase checks for actual LAPIC presence
+    // (CPUID.1:EDX.APIC) during CPU init, so it needs a real emulated LAPIC.
+    // XApic (not X2Apic): X2Apic + WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks
+    // was tried and reverted -- see the SyntheticProcessorFeaturesBanks
+    // comment below for why.
+    WHV_X64_LOCAL_APIC_EMULATION_MODE apicMode = uefiMode
+        ? WHvX64LocalApicEmulationModeXApic
+        : WHvX64LocalApicEmulationModeNone;
+    hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeLocalApicEmulationMode, &apicMode, sizeof(apicMode));
+    if (FAILED(hr)) { printf("Failed to set APIC emulation mode. HRESULT: 0x%lx\n", hr); return 1; }
+
+    // Synthesize CPUID leaf 0x15 (TSC/core crystal clock) with a directly
+    // measured, accurate frequency -- see measureTscFrequency's comment.
+    // TSC_freq = Ecx * Ebx / Eax, so Eax=1, Ebx=1, Ecx=measured gives
+    // TSC_freq = measured exactly, with no rounding from an assumed ratio.
+    // Registered via the static CpuidResultList (WHV answers the guest's
+    // CPUID directly, no exit/host round-trip needed).
+    UINT64 measuredTscFrequency = measureTscFrequency();
+    printf("[cpuid] measured host TSC frequency: %llu Hz\n", (unsigned long long)measuredTscFrequency);
+    WHV_X64_CPUID_RESULT cpuidOverrides[2] = { 0 };
+    cpuidOverrides[0].Function = 0x15;
+    cpuidOverrides[0].Eax = 1;
+    cpuidOverrides[0].Ebx = 1;
+    cpuidOverrides[0].Ecx = (UINT32)measuredTscFrequency;
+    cpuidOverrides[0].Edx = 0;
+
+    // Post-2026-07-16-part-10 investigation (see
+    // docs/investigations/post-vppt-boot-stall.md): leaf 1 was never
+    // overridden, so WHV answers it with the REAL HOST's values --
+    // including EBX[23:16] (logical processor count) and EDX bit 28
+    // (HTT/multi-processor capable), which reflect the host machine's
+    // actual core count, not our single emulated vCPU. Our MADT only ever
+    // declares one Processor Local APIC (vCPU 0); if the host has more
+    // than one logical processor, the guest sees a mismatch between what
+    // CPUID claims is available and what MADT actually enumerates -- a
+    // plausible cause for code that waits for "all processors" to check
+    // in to hang forever, since only one vCPU can ever exist. Query the
+    // real host leaf 1 first (so family/model/stepping and feature bits
+    // ECX/EDX stay accurate) and only correct the processor-count fields.
+    int hostCpuid1[4] = { 0 };
+    __cpuid(hostCpuid1, 1);
+    cpuidOverrides[1].Function = 1;
+    cpuidOverrides[1].Eax = (UINT32)hostCpuid1[0];
+    cpuidOverrides[1].Ebx = ((UINT32)hostCpuid1[1] & 0x0000FFFFUL) | (1UL << 16); // logical processor count = 1, keep brand index/CLFLUSH size
+    cpuidOverrides[1].Ecx = (UINT32)hostCpuid1[2];
+    cpuidOverrides[1].Edx = (UINT32)hostCpuid1[3] & ~(1UL << 28); // clear HTT -- not multi-processor capable
+    printf("[cpuid] leaf 1 override: host EBX=0x%08X EDX=0x%08X -> guest EBX=0x%08X EDX=0x%08X\n",
+           (UINT32)hostCpuid1[1], (UINT32)hostCpuid1[3], cpuidOverrides[1].Ebx, cpuidOverrides[1].Edx);
+
+    hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeCpuidResultList, cpuidOverrides, sizeof(cpuidOverrides));
+    if (FAILED(hr)) { printf("Failed to set CPUID result list. HRESULT: 0x%lx\n", hr); return 1; }
+
+    // TRIED AND REVERTED (twice now): WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks
+    // + LocalApicEmulationMode=X2Apic. First attempt changed guest behavior
+    // (proved WHV honors the property) but traded the clean, diagnosable
+    // bugcheck 0x5C for an unbounded hang. Falsification experiment A (see
+    // docs/roadmap.md) retried with a complete flag set -- also adding
+    // DirectSyntheticTimers/SyntheticClusterIpi, which QEMU's WHPX
+    // accelerator sets alongside the rest of this bank and the first
+    // attempt omitted -- in case the hang was an artifact of an incomplete
+    // flag set rather than proof transparent SynIC backing doesn't exist.
+    // Result: identical hang (same RIP, same register signature, unbounded
+    // past 38s). Strengthens rather than weakens the existing conclusion --
+    // see docs/investigations/vppt-synic-blocker.md's 2026-07-16 update.
+
+    // REVERTED: WHvMsrActionIgnoreWriteReadZero (tried earlier in this same
+    // investigation) didn't change the bugcheck, and on reflection it's
+    // actively risky to leave in place -- WHV creates guest partitions as
+    // real children of the host's own Hyper-V hypervisor (confirmed
+    // separately: our own CPUID overrides for the hypervisor-present bit
+    // and the Hyper-V leaves 0x40000000-0x40000006 had ZERO effect on guest
+    // behavior despite the API reporting success, meaning the guest's
+    // hypervisor identity is enforced beneath the WHV API surface, not
+    // something we control). That strongly implies the REAL Hyper-V root
+    // may already transparently back genuine Hyper-V synthetic MSRs
+    // (SCONTROL/SIMP/SINT/STIMER, VPPT's likely actual interrupt mechanism)
+    // for this partition without any involvement from our emulation at
+    // all. Forcing ALL unimplemented MSRs to silently discard writes and
+    // read zero would have masked any such transparent passthrough,
+    // turning working synthetic MSR access into inert no-ops. Left at the
+    // architecture default (real #GP on truly unsupported MSRs) so
+    // whatever WHV/Hyper-V does handle natively keeps working.
+
+    // Enable #BP (breakpoint trap, vector 3) exception exits for the live
+    // INT3 breakpoint infrastructure -- see the block near the top of
+    // this file and docs/investigations/post-vppt-boot-stall.md. Only
+    // this one vector is requested; every other exception continues to
+    // route to the guest's own IDT unmodified.
+    //
+    // WHvPartitionPropertyCodeExceptionExitBitmap alone is NOT sufficient
+    // -- confirmed the hard way (first version of this patch let the
+    // guest's own kernel see and mishandle the INT3 as an unhandled
+    // exception, bugchecking 0x1E with param1=STATUS_BREAKPOINT and
+    // param2 exactly equal to our patched VA -- direct proof the CPU did
+    // execute our INT3, but the intercept never routed it to us first).
+    // WHV_EXTENDED_VM_EXITS.ExceptionExit must be explicitly enabled via
+    // WHvPartitionPropertyCodeExtendedVmExits before the bitmap has any
+    // effect.
+    WHV_EXTENDED_VM_EXITS extendedExits = { 0 };
+    extendedExits.ExceptionExit = 1;
+    hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeExtendedVmExits,
+                                  &extendedExits, sizeof(extendedExits));
+    if (FAILED(hr)) { printf("Failed to enable extended VM exits (ExceptionExit). HRESULT: 0x%lx\n", hr); return 1; }
+
+    // RETARGETED AGAIN: the first attempt at this experiment used an INT3
+    // patch (#BP) and got stuck behind the DbgBreakPointWithStatus
+    // flooding hazard again -- with #BP interception active, that genuine,
+    // unrelated, extremely-high-frequency software INT3 elsewhere in the
+    // kernel throttles the guest's real progress so much that 86 real
+    // seconds of wall-clock time didn't correspond to reaching anywhere
+    // near where pass 2 normally crashes (confirmed by comparing against
+    // an unthrottled watchpoint run's timing) -- an inconclusive result,
+    // not a negative one. Switched to a HARDWARE EXECUTION breakpoint
+    // (DR0-DR3/DR7, R/W=execute) instead of an INT3 patch: same DR
+    // mechanism already proven clean for the data watchpoint experiments,
+    // traps via #DB (vector 1) rather than #BP (vector 3), and by
+    // construction never intercepts genuine software INT3s anywhere in
+    // the kernel (those are always vector 3) -- sidesteps the flooding
+    // hazard entirely rather than fighting it.
+    //
+    // Does Phase1InitializationDiscard (the real system-thread entry point
+    // that runs Phase 1 init on genuine Windows, per public NT internals --
+    // confirmed present in this exact build via SymFromName) get reached
+    // at all on pass 2? If not, both pool-heap findings are simply
+    // downstream symptoms of a thread that never ran, not independent
+    // gaps.
+    UINT64 exceptionExitBitmap = (1ULL << WHvX64ExceptionTypeDebugTrapOrFault);
+    hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeExceptionExitBitmap,
+                                  &exceptionExitBitmap, sizeof(exceptionExitBitmap));
+    if (FAILED(hr)) { printf("Failed to set exception exit bitmap. HRESULT: 0x%lx\n", hr); return 1; }
+
+    hr = WHvSetupPartition(partition);
+    if (FAILED(hr)) { printf("Failed to setup partition. HRESULT: 0x%lx\n", hr); return 1; }
+
+    hr = WHvCreateVirtualProcessor(partition, 0, 0);
+    if (FAILED(hr)) { printf("Failed to create vCPU. HRESULT: 0x%lx\n", hr); return 1; }
+
+    guestMemory = VirtualAlloc(NULL, guestMemSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (guestMemory == NULL) { printf("Failed to allocate guest memory.\n"); return 1; }
+
+    { // I/O APIC redirection tables (both controllers): start fully masked,
+      // matching real hardware's power-on default (mask bit, 0x10000, set
+      // in every entry).
+        int ioapicI;
+        for (ioapicI = 0; ioapicI < 24; ioapicI++) {
+            ioapic1.redirTable[ioapicI] = 0x10000ULL;
+            ioapic2.redirTable[ioapicI] = 0x10000ULL;
+        }
+    }
+
+    if (!uefiMode) {
+        hmaMemory = VirtualAlloc(NULL, A20_WINDOW_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (hmaMemory == NULL) { printf("Failed to allocate HMA memory.\n"); return 1; }
+    }
+
+    hr = WHvMapGpaRange(partition, guestMemory, 0, guestMemSize,
+                         WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute);
+    if (FAILED(hr)) { printf("Failed to map guest memory. HRESULT: 0x%lx\n", hr); return 1; }
+
+    // TEMP DIAGNOSTIC: A20 aliasing disabled to test whether it's corrupting
+    // hypervisor SLAT/EPT state and causing the later rep-movsb stall.
+    // updateA20Mapping(partition);
+    // (Moot for UEFI regardless -- guest RAM is mapped flat, so there's no
+    // real-mode 1MB wraparound to fake.)
+
+    if (uefiMode) {
+        // UEFI firmware images (OVMF) are meant to sit at the very top of a
+        // 4GB address space, with the architectural x86 reset vector
+        // (physical 0xFFFFFFF0) landing inside them -- see the CS.Base
+        // setup below. Load the whole file there instead of at 0xC0000.
+        FILE *f = fopen(biosPath, "rb");
+        if (!f) { printf("Failed to open %s\n", biosPath); return 1; }
+        fseek(f, 0, SEEK_END);
+        long fwSizeSigned = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (fwSizeSigned <= 0) { printf("Invalid UEFI firmware image %s\n", biosPath); fclose(f); return 1; }
+        SIZE_T fwSize = (SIZE_T)fwSizeSigned;
+
+        uefiFirmwareMemory = VirtualAlloc(NULL, fwSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (uefiFirmwareMemory == NULL) { printf("Failed to allocate UEFI firmware memory.\n"); fclose(f); return 1; }
+        size_t bytesRead = fread(uefiFirmwareMemory, 1, fwSize, f);
+        fclose(f);
+        printf("Loaded %zu bytes of UEFI firmware %s\n", bytesRead, biosPath);
+        fflush(stdout);
+
+        UINT64 fwBase = 0x100000000ULL - fwSize;
+        hr = WHvMapGpaRange(partition, uefiFirmwareMemory, fwBase, fwSize,
+                             WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute);
+        if (FAILED(hr)) { printf("Failed to map UEFI firmware. HRESULT: 0x%lx\n", hr); return 1; }
+        printf("Mapped UEFI firmware at 0x%llX-0xFFFFFFFF, entering run loop\n", (unsigned long long)fwBase);
+        fflush(stdout);
+
+        InitializeCriticalSection(&kdRxLock);
+        InitializeCriticalSection(&kdTxLock);
+        kdTxEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        kdPipe = CreateNamedPipeA("\\\\.\\pipe\\LocalHostKD",
+                                   PIPE_ACCESS_DUPLEX,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                   1, 4096, 4096, 0, NULL);
+        if (kdPipe != INVALID_HANDLE_VALUE) {
+            printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
+                   "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
+            fflush(stdout);
+            HANDLE kdThread = CreateThread(NULL, 0, kdPipeReaderThread, NULL, 0, NULL);
+            if (kdThread) CloseHandle(kdThread);
+            HANDLE kdWriterThread = CreateThread(NULL, 0, kdPipeWriterThread, NULL, 0, NULL);
+            if (kdWriterThread) CloseHandle(kdWriterThread);
+        } else {
+            printf("[kd] failed to create named pipe, GetLastError=%lu\n", GetLastError());
+            fflush(stdout);
+        }
+    } else {
+        FILE *f = fopen(biosPath, "rb");
+        if (!f) { printf("Failed to open %s\n", biosPath); return 1; }
+        size_t bytesRead = fread((char*)guestMemory + 0xC0000, 1, 0x40000, f);
+        fclose(f);
+        printf("Loaded %zu bytes of %s at 0xC0000\n", bytesRead, biosPath);
+
+        // Real BIOS flash is decoded at two addresses: the classic
+        // 0xC0000-0xFFFFF window AND mirrored at the top of the 4GB address
+        // space (0xFFFC0000-0xFFFFFFFF for a 256KB image) so 32-bit
+        // protected-mode code can reach it without real-mode segment
+        // tricks. SeaBIOS relies on this mirror very early in POST --
+        // without it, execution wanders into unmapped memory at a GPA like
+        // 0xFFFEE913 and (once faulting pages are correctly mapped
+        // executable) crashes with an unrecoverable exception on the
+        // resulting garbage/zeroed code.
+        UINT64 biosMirrorBase = 0x100000000ULL - 0x40000;
+        hr = WHvMapGpaRange(partition, (char *)guestMemory + 0xC0000, biosMirrorBase, 0x40000,
+                             WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute);
+        if (FAILED(hr)) { printf("Failed to map BIOS mirror. HRESULT: 0x%lx\n", hr); return 1; }
+    }
+
+    WHV_REGISTER_NAME regNames[2] = { WHvX64RegisterRip, WHvX64RegisterCs };
+    WHV_REGISTER_VALUE regValues[2] = { 0 };
+    regValues[0].Reg64 = 0xFFF0;
+
+    WHV_X64_SEGMENT_REGISTER cs = { 0 };
+    // Legacy path: CS.Base=0xF0000 puts the reset vector at physical
+    // 0xFFFF0, the classic BIOS convention (firmware fits in the last 64KB
+    // of the first 1MB). UEFI path: CS.Base=0xFFFF0000 matches real x86
+    // hardware reset state, landing at physical 0xFFFFFFF0 -- inside the
+    // firmware image mapped at the top of 4GB above.
+    cs.Base = uefiMode ? 0xFFFF0000 : 0xF0000;
+    cs.Limit = 0xFFFF;
+    cs.Selector = 0xF000;
+    cs.Attributes = 0x9B;
+    regValues[1].Segment = cs;
+
+    hr = WHvSetVirtualProcessorRegisters(partition, 0, regNames, 2, regValues);
+    if (FAILED(hr)) { printf("Failed to set registers. HRESULT: 0x%lx\n", hr); return 1; }
+
+    int running = 1;
+    long exitCount = 0;
+    UINT16 debugLastPort = 0;
+    BOOL debugLastWrite = FALSE;
+    unsigned char debugLastVal = 0;
+
+    g_watchdogPartition = partition;
+    CreateThread(NULL, 0, stallWatchdogThread, NULL, 0, NULL);
+
+    // The RTC periodic interrupt (see deliverRtcPeriodicIrq) can only be
+    // delivered between calls to WHvRunVirtualProcessor -- but guest code
+    // that busy-spins without touching any trapped I/O/MMIO (exactly what
+    // HalpTimerWaitForPhase0Interrupt's KeStallExecutionProcessor loop
+    // does, confirmed live: docs/investigations/vppt-synic-blocker.md part
+    // 10) can run for the guest's ENTIRE wait window inside a single
+    // WHvRunVirtualProcessor call, generating zero VM exits and giving the
+    // main loop no opportunity to check/inject anything at all. Force
+    // periodic exits with WHvCancelRunVirtualProcessor (documented-safe to
+    // call from another thread) whenever the RTC's periodic interrupt is
+    // armed, so the main loop regularly regains control and can deliver it.
+    CreateThread(NULL, 0, rtcCancelThread, NULL, 0, NULL);
+
+    while (running) {
+        // --- Halted-CPU wait loop ---
+        // While the guest is halted, we don't call WHvRunVirtualProcessor at all.
+        // Instead we pump window messages and look for something to wake it up
+        // (keyboard data or a timer tick). Once we inject something, we fall
+        // through and call WHvRunVirtualProcessor once to deliver it.
+        while (cpuHalted && running) {
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { running = 0; }
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            if (!running) break;
+
+            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+
+            if (!guestInterruptsEnabled(partition)) {
+                // Guest disabled interrupts while halted (unusual, but be safe) --
+                // just keep waiting without injecting anything.
+                Sleep(1);
+                continue;
+            }
+
+            int injected = 0;
+
+            if (pendingAtaIrq) {
+                injectInterrupt(partition, 0x76); // IRQ14 - primary ATA
+                pendingAtaIrq = 0;
+                injected = 1;
+            } else if (deliverRtcPeriodicIrq(partition)) {
+                // RTC periodic interrupt (IRQ8). See deliverRtcPeriodicIrq's
+                // own comment -- this is what Windows HAL's phase-0 timer
+                // test actually waits for.
+                injected = 1;
+            } else if (kbHasData()) {
+                injectInterrupt(partition, 0x09); // IRQ1 - keyboard
+                injected = 1;
+            } else if (auxHasData()) {
+                // IRQ12 - PS/2 mouse (slave PIC IRQ4 -> legacy remap vector
+                // 0x70+4). Re-checked every loop iteration like the other
+                // sources above, so a multi-byte mouse packet naturally gets
+                // one interrupt per byte, matching real i8042 hardware,
+                // without any extra packet-boundary bookkeeping here.
+                injectInterrupt(partition, 0x74);
+                injected = 1;
+            } else if (pendingRtl8139Irq) {
+                // IRQ11 - RTL8139 NIC. Needed here (not just the outer
+                // loop's deliverPendingRtl8139Irq) so a packet arriving
+                // while the guest is parked in HLT waiting for one -- the
+                // whole point of interrupt-driven RX -- actually wakes it,
+                // the same reason kbHasData/auxHasData are checked here
+                // rather than only after the loop exits.
+                injectInterrupt(partition, 0x73);
+                pendingRtl8139Irq = 0;
+                injected = 1;
+            } else {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                double elapsedMs = (double)(now.QuadPart - lastTimerTick.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+                if (elapsedMs >= TIMER_TICK_INTERVAL_MS) {
+                    injectInterrupt(partition, 0x08); // IRQ0 - timer
+                    lastTimerTick = now;
+                    injected = 1;
+                }
+            }
+
+            if (injected) {
+                cpuHalted = 0; // fall through to WHvRunVirtualProcessor below
+            } else {
+                Sleep(1);
+            }
+        }
+        if (!running) break;
+
+        exitCount++;
+        g_watchdogExitCount = exitCount;
+
+        if (exitCount % 200 == 0) {
+            Sleep(0); // yield periodically -- avoid starving the host scheduler
+        }
+
+        if (exitCount % 5000 == 0) {
+            static LARGE_INTEGER startTick = { 0 };
+            LARGE_INTEGER nowTick;
+            QueryPerformanceCounter(&nowTick);
+            if (startTick.QuadPart == 0) startTick = nowTick;
+            double elapsedSec = (double)(nowTick.QuadPart - startTick.QuadPart) / perfFrequency.QuadPart;
+            printf("[heartbeat: exitCount=%ld elapsedSec=%.1f lastPort=0x%X write=%d val=0x%X]\n",
+                   exitCount, elapsedSec, debugLastPort, debugLastWrite, debugLastVal);
+            fflush(stdout);
+        }
+
+        if (exitCount % 1000 == 0) {
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { running = 0; }
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            if (!running) break;
+        }
+
+        if (exitCount % 5000 == 0 && g_hwnd) {
+            InvalidateRect(g_hwnd, NULL, FALSE);
+        }
+
+        deliverPendingAtaIrq(partition);
+        deliverPendingRtl8139Irq(partition);
+        // RTC/PIT periodic-interrupt delivery deliberately NOT called here
+        // unconditionally (2026-07-17, post-reboot #GP investigation --
+        // see docs/investigations/post-vppt-boot-stall.md). Calling these
+        // after every single VM exit (PCI config reads, I/O port probes,
+        // MMIO -- whatever the guest happened to be doing at an arbitrary
+        // point) injects an interrupt at an essentially random guest RSP.
+        // Live-captured evidence: this landed inside OVMF's own exception/
+        // interrupt-entry stub with RSP misaligned for its internal FXSAVE,
+        // raising #GP -- confirmed via a falsification test (temporarily
+        // removing these two calls let the exact same boot sail past the
+        // ACPI-table-load point and reach BdsDxe with no crash). Delivery
+        // now happens only from the two points proven safe/necessary: the
+        // halted-CPU wait loop above (a single, consistent resume RIP each
+        // time) and the WHvRunVpExitReasonCanceled case below (the bounded,
+        // rtcCancelThread-driven forced-exit mechanism this was built for
+        // in the first place). This narrows -- but does not fully close --
+        // the original CPU-bound-spin gap: a plain PIT-only busy-spin
+        // before the RTC's periodic-interrupt-enable bit is ever armed
+        // (rtcCancelThread's only trigger condition) still won't get a
+        // forced exit. Left as an accepted, documented gap rather than
+        // re-broadening rtcCancelThread -- broadening it unconditionally
+        // was already tried once for a different stall and made things
+        // worse (see the "2026-07-17 update" section of that doc).
+        ahciProcessPendingCommands(partition);
+        netPollUdpSessions(partition);
+        netPollTcpSessions(partition);
+
+        // TEMP DIAGNOSTIC (disabled): the EFI checkpoint hooks below served
+        // their purpose -- they empirically identified BlpTimeInitialize as
+        // the function returning STATUS_IO_DEVICE_ERROR, which is now fixed
+        // (see the cmosReadRtcField comment). Re-scanning 3GB of guest
+        // memory on every "starting Boot0002" occurrence is expensive and,
+        // once boot progresses past BlInitializeLibrary into later stages
+        // this instrumentation wasn't designed for, caused a severe
+        // slowdown (a single main-loop iteration taking 60+ real seconds).
+        // Left in place (not deleted) in case this specific diagnostic
+        // technique is useful again for a future boot blocker.
+        if (0 && uefiMode && efiHookStartingBoot0002Count > efiHookScanAttempted) {
+            efiHookScanAttempted = efiHookStartingBoot0002Count;
+            tryInstallEfiHooks();
+        }
+
+        // TEMP DIAGNOSTIC (disabled): rtcDiagTryFindLoadBase served its
+        // purpose -- it identified OVMF's own PcRtc driver as the source of
+        // heavy post-fix CMOS polling. Left disabled now that investigation
+        // is done: without a one-shot guard here it re-ran a full 3GB
+        // memory scan on every single main-loop iteration whenever the
+        // needle wasn't found (e.g. against a different Windows version's
+        // boot manager build), a real, severe bug caught while testing
+        // against Windows 10.
+        static int rtcDiagScanAttempted = 0;
+        if (0 && uefiMode && !rtcDiagScanAttempted && efiHookStartingBoot0002Count > 0) {
+            rtcDiagScanAttempted = 1;
+            rtcDiagTryFindLoadBase();
+        }
+
+        WHV_RUN_VP_EXIT_CONTEXT exitContext;
+        hr = WHvRunVirtualProcessor(partition, 0, &exitContext, sizeof(exitContext));
+        if (FAILED(hr)) { printf("Failed to run vCPU. HRESULT: 0x%lx\n", hr); break; }
+
+        // Opportunistic breakpoint-site discovery: as soon as RIP looks
+        // like a plausible canonical kernel address and we haven't
+        // already located+patched this boot instance's ntoskrnl.exe,
+        // try the same backward MZ/PE scan used throughout this
+        // investigation. Throttled to once per ~200ms (the scan is a
+        // bounded but non-trivial page-table walk) so it can't add
+        // meaningful overhead once the guest is executing real kernel
+        // code, while still finding the module within a fraction of a
+        // second of it starting to run.
+        if (!g_wpArmed && exitContext.VpContext.Rip >= 0xFFFF800000000000ULL) {
+            static LARGE_INTEGER lastBpDiscoveryAttempt = { 0 };
+            LARGE_INTEGER bpNow;
+            QueryPerformanceCounter(&bpNow);
+            double sinceLastMs = (lastBpDiscoveryAttempt.QuadPart == 0) ? 1e9 :
+                (double)(bpNow.QuadPart - lastBpDiscoveryAttempt.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+            if (sinceLastMs >= 200.0) {
+                lastBpDiscoveryAttempt = bpNow;
+                WHV_REGISTER_NAME cr3Name = WHvX64RegisterCr3;
+                WHV_REGISTER_VALUE cr3Val = { 0 };
+                if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, &cr3Name, 1, &cr3Val)) && cr3Val.Reg64 != 0) {
+                    UINT64 candBase = 0;
+                    if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, cr3Val.Reg64, exitContext.VpContext.Rip, &candBase)) {
+                        g_bpModuleBase = candBase;
+                        g_wpTargetVA = g_bpModuleBase + BP_FAIL_SITE_RVA;
+                        g_wpTargetVA0 = g_bpModuleBase + WP_RETURN_RVA;
+                        g_wpTargetVA1 = g_bpModuleBase + WP_PHASE1INIT_ENTRY_RVA;
+                        g_haliDispatchTargetVA = g_bpModuleBase + HALI_DISPATCH_CALL_RVA;
+                        // Four simultaneous hardware EXECUTION breakpoints
+                        // (DR0/DR1/DR2/DR3, R/W=00 each) instead of an INT3
+                        // patch -- see the exceptionExitBitmap comment
+                        // above for why. LEN must be 00 (1 byte) for
+                        // instruction breakpoints per architecture. DR7
+                        // layout: L0=bit0, L1=bit2, L2=bit4, L3=bit6,
+                        // reserved bit10=1; R/W/LEN fields for all four
+                        // stay 0 (execute, 1 byte).
+                        WHV_REGISTER_NAME wpNames[5] = { WHvX64RegisterDr0, WHvX64RegisterDr1, WHvX64RegisterDr2, WHvX64RegisterDr3, WHvX64RegisterDr7 };
+                        WHV_REGISTER_VALUE wpVals[5] = { 0 };
+                        wpVals[0].Reg64 = g_wpTargetVA0;
+                        wpVals[1].Reg64 = g_wpTargetVA1;
+                        wpVals[2].Reg64 = g_wpTargetVA;
+                        wpVals[3].Reg64 = g_haliDispatchTargetVA;
+                        // U28: DR2 (L2) is NOT armed at discovery -- the hot
+                        // GetSubsegment site is armed later, only inside the narrow
+                        // pre-crash exitCount window (see windowed-arm block below).
+                        wpVals[4].Reg64 = 0x1ULL | 0x4ULL | 0x40ULL | (1ULL << 10);
+                        if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, wpNames, 5, wpVals))) {
+                            g_wpArmed = 1;
+                            g_wp0Fired = 0;
+                            g_wp1Fired = 0;
+                            g_wp2Fired = 0;
+                            g_haliDispatchArmed = 1;
+                            g_haliDispatchHitCount = 0;
+                            g_poolCallerArmed = 1;
+                            g_poolCallerHitCount = 0;
+                            g_helperEntryArmed = 1;
+                            g_helperEntryHitCount = 0;
+                            g_loopAdvArmed = 0; // U28: armed later, in-window
+                            g_loopAdvHitCount = 0;
+                            printf("[wp] armed breakpoints at module base 0x%llX (DR2 LFH-check armed=%d): DR0=+0x%X (HalpIommuInitSystem entry, VA=0x%llX), DR1=+0x%X (KeBugCheckEx, VA=0x%llX), DR2=+0x%X (RtlpHpLfhOwnerMoveSubsegment entry, VA=0x%llX), DR3=+0x%X (HalpIommuInitSystem ret, VA=0x%llX)\n",
+                                   (unsigned long long)g_bpModuleBase, g_sawReset ? 1 : 0,
+                                   WP_RETURN_RVA, (unsigned long long)g_wpTargetVA0,
+                                   WP_PHASE1INIT_ENTRY_RVA, (unsigned long long)g_wpTargetVA1,
+                                   BP_FAIL_SITE_RVA, (unsigned long long)g_wpTargetVA,
+                                   HALI_DISPATCH_CALL_RVA, (unsigned long long)g_haliDispatchTargetVA);
+                            fflush(stdout);
+                            // U32: dump ExPoolState pool-descriptor +0x08 and +0x10
+                            // fields for pool types 0..7, once per pass, to confirm
+                            // the init gap: +0x10 (the heap-context root) is expected
+                            // NON-NULL on pass 1 but NULL on pass 2. ExPoolState RVA
+                            // 0xC545C0; descriptor table +0x3900 (RVA 0xC57EC0),
+                            // stride 0x20c0. +0x08 has a known writer
+                            // (ExInitializePoolHeapManagement); +0x10 is the suspect.
+                            {
+                                printf("[u32] ExPoolState pool-descriptor fields (pass %s):\n", g_sawReset ? "2" : "1");
+                                int pi;
+                                for (pi = 0; pi < 8; pi++) {
+                                    UINT64 descRva = 0xC57EC0ULL + (UINT64)pi * 0x20c0ULL;
+                                    unsigned char fld[0x18] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, cr3Val.Reg64, g_bpModuleBase + descRva, fld, sizeof(fld))) {
+                                        UINT64 f08 = *(UINT64 *)&fld[0x08], f10 = *(UINT64 *)&fld[0x10];
+                                        printf("[u32]   pool[%d] desc@RVA0x%llX: +0x08=0x%llX +0x10=0x%llX%s\n",
+                                               pi, (unsigned long long)descRva, (unsigned long long)f08, (unsigned long long)f10,
+                                               (f10 == 0) ? "  <== +0x10 NULL" : "");
+                                    }
+                                }
+                                fflush(stdout);
+                            }
+                            // U27: one-shot full-kernel image dump (scratchpad
+                            // ntoskrnl_dump.bin was purged; re-capture for offline
+                            // disasm). Read base..base+0x1000000 page-by-page and
+                            // write incrementally. Runs once per process.
+                            static int g_kernelDumped = 0;
+                            if (!g_kernelDumped) {
+                                g_kernelDumped = 1;
+                                const char *dpath = "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\c66b1c4e-0568-43ec-a192-37631199a9df\\scratchpad\\ntoskrnl_dump.bin";
+                                FILE *df = fopen(dpath, "wb");
+                                if (df) {
+                                    unsigned char page[0x1000];
+                                    UINT64 off; int okPages = 0;
+                                    for (off = 0; off < 0x1000000ULL; off += 0x1000) {
+                                        if (kernelReadVA((unsigned char *)guestMemory, cr3Val.Reg64, g_bpModuleBase + off, page, sizeof(page)))
+                                            okPages++;
+                                        else
+                                            memset(page, 0, sizeof(page));
+                                        fwrite(page, 1, sizeof(page), df);
+                                    }
+                                    fclose(df);
+                                    printf("[u27] dumped kernel image to ntoskrnl_dump.bin (%d/%d pages readable)\n", okPages, 0x1000);
+                                    fflush(stdout);
+                                }
+                            }
+                        } else {
+                            printf("[wp] failed to arm execution breakpoints -- will retry on next plausible RIP\n");
+                            fflush(stdout);
+                        }
+                    }
+                }
+            }
+        }
+
+        // U32: milestone dump of ExPoolState pool-descriptor +0x08/+0x10 fields
+        // to watch pool-heap init evolve across BOTH passes. +0x08 has a known
+        // writer (ExInitializePoolHeapManagement); +0x10 is the suspect that
+        // stays NULL. If +0x10 populates on pass 1 but not pass 2, that pins the
+        // skipped init step. Fires every 200k exits (bounded).
+        if (g_bpModuleBase) {
+            static long g_nextPoolDumpEC = 200000L;
+            if (exitCount >= g_nextPoolDumpEC) {
+                g_nextPoolDumpEC = exitCount + 200000L;
+                WHV_REGISTER_NAME c3n = WHvX64RegisterCr3; WHV_REGISTER_VALUE c3v = { 0 };
+                if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, &c3n, 1, &c3v)) && c3v.Reg64) {
+                    printf("[u32ms] exitCount=%ld pass=%s ExPoolState desc +0x08/+0x10:", exitCount, g_sawReset ? "2" : "1");
+                    int pi;
+                    for (pi = 0; pi < 4; pi++) {
+                        UINT64 descRva = 0xC57EC0ULL + (UINT64)pi * 0x20c0ULL;
+                        unsigned char fld[0x18] = { 0 };
+                        if (kernelReadVA((unsigned char *)guestMemory, c3v.Reg64, g_bpModuleBase + descRva, fld, sizeof(fld)))
+                            printf(" p%d[+8=0x%llX +10=0x%llX]", pi, (unsigned long long)*(UINT64 *)&fld[0x08], (unsigned long long)*(UINT64 *)&fld[0x10]);
+                    }
+                    printf("\n"); fflush(stdout);
+                }
+            }
+        }
+
+        // U28: windowed arming of the hot GetSubsegment capture (DR2). Once pass 2
+        // has run GETSUB_WINDOW_START exits past the reset (approaching the ~crash),
+        // point DR2 at GetSubsegment+0x45 and set L2. This bounds the hot-site
+        // overhead to the final pre-crash window while still containing the fatal
+        // (already-corrupt) subsegment call.
+        if (g_wpArmed && g_sawReset && !g_getsubWindowArmed && g_bpModuleBase &&
+            g_resetExitCount && exitCount > g_resetExitCount + GETSUB_WINDOW_START) {
+            g_wpTargetVA = g_bpModuleBase + GETSUB_RVA;
+            WHV_REGISTER_NAME awNames[2] = { WHvX64RegisterDr2, WHvX64RegisterDr7 };
+            WHV_REGISTER_VALUE awVals[2] = { 0 };
+            WHV_REGISTER_NAME dr7rn = WHvX64RegisterDr7; WHV_REGISTER_VALUE dr7rv = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &dr7rn, 1, &dr7rv);
+            awVals[0].Reg64 = g_wpTargetVA;
+            awVals[1].Reg64 = dr7rv.Reg64 | 0x10ULL; // set L2
+            if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, awNames, 2, awVals))) {
+                g_getsubWindowArmed = 1;
+                g_loopAdvArmed = 1;
+                g_loopAdvHitCount = 0;
+                printf("[u28] windowed GetSubsegment capture armed at exitCount=%ld (reset+%ld), VA=0x%llX\n",
+                       exitCount, exitCount - g_resetExitCount, (unsigned long long)g_wpTargetVA);
+                fflush(stdout);
+            }
+        }
+
+        switch (exitContext.ExitReason) {
+            case WHvRunVpExitReasonX64Halt: {
+                // Don't stop the hypervisor -- park the CPU and wait for an
+                // interrupt. The wait loop at the top of the outer while()
+                // will wake it up.
+                WHV_REGISTER_NAME ripNameH = WHvX64RegisterRip;
+                WHV_REGISTER_VALUE ripValH = { 0 };
+                WHvGetVirtualProcessorRegisters(partition, 0, &ripNameH, 1, &ripValH);
+                if (g_bpPatched) logBpEvent("halt rip=0x%llX", (unsigned long long)ripValH.Reg64);
+                printf("[CPU halted at rip=0x%llX -- waiting for interrupt]\n",
+                       (unsigned long long)ripValH.Reg64);
+                fflush(stdout);
+                cpuHalted = 1;
+                break;
+            }
+
+            case WHvRunVpExitReasonX64IoPortAccess: {
+                UINT16 port = exitContext.IoPortAccess.PortNumber;
+                BOOL isWrite = exitContext.IoPortAccess.AccessInfo.IsWrite;
+                debugLastPort = port;
+                debugLastWrite = isWrite;
+
+                if (g_bpPatched) {
+                    logBpEvent("io port=0x%03X write=%d val=0x%llX", port, isWrite,
+                               (unsigned long long)exitContext.IoPortAccess.Rax);
+                }
+
+                if (port == 0x1F0) {
+                    ataHandlePioDataPort(partition, &exitContext, guestMemory);
+                    break;
+                }
+
+                if (port == 0xCF8 || (port >= 0xCFC && port <= 0xCFF)) {
+                    pciHandleConfigAccess(partition, &exitContext);
+                    break;
+                }
+
+                if (port >= 0x3F8 && port <= 0x3FF) {
+                    uartHandleAccess(partition, &exitContext);
+                    break;
+                }
+
+                if (port >= 0x2F8 && port <= 0x2FF) {
+                    uart2HandleAccess(partition, &exitContext);
+                    break;
+                }
+
+                if (port == 0xE2) {
+                    efiHookHandleAccess(partition, &exitContext);
+                    break;
+                }
+
+                if (port == 0x510 || port == 0x511) {
+                    fwCfgHandleAccess(partition, &exitContext, guestMemory);
+                    break;
+                }
+
+                // RTL8139 register file, at whatever I/O base the guest
+                // programmed into BAR0 (see rtl8139HandleBar0Access). Same
+                // dynamic-base pattern as the PM timer below, since real
+                // firmware/OS PCI enumeration assigns this at boot rather
+                // than it being a fixed port.
+                if (rtl8139IoBase != 0) {
+                    UINT32 base = rtl8139IoBase & ~0x3;
+                    if (port >= base && port < base + RTL8139_IO_SIZE) {
+                        rtl8139HandleIoAccess(partition, &exitContext);
+                        break;
+                    }
+                }
+
+                // ACPI PM Timer: PIIX4's PM I/O block base is whatever the
+                // guest programs into the PM function's PMBA register
+                // (pciPmConfig offset 0x40, 64-byte aligned), and the timer
+                // register (PM_TMR_BLK) conventionally lives at base+8.
+                // Before the PM function's config space was writable, this
+                // showed up as a fixed, PCD-loaded port (which happened to
+                // be plain "6") instead of a real dynamically-assigned one
+                // -- same underlying device, just discovered differently
+                // now that BAR programming actually sticks. It's a real
+                // 32-bit free-running counter at 3.579545MHz; returning
+                // only the low 16 bits wraps every ~18ms and can fail a
+                // delta/wraparound sanity check on every single read.
+                {
+                    UINT32 pmBase = (*(UINT32 *)&pciPmConfig[0x40]) & 0xFFC0;
+                    if (pmBase != 0 && port == (UINT16)(pmBase + 8) &&
+                        !exitContext.IoPortAccess.AccessInfo.IsWrite) {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        double pmTicks = (double)now.QuadPart * (3579545.0 / (double)perfFrequency.QuadPart);
+                        UINT32 pmValue = (UINT32)((UINT64)pmTicks & 0xFFFFFFFFULL);
+
+                        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+                        WHV_REGISTER_VALUE values[2] = { 0 };
+                        values[0].Reg64 = pmValue;
+                        values[1].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+                        break;
+                    }
+                }
+
+                // SMI_CMD (port 0xB2, PIIX4's fixed default) and PM1a_CNT_BLK
+                // (pmBase+4): a BIOS's acpi_enable() writes SMI_CMD to ask an
+                // SMI handler to set SCI_EN in PM1a_CNT, then polls PM1a_CNT
+                // for that bit. We don't emulate SMM, so the write to 0xB2
+                // sets SCI_EN synchronously instead -- see pm1aControl's
+                // declaration for why.
+                if (port == 0xB2 && isWrite) {
+                    pm1aControl |= 0x1;
+                    smiStatus = 0;
+                    WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+                    WHV_REGISTER_VALUE newRip = { 0 };
+                    newRip.Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                    WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &newRip);
+                    break;
+                }
+                if (port == 0xB3) {
+                    UINT64 rax = smiStatus;
+                    if (isWrite) smiStatus = (unsigned char)exitContext.IoPortAccess.Rax;
+                    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+                    WHV_REGISTER_VALUE values[2] = { 0 };
+                    values[0].Reg64 = isWrite ? 0 : rax;
+                    values[1].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+                    break;
+                }
+                {
+                    UINT32 pmBase = (*(UINT32 *)&pciPmConfig[0x40]) & 0xFFC0;
+                    if (pmBase != 0 && port == (UINT16)(pmBase + 4)) {
+                        UINT64 rax = pm1aControl;
+                        // SLP_TYP/SLP_EN (bits 10-13) are the only fields real
+                        // POST code legitimately writes here before an OS is
+                        // even loaded (confirmed live: SeaBIOS writes 0x2000 --
+                        // SLP_EN with SLP_TYP=0, i.e. a harmless S0 no-op, not
+                        // an actual sleep request). A blind overwrite clobbers
+                        // SCI_EN (bit0) back to 0, and since our FADT declares
+                        // SMI_CMD=0 ("ACPI already enabled, no handshake"),
+                        // nothing will ever write 0xB2 again to re-set it --
+                        // any later SCI_EN poll then spins forever (confirmed
+                        // live: SeaBIOS hangs at its own PM1a_CNT init read
+                        // immediately after this write). Pin SCI_EN through
+                        // writes to keep it consistent with that guarantee.
+                        if (isWrite) pm1aControl = (UINT16)exitContext.IoPortAccess.Rax | 0x1;
+                        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+                        WHV_REGISTER_VALUE values[2] = { 0 };
+                        values[0].Reg64 = isWrite ? 0 : rax;
+                        values[1].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+                        break;
+                    }
+                }
+
+                if (isWrite) {
+                    unsigned char val = (unsigned char)exitContext.IoPortAccess.Rax;
+                    debugLastVal = val;
+                    int skipRipAdvance = 0;
+
+                    // Keyboard-controller reset pulse (byte 0xFE to port
+                    // 0x64): the classic legacy "reset the CPU" mechanism,
+                    // still used as a HAL fallback by modern Windows (e.g.
+                    // Setup's mid-installation restart). Confirmed live
+                    // (see docs/investigations/post-vppt-boot-stall.md)
+                    // that this guest genuinely sends this pulse and then
+                    // deadlocks forever waiting for a reset that never
+                    // happened, because this hypervisor previously did
+                    // nothing for it.
+                    //
+                    // Two things are needed to honor it correctly, both
+                    // confirmed necessary by direct experiment:
+                    //
+                    // 1. Reset CPU state to the same reset-vector state
+                    //    used at cold boot (RIP/CS, matching the existing
+                    //    port-0x92 hot-reset mechanism) -- plus CR0/CR3/
+                    //    CR4/EFER, since this fires while the guest is deep
+                    //    in 64-bit long mode, where CS.Base is architecturally
+                    //    ignored for addressing. Without also exiting long
+                    //    mode, the RIP/CS reset alone lands at flat linear
+                    //    address 0xFFF0 under the guest's still-active page
+                    //    tables, not the real reset vector.
+                    //
+                    // 2. Clear guest RAM above the legacy 16MB boundary.
+                    //    Without this, the guest reboots successfully but
+                    //    then bugchecks (0x139 KERNEL_SECURITY_CHECK_FAILURE,
+                    //    traced to a corrupted LIST_ENTRY inside
+                    //    RtlpHpLfhOwnerMoveSubsegment -- the kernel's
+                    //    Segment Heap) because the freshly-restarted
+                    //    kernel's memory manager finds stale, partially-
+                    //    modified heap bookkeeping left behind by the
+                    //    aborted prior boot instance in the same physical
+                    //    memory. Two independent falsification tests
+                    //    (clearing everything, then clearing only above
+                    //    16MB) confirmed this is specifically OS-managed
+                    //    extended memory, not low/legacy memory -- see the
+                    //    investigation doc for the full trace. Real
+                    //    hardware's warm reset doesn't clear RAM and
+                    //    doesn't hit this, so this is a known, deliberate
+                    //    divergence from real hardware, not an attempt at
+                    //    full architectural accuracy -- it's what this
+                    //    guest's boot path actually needs to get past this
+                    //    point.
+                    if (port == 0x64 && val == 0xFE) {
+                        // Beyond RIP/CS/CR0/CR3/CR4/EFER (already proven
+                        // necessary and sufficient to get the guest
+                        // restarting), real x86 RESET# also reinitializes
+                        // IDTR/GDTR/LDTR/TR, DR7, and the non-CS segment
+                        // registers -- none of which this reset has ever
+                        // touched. Not yet known whether any of these are
+                        // relevant to the still-unsolved bugcheck 0x139
+                        // (Segment Heap corruption, see
+                        // docs/investigations/post-vppt-boot-stall.md),
+                        // but they're genuine, real, well-defined gaps
+                        // versus documented CPU reset semantics -- unlike
+                        // IOAPIC state (platform/chipset, not CPU
+                        // architectural, and already proven harmful to
+                        // reset) or RAM content (proven not reliably
+                        // relevant despite four attempts). Worth testing
+                        // before returning to guessing at heap internals.
+                        WHV_REGISTER_NAME resetNames[15] = {
+                            WHvX64RegisterRip, WHvX64RegisterCs,
+                            WHvX64RegisterCr0, WHvX64RegisterCr3,
+                            WHvX64RegisterCr4, WHvX64RegisterEfer,
+                            WHvX64RegisterIdtr, WHvX64RegisterGdtr,
+                            WHvX64RegisterLdtr, WHvX64RegisterTr,
+                            WHvX64RegisterDr7,
+                            WHvX64RegisterDs, WHvX64RegisterEs,
+                            WHvX64RegisterFs, WHvX64RegisterGs
+                        };
+                        WHV_REGISTER_VALUE resetValues[15] = { 0 };
+                        resetValues[0].Reg64 = 0xFFF0;
+                        WHV_X64_SEGMENT_REGISTER resetCs = { 0 };
+                        resetCs.Base = uefiMode ? 0xFFFF0000 : 0xF0000;
+                        resetCs.Limit = 0xFFFF;
+                        resetCs.Selector = 0xF000;
+                        resetCs.Attributes = 0x9B;
+                        resetValues[1].Segment = resetCs;
+                        resetValues[2].Reg64 = 0x60000010; // CR0 reset value (PE=0, PG=0)
+                        resetValues[3].Reg64 = 0;           // CR3
+                        resetValues[4].Reg64 = 0;           // CR4
+                        resetValues[5].Reg64 = 0;           // EFER (clears LME/LMA)
+                        resetValues[6].Table.Base = 0;
+                        resetValues[6].Table.Limit = 0x3FF; // IDTR: real-mode IVT size
+                        resetValues[7].Table.Base = 0;
+                        resetValues[7].Table.Limit = 0xFFFF; // GDTR
+                        WHV_X64_SEGMENT_REGISTER resetLdtr = { 0 };
+                        resetLdtr.Base = 0;
+                        resetLdtr.Limit = 0xFFFF;
+                        resetLdtr.Selector = 0;
+                        resetLdtr.Attributes = 0x82; // system segment, type=2 (LDT descriptor), present
+                        resetValues[8].Segment = resetLdtr;  // LDTR
+                        WHV_X64_SEGMENT_REGISTER resetTr = { 0 };
+                        resetTr.Base = 0;
+                        resetTr.Limit = 0xFFFF;
+                        resetTr.Selector = 0;
+                        resetTr.Attributes = 0x8B; // system segment, type=0xB (busy 64-bit TSS), present -- WHV rejects type=2 here (not a valid TSS type)
+                        resetValues[9].Segment = resetTr;    // TR
+                        resetValues[10].Reg64 = 0;           // DR7
+                        WHV_X64_SEGMENT_REGISTER resetData = { 0 };
+                        resetData.Base = 0;
+                        resetData.Limit = 0xFFFF;
+                        resetData.Selector = 0;
+                        resetData.Attributes = 0x93; // present, read/write data segment -- matches real-mode default
+                        resetValues[11].Segment = resetData; // DS
+                        resetValues[12].Segment = resetData; // ES
+                        resetValues[13].Segment = resetData; // FS
+                        resetValues[14].Segment = resetData; // GS
+                        WHvSetVirtualProcessorRegisters(partition, 0, resetNames, 15, resetValues);
+                        skipRipAdvance = 1;
+
+                        // This CPU-register reset reliably gets the guest
+                        // past the original frozen spin-wait deadlock --
+                        // confirmed across many independent runs. It does
+                        // NOT reliably prevent a secondary bugcheck 0x139
+                        // (KERNEL_SECURITY_CHECK_FAILURE, Segment Heap list
+                        // corruption) that occurs on the second boot pass
+                        // in most runs. Four mitigation attempts were tried
+                        // and tested live, none reliably: clearing guest RAM
+                        // above 16MB (worked once, failed on repeated
+                        // trials), a narrower/faster 240MB clear (failed),
+                        // resetting rtcPeriodicTickArmed/lastRtcPeriodicTick
+                        // alone (failed), and combining the RAM clear with
+                        // the rtcPeriodicTickArmed reset (also eventually
+                        // failed). None left in -- none earned their
+                        // complexity.
+                        //
+                        // The RTC-timing theory behind all four attempts
+                        // was itself directly disproven afterward: live
+                        // symbol resolution of the "stall" RIP (via
+                        // ntkrnlmp.pdb, added as a one-off diagnostic and
+                        // removed once it answered the question) showed it
+                        // resolves to HaliHaltSystem -- the HAL's terminal
+                        // halt loop, reached only *after* a bugcheck has
+                        // already fully completed. The oscillating RIP and
+                        // HIGH_LEVEL IRQL are just the ordinary signature
+                        // of a frozen post-bugcheck CPU, not a live
+                        // interrupt-delivery race -- confirmed further by
+                        // that same diagnostic pass showing the guest's
+                        // RTC PIE bit never even gets re-enabled before
+                        // the bugcheck happens. The real fault is exactly
+                        // where the earlier investigation phase already
+                        // found it: RtlpHpLfhOwnerMoveSubsegment (Segment
+                        // Heap corruption) -- see
+                        // docs/investigations/post-vppt-boot-stall.md for
+                        // the full trace. This remains an open problem,
+                        // not a solved one.
+
+                        // Live-breakpoint infrastructure: this boot
+                        // instance's ntoskrnl.exe base (if the first pass
+                        // had already been found and patched) is about to
+                        // be invalidated by the reset -- KASLR gives the
+                        // second pass a new base. Restore the original
+                        // byte first if we can still read/write it
+                        // (defensive; harmless if the underlying page no
+                        // longer maps the same way), then clear discovery
+                        // state so it's found fresh on the second pass.
+                        if (g_bpPatched && guestMemory) {
+                            kernelWriteByteVA((unsigned char *)guestMemory, g_bpCr3, g_bpTargetVA, g_bpOriginalByte);
+                        }
+                        g_bpModuleBase = 0;
+                        g_bpTargetVA = 0;
+                        g_bpCr3 = 0;
+                        g_bpPatched = 0;
+                        g_wpArmed = 0; // DR7 was just zeroed above (real RESET# semantics) -- re-arm fresh on rediscovery
+                        g_wp0Fired = 0;
+                        g_wp1Fired = 0;
+                        g_wp2Fired = 0;
+                        g_haliDispatchArmed = 0;
+                        g_haliDispatchHitCount = 0;
+                        g_poolCallerArmed = 0;
+                        g_poolCallerHitCount = 0;
+                        g_helperEntryArmed = 0;
+                        g_helperEntryHitCount = 0;
+                        g_loopAdvArmed = 0;
+                        g_loopAdvHitCount = 0;
+                        g_sawReset = 1; // U23c: pass 2 begins after this reset
+                        g_resetExitCount = exitCount; // U28: window anchor
+                        g_getsubWindowArmed = 0;
+
+                        printf("[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=%ld)\n", exitCount);
+                        fflush(stdout);
+                    }
+
+                    if (port == 0x70) {
+                        cmosSelectedReg = val & 0x7F;
+                        if (rtcDiagLoadBaseKnown) rtcDiagLogAccess(partition, exitContext.VpContext.Rip, cmosSelectedReg, 1);
+                    }
+                    else if (port == 0x71) {
+                        cmosRegisters[cmosSelectedReg] = val;
+                        if (cmosSelectedReg == 0x0A || cmosSelectedReg == 0x0B) {
+                            static int cmosAbLogCount = 0;
+                            if (cmosAbLogCount < 100) {
+                                cmosAbLogCount++;
+                                printf("[cmos-ab] write reg=0x%02X value=0x%02X (RegA=0x%02X RegB=0x%02X, PIE=%d)\n",
+                                       cmosSelectedReg, val, cmosRegisters[0x0A], cmosRegisters[0x0B],
+                                       (cmosRegisters[0x0B] & 0x40) ? 1 : 0);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                    else if (port == 0x64 && val == 0x20) kbEnqueue(0x45);
+                    else if (port == 0x64 && val == 0xAA) kbEnqueue(0x55); // controller self-test: 0x55 = passed
+                    else if (port == 0x64 && val == 0xAB) kbEnqueue(0x00); // test first PS/2 port: 0x00 = passed
+                    else if (port == 0x64 && val == 0xA7) { auxPortEnabled = 0; printf("[aux] controller: disable AUX port\n"); fflush(stdout); }
+                    else if (port == 0x64 && val == 0xA8) { auxPortEnabled = 1; printf("[aux] controller: enable AUX port\n"); fflush(stdout); }
+                    else if (port == 0x64 && val == 0xA9) { kbEnqueue(0x00); printf("[aux] controller: test AUX port\n"); fflush(stdout); } // reply via keyboard-tagged path, matching 0xAB above
+                    else if (port == 0x64 && val == 0xD4) { nextByteTargetsAux = 1; printf("[aux] controller: next byte targets AUX\n"); fflush(stdout); }
+                    else if (port == 0x60 && nextByteTargetsAux) {
+                        nextByteTargetsAux = 0;
+                        auxHandleCommand(val);
+                    }
+                    else if (port == 0x60 && val == 0xFF) {
+                        // Reset the keyboard device itself (as opposed to
+                        // the 0xAA/0xAB controller-level tests above): real
+                        // hardware sends TWO bytes back in sequence -- 0xFA
+                        // (command acknowledged) then, once the reset
+                        // finishes, 0xAA (self-test passed). Previously
+                        // this fell through to the generic "always just
+                        // send 0xFA" handler below, which never sent the
+                        // second byte -- a driver waiting on the full
+                        // handshake before considering the keyboard usable
+                        // would never see it complete.
+                        kbEnqueue(0xFA);
+                        kbEnqueue(0xAA);
+                    }
+                    else if (port == 0x60) kbEnqueue(0xFA);
+                    else if (port == 0x402) {
+                        appendToLog((char)val);
+                    }
+                    else if (port == 0x92) {
+                        port92Value = val & 0xFE;
+                        int newA20 = (val & 0x02) ? 1 : 0;
+                        if (newA20 != a20Enabled) {
+                            a20Enabled = newA20;
+                            // TEMP DIAGNOSTIC: remap disabled, see above
+                            // updateA20Mapping(partition);
+                        }
+                        if (val & 0x01) {
+                            // Hot-reset bit -- restart the vCPU at the BIOS
+                            // reset vector, same as the initial boot setup.
+                            // Guest RAM and our emulated device state (CMOS,
+                            // ATA, etc.) intentionally survive, matching how
+                            // a real warm reset doesn't clear battery-backed
+                            // CMOS or physical memory.
+                            WHV_REGISTER_NAME resetNames[2] = { WHvX64RegisterRip, WHvX64RegisterCs };
+                            WHV_REGISTER_VALUE resetValues[2] = { 0 };
+                            resetValues[0].Reg64 = 0xFFF0;
+                            WHV_X64_SEGMENT_REGISTER resetCs = { 0 };
+                            resetCs.Base = uefiMode ? 0xFFFF0000 : 0xF0000;
+                            resetCs.Limit = 0xFFFF;
+                            resetCs.Selector = 0xF000;
+                            resetCs.Attributes = 0x9B;
+                            resetValues[1].Segment = resetCs;
+                            WHvSetVirtualProcessorRegisters(partition, 0, resetNames, 2, resetValues);
+                            skipRipAdvance = 1;
+                            printf("[port 0x92 hot reset -- exitCount=%ld]\n", exitCount); fflush(stdout);
+                        }
+                    }
+                    else if (port == 0x43) {
+                        // PIT mode/command register. Only channel 2 (bits 7-6 == 10)
+                        // is emulated -- that's the one BIOS timer calibration uses.
+                        if (((val >> 6) & 0x3) == 2) {
+                            pitChannel2AccessMode = (val >> 4) & 0x3;
+                            pitChannel2WritePhase = 0;
+                            pitChannel2Loaded = 0;
+                        }
+                    }
+                    else if (port == 0x42) {
+                        // Channel 2 count reload value, byte order depends on
+                        // the access mode latched via port 0x43.
+                        if (pitChannel2AccessMode == 1) { // lobyte only
+                            pitChannel2Reload = val;
+                            pitChannel2Loaded = 1;
+                            QueryPerformanceCounter(&pitChannel2LoadTime);
+                        } else if (pitChannel2AccessMode == 2) { // hibyte only
+                            pitChannel2Reload = (UINT16)val << 8;
+                            pitChannel2Loaded = 1;
+                            QueryPerformanceCounter(&pitChannel2LoadTime);
+                        } else { // lobyte/hibyte sequence
+                            if (pitChannel2WritePhase == 0) {
+                                pitChannel2LowByte = val;
+                                pitChannel2WritePhase = 1;
+                            } else {
+                                pitChannel2Reload = ((UINT16)val << 8) | pitChannel2LowByte;
+                                pitChannel2WritePhase = 0;
+                                pitChannel2Loaded = 1;
+                                QueryPerformanceCounter(&pitChannel2LoadTime);
+                            }
+                        }
+                    }
+                    else if (port == 0x61) {
+                        unsigned char newGate = val & 0x1;
+                        if (newGate && !port61Gate && pitChannel2Loaded) {
+                            // Gate rising edge restarts the countdown, matching
+                            // the usual "program count, then enable gate" sequence.
+                            QueryPerformanceCounter(&pitChannel2LoadTime);
+                        }
+                        port61Gate = newGate;
+                        port61SpeakerData = (val >> 1) & 0x1;
+                    }
+                    else if (port == 0x1F1) ataFeatures = val;
+                    else if (port == 0x1F2) ataSectorCount = val;
+                    else if (port == 0x1F3) ataLbaLow = val;
+                    else if (port == 0x1F4) ataLbaMid = val;
+                    else if (port == 0x1F5) ataLbaHigh = val;
+                    else if (port == 0x1F6) ataDriveHead = val;
+                    else if (port == 0x1F7) ataHandleCommand(partition, val);
+                    else if (port == 0x3F6) {
+                        if (val & 0x04) { // SRST -- software reset
+                            ataStatus = ATA_ST_DRDY | ATA_ST_DSC;
+                            ataError = 0;
+                            ataDataLen = 0;
+                            ataDataPos = 0;
+                            // Real hardware presents the ATA "device passed
+                            // diagnostics" signature on these registers after
+                            // a reset -- probes rely on this to detect a drive.
+                            ataSectorCount = 1;
+                            ataLbaLow = 1;
+                            ataLbaMid = 0;
+                            ataLbaHigh = 0;
+                        }
+                    }
+
+                    if (!skipRipAdvance) {
+                        WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+                        WHV_REGISTER_VALUE newRip = { 0 };
+                        newRip.Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                        WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &newRip);
+                    }
+                } else {
+                    UINT16 returnValue = 0xFF;
+                    if (port == 0x71) {
+                        if (cmosSelectedReg <= 0x09) returnValue = cmosReadRtcField(cmosSelectedReg);
+                        else if (cmosSelectedReg == 0x0A) returnValue = cmosRegisters[0x0A] & ~0x80; // UIP always 0
+                        else if (cmosSelectedReg == 0x0D) returnValue = cmosRegisters[0x0D] | 0x80;  // VRT always 1
+                        else if (cmosSelectedReg == 0x0C) {
+                            // Register C (interrupt status/ack): real
+                            // hardware clears it and de-asserts IRQ8 on
+                            // read -- the RTC ISR's standard acknowledgment.
+                            returnValue = cmosRegisters[0x0C];
+                            cmosRegisters[0x0C] = 0;
+                        }
+                        else returnValue = cmosRegisters[cmosSelectedReg];
+                        if (rtcDiagLoadBaseKnown) rtcDiagLogAccess(partition, exitContext.VpContext.Rip, cmosSelectedReg, 0);
+                    }
+                    else if (port == 0x92) returnValue = port92Value;
+                    else if (port == 0x402) {
+                        // edk2's PlatformDebugLibIoPortFound() probes this
+                        // port with a read and treats the floating-bus value
+                        // 0xFF as "no debug port present," silently
+                        // discarding every DEBUG() message rather than
+                        // writing it -- any other value makes it (correctly,
+                        // for our purposes) detect the port as present.
+                        returnValue = 0x00;
+                    }
+                    else if (port == 0x64) {
+                        // Bit 0: output buffer full. Bit 5: the buffered byte
+                        // came from the AUX (mouse) port rather than the
+                        // keyboard. Keyboard takes priority when both have
+                        // data, matching the dequeue order below so a status
+                        // read immediately followed by a data read always
+                        // agree on the source.
+                        if (kbHasData()) returnValue = 0x01;
+                        else if (auxHasData()) returnValue = 0x21;
+                        else returnValue = 0x00;
+                    }
+                    else if (port == 0x60) {
+                        if (kbHasData()) returnValue = kbDequeue();
+                        else if (auxHasData()) returnValue = auxDequeue();
+                        else returnValue = 0x00;
+                    }
+                    else if (port == 0x61) {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        double elapsedUs = (double)(now.QuadPart - lastToggleTime.QuadPart) * 1000000.0 / perfFrequency.QuadPart;
+                        if (elapsedUs >= 15.0) {
+                            refreshToggle ^= 0x10;
+                            lastToggleTime = now;
+                        }
+
+                        unsigned char channel2Output = 0;
+                        if (port61Gate && pitChannel2Loaded) {
+                            double loadedElapsedUs = (double)(now.QuadPart - pitChannel2LoadTime.QuadPart) * 1000000.0 / perfFrequency.QuadPart;
+                            double elapsedTicks = loadedElapsedUs * (PIT_HZ / 1000000.0);
+                            UINT32 reload = pitChannel2Reload == 0 ? 65536 : pitChannel2Reload;
+                            if (elapsedTicks >= (double)reload) channel2Output = 0x20;
+                        }
+
+                        returnValue = (port61Gate ? 0x01 : 0) | (port61SpeakerData ? 0x02 : 0)
+                                      | refreshToggle | channel2Output;
+                    }
+                    else if (port == 0x1F6) returnValue = ataDriveHead; // readable regardless of which drive is selected
+                    // NOTE: these registers are intentionally NOT gated on
+                    // ataSlaveSelected() the way commands are. A hard-floated
+                    // 0xFF for an absent slave (BSY permanently set) makes
+                    // BIOS's "wait for not-busy" polling -- done *before* it
+                    // even issues a command, just to see if a device
+                    // responds -- hang forever. Status is handled specially
+                    // below to give BSY=0 without leaking the master's
+                    // possibly-stale DRQ/ERR; everything else can safely
+                    // mirror the shared bus. Commands themselves are still
+                    // correctly dropped for the slave in ataHandleCommand,
+                    // which is what actually prevents a phantom second
+                    // drive from appearing.
+                    else if (port == 0x1F1) returnValue = ataError;
+                    else if (port == 0x1F2) returnValue = ataSectorCount;
+                    else if (port == 0x1F3) returnValue = ataLbaLow;
+                    else if (port == 0x1F4) returnValue = ataLbaMid;
+                    else if (port == 0x1F5) returnValue = ataLbaHigh;
+                    else if (port == 0x1F7 || port == 0x3F6) {
+                        // BSY must read 0 (else "wait for not-busy" polling
+                        // before a command is even issued hangs forever --
+                        // see above), but DRQ/ERR must NOT leak the
+                        // master's possibly-stale command result, or a
+                        // dropped command on the slave looks like it
+                        // produced data. DRDY-only is what an idle,
+                        // never-been-commanded device looks like.
+                        returnValue = ataSlaveSelected() ? ATA_ST_DRDY : ataStatus;
+                    }
+
+                    WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+                    WHV_REGISTER_VALUE values[2] = { 0 };
+                    values[0].Reg64 = returnValue;
+                    values[1].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                    WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+                }
+                break;
+            }
+
+            case WHvRunVpExitReasonX64Cpuid: {
+                // Unreachable in current config: no WHvPartitionPropertyCodeCpuidExitList
+                // is registered (see the SyntheticProcessorFeaturesBanks setup
+                // near WHvSetupPartition for why the CPUID-trap approach this
+                // handler used to implement was abandoned). Kept only so the
+                // switch has a defined case if that property is ever
+                // reintroduced; just answers with WHV's own computed default.
+                WHV_REGISTER_NAME names[5] = {
+                    WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
+                    WHvX64RegisterRdx, WHvX64RegisterRip
+                };
+                WHV_REGISTER_VALUE values[5] = { 0 };
+                values[0].Reg64 = exitContext.CpuidAccess.DefaultResultRax;
+                values[1].Reg64 = exitContext.CpuidAccess.DefaultResultRbx;
+                values[2].Reg64 = exitContext.CpuidAccess.DefaultResultRcx;
+                values[3].Reg64 = exitContext.CpuidAccess.DefaultResultRdx;
+                values[4].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                WHvSetVirtualProcessorRegisters(partition, 0, names, 5, values);
+                break;
+            }
+
+            case WHvRunVpExitReasonMemoryAccess: {
+                if (g_bpPatched) {
+                    logBpEvent("memaccess gpa=0x%llX", (unsigned long long)exitContext.MemoryAccess.Gpa);
+                }
+                if (ioapicHandleMmioAccess(partition, &exitContext)) {
+                    break;
+                }
+                UINT64 faultAddr = exitContext.MemoryAccess.Gpa;
+                UINT64 pageBase = faultAddr & ~0xFFFULL;
+                memAccessFaultCount++;
+                if (memAccessFaultCount <= 20 || memAccessFaultCount % 1000 == 0) {
+                    printf("[memaccess fault #%d gpa=0x%llX]\n", memAccessFaultCount, (unsigned long long)faultAddr);
+                    fflush(stdout);
+                }
+                void *scratchPage = VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (scratchPage != NULL) {
+                    memset(scratchPage, 0, 0x1000);
+                    WHvMapGpaRange(partition, scratchPage, pageBase, 0x1000,
+                                   WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute);
+                }
+                break;
+            }
+
+            case WHvRunVpExitReasonCanceled:
+                // rtcCancelThread forces these so the main loop regains
+                // control and can deliver the RTC/PIT periodic interrupts
+                // even while the guest is CPU-bound in a busy-spin with no
+                // VM exits of its own. This is now the ONLY unconditional
+                // (non-halted) delivery point for those two interrupts --
+                // narrowed here from "after every exit reason" specifically
+                // because that was landing injections at essentially random
+                // guest RSP values and faulting OVMF's own FXSAVE (see
+                // docs/investigations/post-vppt-boot-stall.md, 2026-07-17).
+                // This exit is bounded and deliberate (rtcCancelThread's own
+                // ~1ms cadence while RTC PIE is armed), a much narrower
+                // surface than every I/O/MMIO/PCI-config exit combined.
+                if (g_bpPatched) logBpEvent("cancel (rtcCancelThread forced exit)");
+                deliverRtcPeriodicIrq(partition);
+                deliverPitTimerIrq(partition);
+                break;
+
+            case WHvRunVpExitReasonException: {
+                // Three simultaneous hardware EXECUTION breakpoints
+                // (DR0/DR1/DR2, R/W=execute) -- see the WP_RETURN_RVA /
+                // WP_PHASE1INIT_ENTRY_RVA / BP_FAIL_SITE_RVA comment block
+                // near the top of this file for what each one answers.
+                // Currently: DR0/DR1 sit at the entry of
+                // ExInitializePagedHeaps/ExInitializePoolHeapManagement
+                // (U6 -- who calls them?), DR2 stays on
+                // Phase1InitializationDiscard's entry for ordering context.
+                // Unlike the earlier data-write watchpoint (trap
+                // semantics, RIP past the access), an instruction
+                // execution breakpoint is fault-style: RIP is the
+                // breakpoint's own address, the instruction has NOT
+                // executed yet -- so RIP alone unambiguously identifies
+                // which of the three trapped (only one can be "next
+                // instruction" at a given exit). Each site is one-shot:
+                // once identified, only ITS DR7 L-bit is cleared, leaving
+                // the other two still armed so a single pass can capture
+                // all three events.
+                if (exitContext.VpException.ExceptionType == WHvX64ExceptionTypeDebugTrapOrFault && g_wpArmed) {
+                    UINT64 wpRip = exitContext.VpContext.Rip;
+
+                    // DR3 (repurposed for U13): multi-shot tracer at
+                    // HalpIommuInitSystem's own return point (its `ret`
+                    // instruction). RIP is AT `ret`, not yet executed --
+                    // EAX already holds its real, final return value at
+                    // this exact point. Logged and resumed WITHOUT
+                    // disabling DR3, so every call across the retry loop
+                    // gets its return value captured, up to
+                    // HALI_DISPATCH_MAX_HITS.
+                    if (wpRip == g_haliDispatchTargetVA && g_haliDispatchArmed) {
+                        g_haliDispatchHitCount++;
+                        WHV_REGISTER_NAME dispatchNames[2] = { WHvX64RegisterRax, WHvX64RegisterRsp };
+                        WHV_REGISTER_VALUE dispatchVals[2] = { 0 };
+                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, dispatchNames, 2, dispatchVals))) {
+                            INT32 retVal = (INT32)(dispatchVals[0].Reg64 & 0xFFFFFFFFULL);
+                            UINT64 rspVA = dispatchVals[1].Reg64;
+                            printf("[iommuret] hit #%d: HalpIommuInitSystem returned EAX=0x%08X (%s) rsp=0x%llX exitCount=%ld\n",
+                                   g_haliDispatchHitCount, (unsigned)retVal, (retVal < 0) ? "FAILURE" : "success/other",
+                                   (unsigned long long)rspVA, exitCount);
+                            fflush(stdout);
+                        }
+                        WHV_REGISTER_NAME dr6ClearName = WHvX64RegisterDr6;
+                        WHV_REGISTER_VALUE dr6ClearVal = { 0 };
+                        WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName, 1, &dr6ClearVal);
+                        if (g_haliDispatchHitCount >= HALI_DISPATCH_MAX_HITS) {
+                            printf("[iommuret] cap reached (%d hits) -- disabling DR3 for this pass\n", HALI_DISPATCH_MAX_HITS);
+                            fflush(stdout);
+                            WHV_REGISTER_NAME dr7ReadName2 = WHvX64RegisterDr7;
+                            WHV_REGISTER_VALUE dr7ReadVal2 = { 0 };
+                            WHvGetVirtualProcessorRegisters(partition, 0, &dr7ReadName2, 1, &dr7ReadVal2);
+                            dr7ReadVal2.Reg64 &= ~0x40ULL; // clear L3
+                            WHV_REGISTER_NAME dr7WriteName2 = WHvX64RegisterDr7;
+                            WHvSetVirtualProcessorRegisters(partition, 0, &dr7WriteName2, 1, &dr7ReadVal2);
+                            g_haliDispatchArmed = 0;
+                        }
+                        break;
+                    }
+
+                    // DR0 (repurposed for U13): multi-shot tracer at
+                    // HalpIommuInitSystem's own entry. RIP is AT the
+                    // function's entry, not yet executed -- RCX/RDX/R8/R9
+                    // are its real, live arguments (standard x64 calling
+                    // convention). Its own first instructions test RCX
+                    // (the outer loop index passed by HalpInitSystemHelper)
+                    // for zero, so this directly shows what it's being
+                    // invoked with on every retry.
+                    if (wpRip == g_wpTargetVA0 && g_poolCallerArmed) {
+                        g_poolCallerHitCount++;
+                        WHV_REGISTER_NAME poolRegNames[10] = { WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterRsp, WHvX64RegisterCr3, WHvX64RegisterRbx, WHvX64RegisterRsi, WHvX64RegisterRdi, WHvX64RegisterRbp };
+                        WHV_REGISTER_VALUE poolRegVals[10] = { 0 };
+                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, poolRegNames, 10, poolRegVals))) {
+                            // U18: rbx/rsi/rdi are non-volatile, so they still hold
+                            // HalpInitSystemHelper's live loop state here (ebx=outer
+                            // index, rsi=table ptr, edi=inner index). If identical
+                            // across consecutive pass-2 calls, the loop is frozen
+                            // (something external resets it); if advancing, cycling.
+                            // U19: rbp = ebp = the loop's outer LIMIT (edx arg
+                            // copied to ebp at helper+0x2D); ebx = outer index.
+                            // Loop exits when ebx > ebp. If ebp is huge/corrupt,
+                            // the outer loop iterates effectively forever.
+                            printf("    [loopstate] ebx=0x%llX ebp(limit)=0x%llX rsi=0x%llX edi=0x%llX\n",
+                                   (unsigned long long)poolRegVals[6].Reg64,
+                                   (unsigned long long)(poolRegVals[9].Reg64 & 0xFFFFFFFFULL),
+                                   (unsigned long long)poolRegVals[7].Reg64,
+                                   (unsigned long long)(poolRegVals[8].Reg64 & 0xFFFFFFFFULL));
+                            // U17: RIP is AT the function entry (not yet executed),
+                            // so [rsp+0x00] is the guaranteed real return address =
+                            // the caller. Read the top few stack qwords and resolve
+                            // each canonical kernel address to module+RVA.
+                            UINT64 iRsp = poolRegVals[4].Reg64, iCr3 = poolRegVals[5].Reg64;
+                            printf("[iommuargs] hit #%d: HalpIommuInitSystem called with rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX exitCount=%ld\n",
+                                   g_poolCallerHitCount,
+                                   (unsigned long long)poolRegVals[0].Reg64, (unsigned long long)poolRegVals[1].Reg64,
+                                   (unsigned long long)poolRegVals[2].Reg64, (unsigned long long)poolRegVals[3].Reg64,
+                                   (unsigned long long)iRsp, exitCount);
+                            unsigned char iStk[0x40] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, iCr3, iRsp, iStk, sizeof(iStk))) {
+                                int isk;
+                                for (isk = 0; isk < (int)sizeof(iStk); isk += 8) {
+                                    UINT64 qv = *(UINT64 *)&iStk[isk];
+                                    if (qv >= 0xFFFF800000000000ULL) {
+                                        UINT64 cb = 0;
+                                        printf("    [rsp+0x%02X]=0x%llX", isk, (unsigned long long)qv);
+                                        if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, iCr3, qv, &cb))
+                                            printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb, (unsigned long long)(qv - cb));
+                                        printf("\n");
+                                    }
+                                }
+                            }
+                            fflush(stdout);
+                        }
+                        WHV_REGISTER_NAME dr6ClearName3 = WHvX64RegisterDr6;
+                        WHV_REGISTER_VALUE dr6ClearVal3 = { 0 };
+                        WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName3, 1, &dr6ClearVal3);
+                        if (g_poolCallerHitCount >= POOL_CALLER_MAX_HITS) {
+                            printf("[iommuargs] cap reached (%d hits) -- disabling DR0 for this pass\n", POOL_CALLER_MAX_HITS);
+                            fflush(stdout);
+                            WHV_REGISTER_NAME dr7ReadName3 = WHvX64RegisterDr7;
+                            WHV_REGISTER_VALUE dr7ReadVal3 = { 0 };
+                            WHvGetVirtualProcessorRegisters(partition, 0, &dr7ReadName3, 1, &dr7ReadVal3);
+                            dr7ReadVal3.Reg64 &= ~0x1ULL; // clear L0
+                            WHV_REGISTER_NAME dr7WriteName3 = WHvX64RegisterDr7;
+                            WHvSetVirtualProcessorRegisters(partition, 0, &dr7WriteName3, 1, &dr7ReadVal3);
+                            g_poolCallerArmed = 0;
+                        }
+                        break;
+                    }
+
+                    // DR1 (repurposed for U15): multi-shot tracer at
+                    // HalpInitSystemHelper's own entry. RIP is AT the
+                    // function's entry, not yet executed -- ECX/EDX/R8 are
+                    // its real, live arguments (outer loop index, outer
+                    // loop limit, third arg passed through to every
+                    // dispatch call). Logged and resumed WITHOUT disabling
+                    // DR1, so this directly answers U15: does this
+                    // function get freshly re-entered many times (H7), or
+                    // called once while stuck internally (H6)?
+                    if (wpRip == g_wpTargetVA1 && g_helperEntryArmed) {
+                        g_helperEntryHitCount++;
+                        // U21: KeBugCheckEx entry. rcx=bugcheck code, rdx/r8/r9=
+                        // params 1-3; param 4 at [rsp+0x28]; return address at
+                        // [rsp+0x00] = the caller that raised the bugcheck.
+                        WHV_REGISTER_NAME bcNames[6] = { WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterRsp, WHvX64RegisterCr3 };
+                        WHV_REGISTER_VALUE bcVals[6] = { 0 };
+                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, bcNames, 6, bcVals))) {
+                            UINT64 bcRsp = bcVals[4].Reg64, bcCr3 = bcVals[5].Reg64;
+                            printf("\n[BUGCHECK] hit #%d: KeBugCheckEx code=0x%llX p1=0x%llX p2=0x%llX p3=0x%llX exitCount=%ld\n",
+                                   g_helperEntryHitCount,
+                                   (unsigned long long)bcVals[0].Reg64, (unsigned long long)bcVals[1].Reg64,
+                                   (unsigned long long)bcVals[2].Reg64, (unsigned long long)bcVals[3].Reg64, exitCount);
+                            unsigned char bcStk[0x40] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, bcCr3, bcRsp, bcStk, sizeof(bcStk))) {
+                                UINT64 retAddr = *(UINT64 *)&bcStk[0x00];
+                                UINT64 p4 = *(UINT64 *)&bcStk[0x28];
+                                UINT64 cb = 0;
+                                printf("[BUGCHECK]   p4=0x%llX  caller(return)=0x%llX", (unsigned long long)p4, (unsigned long long)retAddr);
+                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, retAddr, &cb))
+                                    printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb, (unsigned long long)(retAddr - cb));
+                                printf("\n[BUGCHECK]   stack (canonical kernel qwords):\n");
+                                int bsk;
+                                for (bsk = 0; bsk < (int)sizeof(bcStk); bsk += 8) {
+                                    UINT64 qv = *(UINT64 *)&bcStk[bsk];
+                                    if (qv >= 0xFFFF800000000000ULL) {
+                                        UINT64 cb2 = 0;
+                                        printf("[BUGCHECK]     [rsp+0x%02X]=0x%llX", bsk, (unsigned long long)qv);
+                                        if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, qv, &cb2))
+                                            printf("  (RVA 0x%llX)", (unsigned long long)(qv - cb2));
+                                        printf("\n");
+                                    }
+                                }
+                            }
+                            // U22: for 0x139, KeBugCheckEx(code, p1, p2=trap frame,
+                            // p3=exception record). The DETECTOR (code that raised
+                            // __fastfail) lives in these, NOT on KeBugCheckEx's own
+                            // stack above. EXCEPTION_RECORD.ExceptionAddress (+0x10)
+                            // = the faulting instruction; KTRAP_FRAME.Rip (+0x168) /
+                            // .Rsp (+0x180) give the real crashing context -- walk
+                            // that Rsp for the detector's own call chain.
+                            if ((bcVals[0].Reg64 & 0xFFFFFFFFULL) == 0x139) {
+                                UINT64 trapFrame = bcVals[2].Reg64;  // p2 = r8
+                                UINT64 excRec    = bcVals[3].Reg64;  // p3 = r9
+                                UINT64 cb3 = 0;
+                                unsigned char erBuf[0x28] = { 0 };
+                                if (kernelReadVA((unsigned char *)guestMemory, bcCr3, excRec, erBuf, sizeof(erBuf))) {
+                                    UINT64 excAddr = *(UINT64 *)&erBuf[0x10];
+                                    printf("[BUGCHECK]   0x139 EXCEPTION_RECORD.ExceptionAddress=0x%llX", (unsigned long long)excAddr);
+                                    if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, excAddr, &cb3))
+                                        printf("  (RVA 0x%llX)", (unsigned long long)(excAddr - cb3));
+                                    printf("  <== DETECTOR\n");
+                                }
+                                unsigned char tfBuf[0x190] = { 0 };
+                                if (kernelReadVA((unsigned char *)guestMemory, bcCr3, trapFrame, tfBuf, sizeof(tfBuf))) {
+                                    UINT64 tfRip = *(UINT64 *)&tfBuf[0x168];
+                                    UINT64 tfRsp = *(UINT64 *)&tfBuf[0x180];
+                                    UINT64 cb4 = 0;
+                                    printf("[BUGCHECK]   0x139 TRAP_FRAME.Rip=0x%llX", (unsigned long long)tfRip);
+                                    if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, tfRip, &cb4))
+                                        printf("  (RVA 0x%llX)", (unsigned long long)(tfRip - cb4));
+                                    printf("  Rsp=0x%llX\n", (unsigned long long)tfRsp);
+                                    // U23b: dump the whole trap frame as qwords so
+                                    // the corrupted LIST_ENTRY pointer + its bad
+                                    // neighbor can be located empirically (fixed GPR
+                                    // offsets were wrong last time -- only rcx=3 was
+                                    // right). For each canonical kernel qword, also
+                                    // read the 0x10 bytes it points to (Flink/Blink)
+                                    // and flag any whose back-links are inconsistent
+                                    // -- that is the corrupted entry, and its bad
+                                    // value fingerprints the writer.
+                                    // U25b: raw dump of the whole trap frame to
+                                    // calibrate GPR offsets (find where rcx=3 lives,
+                                    // hence rdx=the subsegment) -- prior fixed guesses
+                                    // (rax@0x30 etc.) gave rdx=0 which is impossible
+                                    // for the remove-path fault.
+                                    printf("[BUGCHECK]   0x139 raw trap-frame qwords 0x00-0xF8:\n");
+                                    int rtk;
+                                    for (rtk = 0x00; rtk <= 0xF8; rtk += 8) {
+                                        UINT64 rv = *(UINT64 *)&tfBuf[rtk];
+                                        printf("[BUGCHECK]     tf+0x%02X=0x%016llX%s\n", rtk, (unsigned long long)rv,
+                                               (rv == 3) ? "  <== (==3, likely rcx/fastfail code)" :
+                                               (rv >= 0xFFFF800000000000ULL ? "  (canonical)" : ""));
+                                    }
+                                    printf("[BUGCHECK]   0x139 full trap-frame scan (off: value -> [Flink,Blink] consistency):\n");
+                                    int tfk;
+                                    for (tfk = 0x28; tfk <= 0x180; tfk += 8) {
+                                        UINT64 v = *(UINT64 *)&tfBuf[tfk];
+                                        if (v < 0xFFFF800000000000ULL) continue;
+                                        UINT64 cbv = 0;
+                                        printf("[BUGCHECK]     tf+0x%02X=0x%llX", tfk, (unsigned long long)v);
+                                        if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, v, &cbv)) { printf(" (RVA 0x%llX)", (unsigned long long)(v-cbv)); printf("\n"); continue; }
+                                        unsigned char le[0x10] = { 0 };
+                                        if (kernelReadVA((unsigned char *)guestMemory, bcCr3, v, le, sizeof(le))) {
+                                            UINT64 fl = *(UINT64 *)&le[0x00], bl = *(UINT64 *)&le[0x08];
+                                            unsigned char nb[0x10] = { 0 }; UINT64 flBl = ~v, blFl = ~v;
+                                            if (fl >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, fl, nb, sizeof(nb))) flBl = *(UINT64 *)&nb[0x08];
+                                            if (bl >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, bl, nb, sizeof(nb))) blFl = *(UINT64 *)&nb[0x00];
+                                            int bad = (fl >= 0xFFFF800000000000ULL && bl >= 0xFFFF800000000000ULL && (flBl != v || blFl != v));
+                                            printf(" Flink=0x%llX Blink=0x%llX%s\n", (unsigned long long)fl, (unsigned long long)bl,
+                                                   bad ? "  <== CORRUPT LIST_ENTRY (back-links mismatch)" : "");
+                                            if (bad)
+                                                printf("[BUGCHECK]       Flink.Blink=0x%llX Blink.Flink=0x%llX (both should==0x%llX)\n",
+                                                       (unsigned long long)flBl, (unsigned long long)blFl, (unsigned long long)v);
+                                        } else printf(" (unreadable)\n");
+                                    }
+                                    unsigned char csBuf[0x400] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, bcCr3, tfRsp, csBuf, sizeof(csBuf))) {
+                                        printf("[BUGCHECK]   0x139 crashing-thread stack scan (0x400, broadened LIST_ENTRY test):\n");
+                                        int csk;
+                                        for (csk = 0; csk < (int)sizeof(csBuf); csk += 8) {
+                                            UINT64 qv = *(UINT64 *)&csBuf[csk];
+                                            if (qv < 0xFFFF800000000000ULL) continue;
+                                            UINT64 cb5 = 0;
+                                            if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, qv, &cb5)) continue; // skip code ptrs (return addrs)
+                                            // Candidate heap pointer. Read its would-be
+                                            // LIST_ENTRY and test consistency. BROADENED:
+                                            // a link that is non-null but non-canonical
+                                            // (garbage/ASCII/poison) is itself corruption,
+                                            // as is a canonical link whose back-ptr misses.
+                                            unsigned char le[0x10] = { 0 };
+                                            if (!kernelReadVA((unsigned char *)guestMemory, bcCr3, qv, le, sizeof(le))) continue;
+                                            UINT64 fl = *(UINT64 *)&le[0x00], bl = *(UINT64 *)&le[0x08];
+                                            int flCanon = (fl >= 0xFFFF800000000000ULL), blCanon = (bl >= 0xFFFF800000000000ULL);
+                                            int flNullOrCanon = (fl == 0) || flCanon, blNullOrCanon = (bl == 0) || blCanon;
+                                            // A real linked subsegment has BOTH links canonical. Only
+                                            // consider entries that look like list nodes (at least one
+                                            // canonical link) to cut noise.
+                                            if (!flCanon && !blCanon) continue;
+                                            unsigned char nb[0x10] = { 0 }; UINT64 flBl = 0, blFl = 0; int flBlOk = 0, blFlOk = 0;
+                                            if (flCanon && kernelReadVA((unsigned char *)guestMemory, bcCr3, fl, nb, sizeof(nb))) { flBl = *(UINT64 *)&nb[0x08]; flBlOk = 1; }
+                                            if (blCanon && kernelReadVA((unsigned char *)guestMemory, bcCr3, bl, nb, sizeof(nb))) { blFl = *(UINT64 *)&nb[0x00]; blFlOk = 1; }
+                                            int bad = (!flNullOrCanon) || (!blNullOrCanon)
+                                                      || (flBlOk && flBl != qv) || (blFlOk && blFl != qv);
+                                            if (!bad) continue; // only print suspected-corrupt nodes
+                                            printf("[BUGCHECK]     [Rsp+0x%03X]=0x%llX Flink=0x%llX Blink=0x%llX  <== SUSPECT\n",
+                                                   csk, (unsigned long long)qv, (unsigned long long)fl, (unsigned long long)bl);
+                                            if (flBlOk) printf("[BUGCHECK]         Flink.Blink=0x%llX (want 0x%llX)%s\n", (unsigned long long)flBl, (unsigned long long)qv, (flBl!=qv)?"  MISMATCH":"");
+                                            if (blFlOk) printf("[BUGCHECK]         Blink.Flink=0x%llX (want 0x%llX)%s\n", (unsigned long long)blFl, (unsigned long long)qv, (blFl!=qv)?"  MISMATCH":"");
+                                        }
+                                    }
+                                    // U24: recover the corrupted subsegment by frame
+                                    // reconstruction (disasm_bucket.py). Caller
+                                    // RtlpHpLfhBucketGetSubsegment sets rbx=rcx+0x18
+                                    // (bucket list head) and calls with rdx=[rbx].
+                                    // RtlpHpLfhOwnerMoveSubsegment's first insn spills
+                                    // that rbx at [tfRsp+8] (rsp unchanged on the fast
+                                    // path). So subsegment(rdx) = *(*(tfRsp+8)).
+                                    unsigned char q8[8] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, bcCr3, tfRsp + 8, q8, 8)) {
+                                        UINT64 rbx = *(UINT64 *)q8;
+                                        printf("[BUGCHECK]   0x139 recovered rbx(bucket listhead)=0x%llX\n", (unsigned long long)rbx);
+                                        if (rbx >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, rbx, q8, 8)) {
+                                            UINT64 subseg = *(UINT64 *)q8;
+                                            printf("[BUGCHECK]   0x139 recovered SUBSEGMENT(rdx)=0x%llX\n", (unsigned long long)subseg);
+                                            unsigned char sb[0x40] = { 0 };
+                                            if (subseg >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, subseg, sb, sizeof(sb))) {
+                                                UINT64 fl = *(UINT64 *)&sb[0x00], bl = *(UINT64 *)&sb[0x08];
+                                                UINT64 cbf = 0, cbb = 0;
+                                                printf("[BUGCHECK]     subseg.Flink=0x%llX", (unsigned long long)fl);
+                                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, fl, &cbf)) printf("(RVA 0x%llX)", (unsigned long long)(fl-cbf));
+                                                printf("  subseg.Blink=0x%llX", (unsigned long long)bl);
+                                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, bl, &cbb)) printf("(RVA 0x%llX)", (unsigned long long)(bl-cbb));
+                                                printf("\n");
+                                                unsigned char nb[0x10] = { 0 };
+                                                if (fl >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, fl, nb, sizeof(nb)))
+                                                    printf("[BUGCHECK]     subseg.Flink.Blink=0x%llX (should==0x%llX)%s\n", (unsigned long long)*(UINT64 *)&nb[0x08], (unsigned long long)subseg, (*(UINT64 *)&nb[0x08]!=subseg)?"  <== MISMATCH":"");
+                                                if (bl >= 0xFFFF800000000000ULL && kernelReadVA((unsigned char *)guestMemory, bcCr3, bl, nb, sizeof(nb)))
+                                                    printf("[BUGCHECK]     subseg.Blink.Flink=0x%llX (should==0x%llX)%s\n", (unsigned long long)*(UINT64 *)&nb[0x00], (unsigned long long)subseg, (*(UINT64 *)&nb[0x00]!=subseg)?"  <== MISMATCH":"");
+                                                printf("[BUGCHECK]     subseg raw 0x40 bytes:\n");
+                                                int rb; for (rb = 0; rb < 0x40; rb += 0x10)
+                                                    printf("[BUGCHECK]       +0x%02X: %016llX %016llX\n", rb, (unsigned long long)*(UINT64 *)&sb[rb], (unsigned long long)*(UINT64 *)&sb[rb+8]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            fflush(stdout);
+                        }
+                        // U21: one-shot per pass -- a bugcheck fires once and the
+                        // system halts; disarm DR1 immediately after the first hit
+                        // so a resume-flag re-fault at the entry instruction can't
+                        // spew thousands of identical duplicates. Re-armed on reset.
+                        WHV_REGISTER_NAME dr6ClearName4 = WHvX64RegisterDr6;
+                        WHV_REGISTER_VALUE dr6ClearVal4 = { 0 };
+                        WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName4, 1, &dr6ClearVal4);
+                        {
+                            WHV_REGISTER_NAME dr7ReadName4 = WHvX64RegisterDr7;
+                            WHV_REGISTER_VALUE dr7ReadVal4 = { 0 };
+                            WHvGetVirtualProcessorRegisters(partition, 0, &dr7ReadName4, 1, &dr7ReadVal4);
+                            dr7ReadVal4.Reg64 &= ~0x4ULL; // clear L1
+                            WHV_REGISTER_NAME dr7WriteName4 = WHvX64RegisterDr7;
+                            WHvSetVirtualProcessorRegisters(partition, 0, &dr7WriteName4, 1, &dr7ReadVal4);
+                            g_helperEntryArmed = 0;
+                        }
+                        break;
+                    }
+
+                    // DR2 (U28): RtlpHpLfhBucketGetSubsegment+0x45 -- rdx = the
+                    // subsegment ([rbx]) about to be handed to MoveSubsegment.
+                    // Registers read fine here. Validate rdx's LIST_ENTRY; the call
+                    // whose subsegment is ALREADY corrupt is the one that fastfails,
+                    // so this captures the victim VA + the corrupt values (which
+                    // fingerprint the stray writer). Throttled log; loud one-shot on
+                    // the corrupt one.
+                    if (wpRip == g_wpTargetVA && g_loopAdvArmed) {
+                        g_loopAdvHitCount++;
+                        // U30: at ExAllocateHeapPool after r10=*(*(rsp+0x58)). r10 =
+                        // the LFH heap-context. When it is null, ptrB=[rsp+0x58] is
+                        // the pointer whose target (the context slot) holds the null.
+                        // Capture ptrB, its RVA/identity, and 0x40 around it + around
+                        // the slot it points to -- pins the corrupted structure/field.
+                        WHV_REGISTER_NAME gnames[3] = { WHvX64RegisterR10, WHvX64RegisterCr3, WHvX64RegisterRsp };
+                        WHV_REGISTER_VALUE gvals[3] = { 0 };
+                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, gnames, 3, gvals))) {
+                            UINT64 ctx = gvals[0].Reg64, gCr3 = gvals[1].Reg64, gRsp = gvals[2].Reg64;
+                            if (g_loopAdvHitCount <= 8 || (g_loopAdvHitCount % 2000) == 0)
+                                printf("[EXHEAP] #%d exitCount=%ld: r10(context)=0x%llX\n", g_loopAdvHitCount, exitCount, (unsigned long long)ctx);
+                            if (ctx < 0xFFFF800000000000ULL) {
+                                unsigned char q8[8] = { 0 };
+                                UINT64 ptrB = 0;
+                                if (kernelReadVA((unsigned char *)guestMemory, gCr3, gRsp + 0x58, q8, 8)) ptrB = *(UINT64 *)q8;
+                                printf("\n[EXHEAP-NULLCTX] #%d exitCount=%ld: LFH context is NULL (r10=0x%llX). ptrB([rsp+0x58])=0x%llX\n",
+                                       g_loopAdvHitCount, exitCount, (unsigned long long)ctx, (unsigned long long)ptrB);
+                                UINT64 pcb = 0;
+                                if (ptrB >= 0xFFFF800000000000ULL) {
+                                    if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, gCr3, ptrB, &pcb)) printf("[EXHEAP-NULLCTX]   ptrB in module RVA 0x%llX (a global/.data ptr array)\n", (unsigned long long)(ptrB - pcb));
+                                    else printf("[EXHEAP-NULLCTX]   ptrB is a heap/pool pointer\n");
+                                    unsigned char raw[0x40] = { 0 };
+                                    if (kernelReadVA((unsigned char *)guestMemory, gCr3, ptrB, raw, sizeof(raw))) {
+                                        printf("[EXHEAP-NULLCTX]   *ptrB raw 0x40 (the context slot region -- offset 0 is the null ctx):\n");
+                                        int rr; for (rr = 0; rr < 0x40; rr += 0x10)
+                                            printf("[EXHEAP-NULLCTX]     +0x%02X: %016llX %016llX\n", rr, (unsigned long long)*(UINT64 *)&raw[rr], (unsigned long long)*(UINT64 *)&raw[rr+8]);
+                                    }
+                                }
+                                fflush(stdout);
+                                WHV_REGISTER_NAME dr7r5 = WHvX64RegisterDr7; WHV_REGISTER_VALUE dr7v5 = { 0 };
+                                WHvGetVirtualProcessorRegisters(partition, 0, &dr7r5, 1, &dr7v5);
+                                dr7v5.Reg64 &= ~0x10ULL;
+                                WHV_REGISTER_NAME dr7w5 = WHvX64RegisterDr7;
+                                WHvSetVirtualProcessorRegisters(partition, 0, &dr7w5, 1, &dr7v5);
+                                g_loopAdvArmed = 0;
+                            }
+                            fflush(stdout);
+                        }
+                        WHV_REGISTER_NAME dr6ClearName5 = WHvX64RegisterDr6;
+                        WHV_REGISTER_VALUE dr6ClearVal5 = { 0 };
+                        WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName5, 1, &dr6ClearVal5);
+                        break;
+                    }
+
+                    const char *wpLabel = NULL;
+                    int wpSlot = -1;
+
+                    if (wpSlot >= 0) {
+                        g_wpHitCount++;
+                        printf("\n[wp] ==== EXECUTION BREAKPOINT HIT #%d: %s (rip=0x%llX) exitCount=%ld ====\n",
+                               g_wpHitCount, wpLabel, (unsigned long long)wpRip, exitCount);
+
+                        WHV_REGISTER_NAME wpAllNames[19] = {
+                            WHvX64RegisterRax, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRbx,
+                            WHvX64RegisterRsp, WHvX64RegisterRbp, WHvX64RegisterRsi, WHvX64RegisterRdi,
+                            WHvX64RegisterR8,  WHvX64RegisterR9,  WHvX64RegisterR10, WHvX64RegisterR11,
+                            WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
+                            WHvX64RegisterRflags, WHvX64RegisterCr0, WHvX64RegisterCr3
+                        };
+                        WHV_REGISTER_VALUE wpAllVals[19] = { 0 };
+                        HRESULT wpHr = WHvGetVirtualProcessorRegisters(partition, 0, wpAllNames, 19, wpAllVals);
+                        if (SUCCEEDED(wpHr)) {
+                            static const char *wpNames2[19] = {
+                                "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                "r8","r9","r10","r11","r12","r13","r14","r15",
+                                "rflags","cr0","cr3"
+                            };
+                            int wni;
+                            for (wni = 0; wni < 19; wni++) {
+                                printf("  %-6s = 0x%016llX\n", wpNames2[wni], (unsigned long long)wpAllVals[wni].Reg64);
+                            }
+                            UINT64 wpCr3 = wpAllVals[18].Reg64;
+                            printf("  rip    = 0x%016llX\n", (unsigned long long)wpRip);
+
+                            if (wpSlot == 1) {
+                                // RIP is AT the function's own entry point,
+                                // not yet executed -- the standard x86 CALL
+                                // (direct, indirect, or table-based; all
+                                // three forms push identically) already put
+                                // the return address at [rsp+0x00]. That's
+                                // the caller, resolved below by the generic
+                                // stack scan.
+                                printf("[wp] caller (return address) should be at [rsp+0x00] below\n");
+                            }
+
+                            UINT64 wpRsp = wpAllVals[4].Reg64;
+                            unsigned char wpStackBuf[0x80] = { 0 };
+                            if (kernelReadVA((unsigned char *)guestMemory, wpCr3, wpRsp, wpStackBuf, sizeof(wpStackBuf))) {
+                                printf("[wp] scanning stack from rsp=0x%llX:\n", (unsigned long long)wpRsp);
+                                int wsi;
+                                for (wsi = 0; wsi < (int)sizeof(wpStackBuf); wsi += 8) {
+                                    UINT64 qv = *(UINT64 *)&wpStackBuf[wsi];
+                                    if (qv >= 0xFFFF800000000000ULL) {
+                                        UINT64 candBase3 = 0;
+                                        printf("  [rsp+0x%02X] = 0x%llX", wsi, (unsigned long long)qv);
+                                        if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, wpCr3, qv, &candBase3)) {
+                                            printf("    ^ module base 0x%llX RVA 0x%llX", (unsigned long long)candBase3, (unsigned long long)(qv - candBase3));
+                                        }
+                                        printf("\n");
+                                    }
+                                }
+                            }
+                        } else {
+                            printf("[wp] WHvGetVirtualProcessorRegisters failed: 0x%lx\n", wpHr);
+                        }
+                        printf("[wp] ==== end breakpoint report ====\n\n");
+                        fflush(stdout);
+
+                        // Disable ONLY this slot's DR7 L-bit (one-shot),
+                        // leaving the other still-armed sites untouched so
+                        // this single pass can go on to capture them too.
+                        WHV_REGISTER_NAME dr7ReadName = WHvX64RegisterDr7;
+                        WHV_REGISTER_VALUE dr7ReadVal = { 0 };
+                        WHvGetVirtualProcessorRegisters(partition, 0, &dr7ReadName, 1, &dr7ReadVal);
+                        UINT64 lbit = (wpSlot == 0) ? 0x1ULL : (wpSlot == 1) ? 0x4ULL : 0x10ULL;
+                        dr7ReadVal.Reg64 &= ~lbit;
+                        WHV_REGISTER_NAME clearNames[2] = { WHvX64RegisterDr7, WHvX64RegisterDr6 };
+                        WHV_REGISTER_VALUE clearVals[2] = { dr7ReadVal, { 0 } };
+                        WHvSetVirtualProcessorRegisters(partition, 0, clearNames, 2, clearVals);
+
+                        if (wpSlot == 0) g_wp0Fired = 1;
+                        else if (wpSlot == 1) g_wp1Fired = 1;
+                        else g_wp2Fired = 1;
+
+                        if (g_wp0Fired && g_wp1Fired && g_wp2Fired) {
+                            g_wpArmed = 0;
+                        }
+                        break;
+                    }
+
+                    // Spurious/unmatched #DB while armed (shouldn't happen
+                    // in practice -- each site is disabled the instant it
+                    // fires). Don't guess: just clear the sticky DR6
+                    // status bits and resume at the same RIP without
+                    // touching DR7, so whatever's still legitimately
+                    // armed keeps working.
+                    printf("[wp] unmatched #DB at rip=0x%llX while armed (wp0=%d wp1=%d wp2=%d) -- clearing DR6 and resuming\n",
+                           (unsigned long long)wpRip, g_wp0Fired, g_wp1Fired, g_wp2Fired);
+                    fflush(stdout);
+                    WHV_REGISTER_NAME dr6ClearName = WHvX64RegisterDr6;
+                    WHV_REGISTER_VALUE dr6ClearVal = { 0 };
+                    WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName, 1, &dr6ClearVal);
+                    break;
+                }
+
+                // Live breakpoint for the bugcheck-0x139 investigation --
+                // see the infrastructure block near the top of this file
+                // and docs/investigations/post-vppt-boot-stall.md.
+                // WHV reports VpContext.Rip for an exception exit as the
+                // breakpoint's OWN address (unlike raw x86 INT3 trap
+                // semantics, which would leave RIP one byte past it) --
+                // confirmed empirically: the first version of this check
+                // assumed +1 and rejected a genuine hit. Resuming at
+                // g_bpTargetVA (no adjustment) after restoring the byte
+                // is therefore already correct as written below.
+                UINT64 hitRip = exitContext.VpContext.Rip;
+                if (exitContext.VpException.ExceptionType != WHvX64ExceptionTypeBreakpointTrap ||
+                    !g_bpPatched || hitRip != g_bpTargetVA) {
+                    // Not our patched breakpoint. WHV apparently classifies
+                    // any software "int n" trap (not just genuine INT3) as
+                    // ExceptionType==BreakpointTrap -- confirmed live: the
+                    // guest's own genuine `int 0x29` fast-fail (a 2-byte
+                    // CD 29, not our 1-byte CC) exits here too. Treating
+                    // every non-matching hit as fatal would stop the whole
+                    // hypervisor on completely unrelated, legitimate traps
+                    // elsewhere in the kernel (CFG/WPP/other fast-fails).
+                    //
+                    // Attempted faithful re-injection first (set a pending
+                    // exception event for the real vector, read from the
+                    // instruction bytes) -- WHV rejected it with
+                    // InvalidVpRegisterValue (likely because #BP/INT-n are
+                    // software-generated traps that this generic
+                    // hardware-exception pending-event mechanism doesn't
+                    // cleanly support without an explicit instruction-length
+                    // field this struct doesn't expose). Fell back to the
+                    // simpler, pragmatic choice: just skip past the
+                    // instruction. Safe and standard for genuine INT3
+                    // (0xCC) -- that's exactly what a "no debugger
+                    // attached" system does with debug-check stubs anyway.
+                    // For other "int n" (0xCD xx, e.g. an unrelated
+                    // fast-fail elsewhere in the kernel), this means that
+                    // OTHER failure's own detail is lost rather than
+                    // properly reported -- an accepted, logged limitation,
+                    // not a silent one.
+                    unsigned char firstByte = exitContext.VpException.InstructionByteCount > 0
+                        ? exitContext.VpException.InstructionBytes[0] : 0xCC;
+                    UINT32 instrLen = (firstByte == 0xCD) ? 2 : 1;
+                    // Throttled (2026-07-17, ExInitializePoolHeapManagement
+                    // investigation): discovered live that some genuine,
+                    // unrelated INT3 in the guest fires extremely often
+                    // around early pass-2 boot (WPP/ETW-style tracepoint,
+                    // most likely) -- this print was previously
+                    // unconditional and, at that rate, the printf+fflush
+                    // cost alone consumed nearly all wall-clock time
+                    // (486,000+ log lines in a 240s run, guest barely
+                    // progressing), which looked exactly like a guest-side
+                    // stall until traced back to this. Same throttle
+                    // pattern used elsewhere in this file for other
+                    // high-frequency diagnostics.
+                    g_nonBpHitCount++;
+                    if (g_nonBpHitCount <= 20 || g_nonBpHitCount % 5000 == 0) {
+                        printf("[bp] non-breakpoint #BP-class exception at rip=0x%llX (first bytes: 0x%02X...) -- skipping instruction (%s) [count=%d]\n",
+                               (unsigned long long)hitRip, firstByte,
+                               (firstByte == 0xCD) ? "WARNING: this was an unrelated int-n, likely losing detail on a different failure" : "genuine INT3, safe to skip",
+                               g_nonBpHitCount);
+                        fflush(stdout);
+                    }
+
+                    WHV_REGISTER_NAME skipName = WHvX64RegisterRip;
+                    WHV_REGISTER_VALUE skipVal = { 0 };
+                    skipVal.Reg64 = hitRip + instrLen;
+                    WHvSetVirtualProcessorRegisters(partition, 0, &skipName, 1, &skipVal);
+                    break;
+                }
+
+                g_bpHitCount++;
+
+                // Phase1InitializationDiscard is expected to be hit at
+                // most once per boot pass (a genuine one-time system
+                // thread entry point on real Windows), so unlike the
+                // high-frequency sites used earlier this session, every
+                // hit gets a full report -- no throttling needed, and no
+                // pre-learned instruction bytes to emulate: just restore
+                // the original byte and let the real instruction execute
+                // normally on resume (simpler and always correct,
+                // regardless of what the real entry instruction turns out
+                // to be). Does NOT permanently disable #BP interception --
+                // g_bpPatched is cleared so discovery can re-arm fresh
+                // after the next reset, to check pass 2 the same way.
+                printf("\n[bp] ==== BREAKPOINT HIT #%d: Phase1InitializationDiscard ENTRY (RVA 0x%X) -- exitCount=%ld ====\n",
+                       g_bpHitCount, BP_FAIL_SITE_RVA, exitCount);
+
+                WHV_REGISTER_NAME pAllNames[19] = {
+                    WHvX64RegisterRax, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRbx,
+                    WHvX64RegisterRsp, WHvX64RegisterRbp, WHvX64RegisterRsi, WHvX64RegisterRdi,
+                    WHvX64RegisterR8,  WHvX64RegisterR9,  WHvX64RegisterR10, WHvX64RegisterR11,
+                    WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
+                    WHvX64RegisterRflags, WHvX64RegisterCr0, WHvX64RegisterCr3
+                };
+                WHV_REGISTER_VALUE pAllVals[19] = { 0 };
+                HRESULT pHr = WHvGetVirtualProcessorRegisters(partition, 0, pAllNames, 19, pAllVals);
+                if (SUCCEEDED(pHr)) {
+                    static const char *pNames[19] = {
+                        "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                        "r8","r9","r10","r11","r12","r13","r14","r15",
+                        "rflags","cr0","cr3"
+                    };
+                    int pni;
+                    for (pni = 0; pni < 19; pni++) {
+                        printf("  %-6s = 0x%016llX\n", pNames[pni], (unsigned long long)pAllVals[pni].Reg64);
+                    }
+                    UINT64 pCr3 = pAllVals[18].Reg64;
+
+                    UINT64 pRsp = pAllVals[4].Reg64;
+                    unsigned char pStackBuf[0x80] = { 0 };
+                    if (kernelReadVA((unsigned char *)guestMemory, pCr3, pRsp, pStackBuf, sizeof(pStackBuf))) {
+                        printf("[bp] scanning stack from rsp=0x%llX:\n", (unsigned long long)pRsp);
+                        int psi;
+                        for (psi = 0; psi < (int)sizeof(pStackBuf); psi += 8) {
+                            UINT64 qv = *(UINT64 *)&pStackBuf[psi];
+                            if (qv >= 0xFFFF800000000000ULL) {
+                                UINT64 candBase4 = 0;
+                                printf("  [rsp+0x%02X] = 0x%llX", psi, (unsigned long long)qv);
+                                if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, pCr3, qv, &candBase4)) {
+                                    printf("    ^ module base 0x%llX RVA 0x%llX", (unsigned long long)candBase4, (unsigned long long)(qv - candBase4));
+                                }
+                                printf("\n");
+                            }
+                        }
+                    }
+                } else {
+                    printf("[bp] WHvGetVirtualProcessorRegisters failed: 0x%lx\n", pHr);
+                }
+                printf("[bp] ==== end breakpoint report ====\n\n");
+                fflush(stdout);
+
+                if (guestMemory && kernelWriteByteVA((unsigned char *)guestMemory, g_bpCr3, g_bpTargetVA, g_bpOriginalByte)) {
+                    g_bpPatched = 0; // allow re-arm on the next reset, for pass 2
+                }
+                {
+                    WHV_REGISTER_NAME ripBackName2 = WHvX64RegisterRip;
+                    WHV_REGISTER_VALUE ripBackVal2 = { 0 };
+                    ripBackVal2.Reg64 = g_bpTargetVA;
+                    WHvSetVirtualProcessorRegisters(partition, 0, &ripBackName2, 1, &ripBackVal2);
+                }
+                break;
+            }
+
+            default:
+                printf("\n[Unhandled exit reason: %d -- stopping]\n", exitContext.ExitReason);
+                running = 0;
+                break;
+        }
+    }
+
+    if (ataDiskFile) fclose(ataDiskFile);
+    VirtualFree(guestMemory, 0, MEM_RELEASE);
+    if (hmaMemory) VirtualFree(hmaMemory, 0, MEM_RELEASE);
+    if (uefiFirmwareMemory) VirtualFree(uefiFirmwareMemory, 0, MEM_RELEASE);
+    WHvDeletePartition(partition);
+    return 0;
+}

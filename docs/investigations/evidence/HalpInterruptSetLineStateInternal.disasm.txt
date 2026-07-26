@@ -1,0 +1,353 @@
+﻿0x378C7C:	mov	qword ptr [rsp + 8], rbx
+0x378C81:	mov	qword ptr [rsp + 0x10], rdi
+0x378C86:	pushfq	
+0x378C88:	sub	rsp, 0x20
+0x378C8C:	mov	r10d, dword ptr [r8 + 0xc]
+0x378C90:	mov	edi, 0x200
+0x378C95:	mov	r9d, r10d
+0x378C98:	mov	eax, r10d
+0x378C9B:	and	eax, 0xfffffffe
+0x378C9E:	or	r10d, 1
+0x378CA2:	and	r9b, 0x30
+0x378CA6:	mov	rbx, rcx
+0x378CA9:	cmp	r9b, 0x10
+0x378CAD:	cmovne	r10d, eax
+0x378CB1:	mov	dword ptr [r8 + 0xc], r10d
+0x378CB5:	test	dword ptr [rcx + 0xdc], edi
+0x378CBB:	jne	0x10494610
+0x378CC1:	mov	rax, qword ptr [rcx + 0x70]
+0x378CC5:	mov	rcx, qword ptr [rcx + 0x10]
+0x378CC9:	call	0x10407b40    ; RVA 0x407B40 guard_dispatch_icall
+0x378CCE:	test	eax, eax
+0x378CD0:	js	0x1049462e
+0x378CD6:	mov	rbx, qword ptr [rsp + 0x30]
+0x378CDB:	mov	rdi, qword ptr [rsp + 0x38]
+0x378CE0:	add	rsp, 0x20
+0x378CE4:	pop	rcx
+0x378CE5:	ret	
+0x378CE6:	int3	
+0x378CE7:	int3	
+0x378CE8:	int3	
+0x378CE9:	int3	
+0x378CEA:	int3	
+0x378CEB:	int3	
+0x378CEC:	int3	
+0x378CED:	int3	
+0x378CEE:	int3	
+0x378CEF:	int3	
+0x378CF0:	mov	qword ptr [rsp + 8], rbx
+0x378CF5:	mov	qword ptr [rsp + 0x10], rdx
+0x378CFA:	push	rdi
+0x378CFB:	sub	rsp, 0x20
+0x378CFF:	mov	ecx, dword ptr [rcx]
+0x378D01:	mov	r10, r8
+0x378D04:	mov	r9, rdx
+0x378D07:	call	0x10378dd0    ; RVA 0x378DD0 HalpInterruptLookupController
+0x378D0C:	xor	ecx, ecx
+0x378D0E:	test	rax, rax
+0x378D11:	je	0x10378d57
+0x378D13:	lea	r8, [rax + 0x100]
+0x378D1A:	mov	ebx, ecx
+0x378D1C:	mov	r11, qword ptr [r8]
+0x378D1F:	mov	rdx, r11
+0x378D22:	cmp	r11, r8
+0x378D25:	je	0x10378d3d
+0x378D27:	mov	edi, dword ptr [rsp + 0x3c]
+0x378D2B:	inc	ebx
+0x378D2D:	cmp	dword ptr [rdx + 0x10], r9d
+0x378D31:	jne	0x10378d5e
+0x378D33:	cmp	dword ptr [rdx + 0x14], edi
+0x378D36:	jg	0x10378d5e
+0x378D38:	cmp	dword ptr [rdx + 0x18], edi
+0x378D3B:	jle	0x10378d5e
+0x378D3D:	cmp	rdx, r8
+0x378D40:	je	0x10494662
+0x378D46:	mov	qword ptr [r10], r9
+0x378D49:	mov	rbx, qword ptr [rsp + 0x30]
+0x378D4E:	mov	eax, ecx
+0x378D50:	add	rsp, 0x20
+0x378D54:	pop	rdi
+0x378D55:	ret	
+0x378D56:	int3	
+0x378D57:	mov	ecx, 0xc000000d
+0x378D5C:	jmp	0x10378d49    ; RVA 0x378D49 HalpInterruptFindBestRouting+0x59
+0x378D5E:	mov	rdx, qword ptr [rdx]
+0x378D61:	cmp	rdx, r8
+0x378D64:	jne	0x10378d2b
+0x378D66:	jmp	0x10378d3d    ; RVA 0x378D3D HalpInterruptFindBestRouting+0x4D
+0x378D68:	int3	
+0x378D69:	int3	
+0x378D6A:	int3	
+0x378D6B:	int3	
+0x378D6C:	int3	
+0x378D6D:	int3	
+0x378D6E:	int3	
+0x378D6F:	int3	
+0x378D70:	sub	rsp, 0x28
+0x378D74:	mov	r10, rcx
+0x378D77:	mov	r11, rdx
+0x378D7A:	mov	ecx, dword ptr [rcx]
+0x378D7C:	call	0x10378dd0    ; RVA 0x378DD0 HalpInterruptLookupController
+0x378D81:	test	rax, rax
+0x378D84:	je	0x10378db0
+0x378D86:	lea	r9, [rax + 0xf0]
+0x378D8D:	mov	r8, qword ptr [r9]
+0x378D90:	cmp	r8, r9
+0x378D93:	je	0x10378db0
+0x378D95:	mov	eax, dword ptr [r10 + 4]
+0x378D99:	mov	rcx, r8
+0x378D9C:	mov	r8, qword ptr [r8]
+0x378D9F:	mov	edx, dword ptr [rcx + 0x14]
+0x378DA2:	cmp	edx, eax
+0x378DA4:	jg	0x10378dab
+0x378DA6:	cmp	dword ptr [rcx + 0x18], eax
+0x378DA9:	jg	0x10378db4
+0x378DAB:	cmp	r8, r9
+0x378DAE:	jne	0x10378d99
+0x378DB0:	xor	eax, eax
+0x378DB2:	jmp	0x10378dc1    ; RVA 0x378DC1 HalpInterruptFindLines+0x51
+0x378DB4:	test	r11, r11
+0x378DB7:	je	0x10378dbe
+0x378DB9:	sub	eax, edx
+0x378DBB:	mov	dword ptr [r11], eax
+0x378DBE:	mov	rax, rcx
+0x378DC1:	add	rsp, 0x28
+0x378DC5:	ret	
+0x378DC6:	int3	
+0x378DC7:	int3	
+0x378DC8:	int3	
+0x378DC9:	int3	
+0x378DCA:	int3	
+0x378DCB:	int3	
+0x378DCC:	int3	
+0x378DCD:	int3	
+0x378DCE:	int3	
+0x378DCF:	int3	
+0x378DD0:	mov	rax, qword ptr [rip + 0x8d2b39]
+0x378DD7:	lea	r8, [rip + 0x8d2b32]
+0x378DDE:	cmp	rax, r8
+0x378DE1:	je	0x10378df6
+0x378DE3:	mov	rdx, rax
+0x378DE6:	mov	rax, qword ptr [rax]
+0x378DE9:	cmp	dword ptr [rdx + 0xe8], ecx
+0x378DEF:	jne	0x10378dde
+0x378DF1:	mov	rax, rdx
+0x378DF4:	ret	
+0x378DF5:	int3	
+0x378DF6:	xor	eax, eax
+0x378DF8:	ret	
+0x378DF9:	int3	
+0x378DFA:	int3	
+0x378DFB:	int3	
+0x378DFC:	int3	
+0x378DFD:	int3	
+0x378DFE:	int3	
+0x378DFF:	int3	
+0x378E00:	mov	rax, rsp
+0x378E03:	mov	qword ptr [rax + 0x10], rbx
+0x378E07:	mov	qword ptr [rax + 0x18], rbp
+0x378E0B:	mov	qword ptr [rax + 0x20], rsi
+0x378E0F:	mov	qword ptr [rax + 8], rcx
+0x378E13:	push	rdi
+0x378E14:	sub	rsp, 0x20
+0x378E18:	xor	edi, edi
+0x378E1A:	mov	rbx, r8
+0x378E1D:	mov	dword ptr [r8], edi
+0x378E20:	mov	ecx, dword ptr [rdx]
+0x378E22:	sub	ecx, 1
+0x378E25:	jne	0x10378e99
+0x378E27:	mov	rax, qword ptr [rdx + 8]
+0x378E2B:	mov	sil, dil
+0x378E2E:	mov	dword ptr [rsp + 0x30], edi
+0x378E32:	mov	byte ptr [rsp + 0x32], dil
+0x378E37:	mov	rbp, qword ptr [rax]
+0x378E3A:	movzx	eax, word ptr [rax + 8]
+0x378E3E:	mov	word ptr [rsp + 0x30], ax
+0x378E43:	test	rbp, rbp
+0x378E46:	je	0x10378eb3
+0x378E48:	movzx	eax, sil
+0x378E4C:	bt	rbp, rax
+0x378E50:	jae	0x10378e8f
+0x378E52:	movzx	eax, sil
+0x378E56:	lea	rcx, [rsp + 0x30]
+0x378E5B:	btr	rbp, rax
+0x378E5F:	call	0x10215e70    ; RVA 0x215E70 KeGetProcessorIndexFromNumber
+0x378E64:	mov	rdx, qword ptr [rip + 0x8d7885]
+0x378E6B:	mov	eax, eax
+0x378E6D:	lea	rcx, [rax + rax*2]
+0x378E71:	mov	eax, dword ptr [rdx + rcx*8]
+0x378E74:	cmp	eax, 4
+0x378E77:	je	0x10378ee6
+0x378E79:	cmp	eax, 5
+0x378E7C:	jne	0x104946e6
+0x378E82:	cmp	dword ptr [rbx], eax
+0x378E84:	je	0x10378ecb
+0x378E86:	mov	dword ptr [rbx], eax
+0x378E88:	mov	eax, dword ptr [rdx + rcx*8 + 8]
+0x378E8C:	mov	dword ptr [rbx + 8], eax
+0x378E8F:	inc	sil
+0x378E92:	mov	byte ptr [rsp + 0x32], sil
+0x378E97:	jmp	0x10378e43    ; RVA 0x378E43 HalpInterruptDestinationToTarget+0x43
+0x378E99:	sub	ecx, 2
+0x378E9C:	je	0x10378edd
+0x378E9E:	sub	ecx, 1
+0x378EA1:	je	0x10378ed4
+0x378EA3:	sub	ecx, 1
+0x378EA6:	jne	0x104946b0
+0x378EAC:	mov	dword ptr [r8], 3
+0x378EB3:	mov	rbx, qword ptr [rsp + 0x38]
+0x378EB8:	mov	eax, edi
+0x378EBA:	mov	rbp, qword ptr [rsp + 0x40]
+0x378EBF:	mov	rsi, qword ptr [rsp + 0x48]
+0x378EC4:	add	rsp, 0x20
+0x378EC8:	pop	rdi
+0x378EC9:	ret	
+0x378ECA:	int3	
+0x378ECB:	mov	eax, dword ptr [rdx + rcx*8 + 8]
+0x378ECF:	or	dword ptr [rbx + 8], eax
+0x378ED2:	jmp	0x10378e8f    ; RVA 0x378E8F HalpInterruptDestinationToTarget+0x8F
+0x378ED4:	mov	dword ptr [r8], 2
+0x378EDB:	jmp	0x10378eb3    ; RVA 0x378EB3 HalpInterruptDestinationToTarget+0xB3
+0x378EDD:	mov	dword ptr [r8], 1
+0x378EE4:	jmp	0x10378eb3    ; RVA 0x378EB3 HalpInterruptDestinationToTarget+0xB3
+0x378EE6:	mov	dword ptr [rbx], 4
+0x378EEC:	jmp	0x10378e88    ; RVA 0x378E88 HalpInterruptDestinationToTarget+0x88
+0x378EEE:	int3	
+0x378EEF:	int3	
+0x378EF0:	int3	
+0x378EF1:	int3	
+0x378EF2:	int3	
+0x378EF3:	int3	
+0x378EF4:	mov	qword ptr [rsp + 8], rbx
+0x378EF9:	mov	qword ptr [rsp + 0x10], rsi
+0x378EFE:	mov	qword ptr [rsp + 0x18], rdi
+0x378F03:	push	r14
+0x378F05:	sub	rsp, 0x20
+0x378F09:	mov	rbx, rcx
+0x378F0C:	mov	rsi, r8
+0x378F0F:	lea	rcx, [rip + 0x8d07c2]
+0x378F16:	mov	r14, rdx
+0x378F19:	xor	dil, dil
+0x378F1C:	call	0x10378ff0    ; RVA 0x378FF0 HalpAcquireHighLevelLock
+0x378F21:	mov	r9, qword ptr [rip + 0x8d0798]
+0x378F28:	lea	r10, [rip + 0x8d0791]
+0x378F2F:	mov	r8b, al
+0x378F32:	cmp	r9, r10
+0x378F35:	je	0x10378f72
+0x378F37:	mov	edx, dword ptr [rbx]
+0x378F39:	lea	rcx, [r9]
+0x378F3C:	mov	r9, qword ptr [r9]
+0x378F3F:	cmp	dword ptr [rcx + 0x10], edx
+0x378F42:	jne	0x10378f4c
+0x378F44:	mov	eax, dword ptr [rbx + 4]
+0x378F47:	cmp	dword ptr [rcx + 0x14], eax
+0x378F4A:	je	0x10378f53
+0x378F4C:	cmp	r9, r10
+0x378F4F:	je	0x10378f72
+0x378F51:	jmp	0x10378f39    ; RVA 0x378F39 HalpInterruptApplyOverrides+0x45
+0x378F53:	mov	rax, qword ptr [rcx + 0x18]
+0x378F57:	mov	qword ptr [rbx], rax
+0x378F5A:	test	r14, r14
+0x378F5D:	je	0x10378f65
+0x378F5F:	mov	eax, dword ptr [rcx + 0x24]
+0x378F62:	mov	dword ptr [r14], eax
+0x378F65:	test	rsi, rsi
+0x378F68:	je	0x10378f6f
+0x378F6A:	mov	eax, dword ptr [rcx + 0x20]
+0x378F6D:	mov	dword ptr [rsi], eax
+0x378F6F:	mov	dil, 1
+0x378F72:	mov	dl, r8b
+0x378F75:	lea	rcx, [rip + 0x8d075c]
+0x378F7C:	call	0x104d0d3c    ; RVA 0x4D0D3C HalpReleaseHighLevelLock
+0x378F81:	test	dil, dil
+0x378F84:	jne	0x10378fd1
+0x378F86:	mov	rax, qword ptr [rip + 0x8d776b]
+0x378F8D:	cmp	dword ptr [rax + 0xd8], 2
+0x378F94:	jne	0x10378fd1
+0x378F96:	mov	ecx, dword ptr [rbx]
+0x378F98:	lea	eax, [rcx - 0xb000]
+0x378F9E:	cmp	eax, 1
+0x378FA1:	ja	0x10378fd1
+0x378FA3:	mov	eax, dword ptr [rbx + 4]
+0x378FA6:	cmp	ecx, 0xb001
+0x378FAC:	lea	edi, [rax + 8]
+0x378FAF:	cmovne	edi, eax
+0x378FB2:	mov	ecx, edi
+0x378FB4:	lea	edx, [rdi + 1]
+0x378FB7:	call	0x10379078    ; RVA 0x379078 HalpInterruptFindLinesForGsiRange
+0x378FBC:	test	rax, rax
+0x378FBF:	je	0x10378fd1
+0x378FC1:	mov	edx, dword ptr [rax + 0x14]
+0x378FC4:	sub	edx, dword ptr [rax + 0x1c]
+0x378FC7:	add	edx, edi
+0x378FC9:	mov	dword ptr [rbx + 4], edx
+0x378FCC:	mov	eax, dword ptr [rax + 0x10]
+0x378FCF:	mov	dword ptr [rbx], eax
+0x378FD1:	mov	rbx, qword ptr [rsp + 0x30]
+0x378FD6:	mov	rsi, qword ptr [rsp + 0x38]
+0x378FDB:	mov	rdi, qword ptr [rsp + 0x40]
+0x378FE0:	add	rsp, 0x20
+0x378FE4:	pop	r14
+0x378FE6:	ret	
+0x378FE7:	int3	
+0x378FE8:	int3	
+0x378FE9:	int3	
+0x378FEA:	int3	
+0x378FEB:	int3	
+0x378FEC:	int3	
+0x378FED:	int3	
+0x378FEE:	int3	
+0x378FEF:	int3	
+0x378FF0:	push	rbx
+0x378FF2:	sub	rsp, 0x20
+0x378FF6:	mov	r10, rcx
+0x378FF9:	mov	rbx, cr8
+0x378FFD:	mov	ecx, 0xf
+0x379002:	mov	cr8, rcx
+0x379006:	mov	eax, dword ptr [rip + 0x983654]
+0x37900C:	test	eax, eax
+0x37900E:	jne	0x10494728
+0x379014:	mov	rcx, r10
+0x379017:	call	0x10242ff0    ; RVA 0x242FF0 KeAcquireSpinLockAtDpcLevel
+0x37901C:	mov	al, bl
+0x37901E:	add	rsp, 0x20
+0x379022:	pop	rbx
+0x379023:	ret	
+0x379024:	int3	
+0x379025:	int3	
+0x379026:	int3	
+0x379027:	int3	
+0x379028:	int3	
+0x379029:	int3	
+0x37902A:	int3	
+0x37902B:	int3	
+0x37902C:	mov	qword ptr [rsp + 8], rbx
+0x379031:	push	rdi
+0x379032:	sub	rsp, 0x20
+0x379036:	mov	rdi, rdx
+0x379039:	mov	ebx, ecx
+0x37903B:	lea	edx, [rcx + 1]
+0x37903E:	call	0x10379078    ; RVA 0x379078 HalpInterruptFindLinesForGsiRange
+0x379043:	mov	r8, rax
+0x379046:	test	rax, rax
+0x379049:	je	0x1037906b
+0x37904B:	mov	eax, dword ptr [rax + 0x10]
+0x37904E:	mov	dword ptr [rdi], eax
+0x379050:	mov	ecx, dword ptr [r8 + 0x14]
+0x379054:	sub	ecx, dword ptr [r8 + 0x1c]
+0x379058:	add	ecx, ebx
+0x37905A:	mov	dword ptr [rdi + 4], ecx
+0x37905D:	xor	eax, eax
+0x37905F:	mov	rbx, qword ptr [rsp + 0x30]
+0x379064:	add	rsp, 0x20
+0x379068:	pop	rdi
+0x379069:	ret	
+0x37906A:	int3	
+0x37906B:	mov	eax, 0xc0000225
+0x379070:	jmp	0x1037905f    ; RVA 0x37905F HalpInterruptGsiToLine+0x33
+0x379072:	int3	
+0x379073:	int3	
+0x379074:	int3	
+0x379075:	int3	
+0x379076:	int3	
+0x379077:	int3	

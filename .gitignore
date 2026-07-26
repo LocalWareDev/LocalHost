@@ -1,0 +1,26 @@
+# VM disk images — multi-GB, never version-controlled (also excluded from SD sync)
+*.vhd
+*.vhdx
+*.iso
+
+# MSVC build artifacts
+*.exe
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
+
+# Investigation scratch: small raw function/memory dumps (keep the real firmware)
+*.bin
+!bios.bin
+
+# Python / PyInstaller build outputs
+__pycache__/
+*.pyc
+build/
+dist/
+
+# OS / editor cruft
+Thumbs.db
+Desktop.ini

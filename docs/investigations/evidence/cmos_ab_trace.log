@@ -1,0 +1,870 @@
+[net] backend initialized
+Detected Fixed VHD footer -- excluding it from disk geometry
+Attached disk win10_installer.vhd (16777216 sectors of 512 bytes)
+[cpuid] measured host TSC frequency: 1896006700 Hz
+Loaded 4194304 bytes of UEFI firmware C:\Users\DELL\Downloads\RELEASEX64_OVMF.fd
+Mapped UEFI firmware at 0xFFC00000-0xFFFFFFFF, entering run loop
+[kd] named pipe \\.\pipe\LocalHostKD ready -- attach WinDbg with -k com:pipe,port=\\.\pipe\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)
+[kd-reader] outer loop #1: calling ConnectNamedPipe
+[pcicfg #1] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #2] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x0 cfg=present
+[pcicfg #3] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0x0 cfg=present
+[pcicfg #4] bus=0 dev=1 func=3 off=0x40 size=4 write=1 val=0xB000 cfg=present
+[pcicfg #5] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x0 cfg=present
+[pcicfg #6] bus=0 dev=1 func=3 off=0x80 size=1 write=1 val=0x1 cfg=present
+[pcicfg #7] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #8] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #9] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #10] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #11] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #12] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #13] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #14] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #15] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #16] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #17] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #18] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #1: selector=0x0
+[fwcfg] read #1: selector=0x0 offset=0 dataLen=4 stringOp=1 rep=1
+[fwcfg] select #2: selector=0x1
+[fwcfg] read #2: selector=0x1 offset=0 dataLen=4 stringOp=1 rep=1
+[fwcfg] select #3: selector=0x19
+[fwcfg] read #3: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #4: selector=0x19
+[fwcfg] read #4: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #5: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #6: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #7: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #8: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #9: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #10: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #11: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #12: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #13: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #14: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #15: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #16: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #17: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #18: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #19: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #20: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #5: selector=0x19
+[fwcfg] read #21: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #22: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #23: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #24: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #25: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #26: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #27: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #28: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #29: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #30: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #31: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #32: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #33: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #34: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #35: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #36: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #37: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #6: selector=0x19
+[fwcfg] read #38: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #39: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #40: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #41: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #42: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #43: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #44: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #45: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #46: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #47: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #48: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #49: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #50: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #51: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #52: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #53: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #54: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #7: selector=0x19
+[fwcfg] read #55: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #56: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #57: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #58: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #59: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #60: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #8: selector=0x19
+[fwcfg] select #9: selector=0x19
+[fwcfg] select #10: selector=0x19
+[fwcfg] select #11: selector=0x0
+[fwcfg] select #12: selector=0x1
+[fwcfg] select #13: selector=0x19
+[fwcfg] select #14: selector=0xE
+[pcicfg #19] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[fwcfg] select #15: selector=0x5
+[pcicfg #20] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #21] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #22] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #23] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #24] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #25] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #26] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #27] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #28] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #29] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #30] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #31] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #32] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[heartbeat: exitCount=5000 elapsedSec=0.0 lastPort=0xB008 write=0 val=0x2]
+[pcicfg #33] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #34] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #35] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #36] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #37] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #38] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #39] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #40] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #41] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[heartbeat: exitCount=10000 elapsedSec=0.1 lastPort=0xB008 write=0 val=0x2]
+[pcicfg #42] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #43] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #44] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #45] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #46] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #47] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #48] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #49] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #16: selector=0x23
+[ramfb] configured: address=0xBE500000 800x600 stride=3200
+[pcicfg #50] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #51] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[cmos-ab] write reg=0x0A value=0x26 (RegA=0x26 RegB=0x06, PIE=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x26 RegB=0x02, PIE=0)
+[cmos-ab] write reg=0x0B value=0x82 (RegA=0x26 RegB=0x82, PIE=0)
+[cmos-ab] write reg=0x0A value=0x76 (RegA=0x76 RegB=0x82, PIE=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x76 RegB=0x02, PIE=0)
+[cmos-ab] write reg=0x0A value=0x26 (RegA=0x26 RegB=0x02, PIE=0)
+[pcicfg #52] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #17: selector=0x17
+[fwcfg] select #18: selector=0x8
+[fwcfg] select #19: selector=0xB
+[fwcfg] select #20: selector=0x14
+[pcicfg #53] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #54] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #55] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #56] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #57] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #58] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #59] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #60] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #61] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #62] bus=0 dev=0 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #63] bus=0 dev=0 func=0 off=0x08 size=4 write=0 val=0x6000002 cfg=present
+[pcicfg #64] bus=0 dev=0 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #65] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #66] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #67] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #68] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #69] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #70] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #71] bus=0 dev=0 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #72] bus=0 dev=0 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #73] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #74] bus=0 dev=0 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #75] bus=0 dev=0 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #76] bus=0 dev=0 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #77] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #78] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #79] bus=0 dev=1 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #80] bus=0 dev=1 func=0 off=0x08 size=4 write=0 val=0x6010000 cfg=present
+[pcicfg #81] bus=0 dev=1 func=0 off=0x0C size=4 write=0 val=0x800000 cfg=present
+[pcicfg #82] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #83] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #84] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #85] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #86] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #87] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #88] bus=0 dev=1 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #89] bus=0 dev=1 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #90] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #91] bus=0 dev=1 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #92] bus=0 dev=1 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #93] bus=0 dev=1 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #94] bus=0 dev=1 func=1 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #95] bus=0 dev=1 func=2 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #96] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #97] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #98] bus=0 dev=1 func=3 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #99] bus=0 dev=1 func=3 off=0x08 size=4 write=0 val=0x6800000 cfg=present
+[pcicfg #100] bus=0 dev=1 func=3 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #101] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #102] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #103] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #104] bus=0 dev=1 func=3 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #105] bus=0 dev=1 func=3 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #106] bus=0 dev=1 func=3 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #107] bus=0 dev=1 func=3 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #108] bus=0 dev=1 func=3 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #109] bus=0 dev=1 func=3 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #110] bus=0 dev=1 func=3 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #111] bus=0 dev=1 func=3 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #112] bus=0 dev=1 func=3 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #113] bus=0 dev=1 func=4 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #114] bus=0 dev=1 func=5 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #115] bus=0 dev=1 func=6 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #116] bus=0 dev=1 func=7 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #117] bus=0 dev=2 func=0 off=0x00 size=4 write=0 val=0x29228086 cfg=present
+[pcicfg #118] bus=0 dev=2 func=0 off=0x00 size=4 write=0 val=0x29228086 cfg=present
+[pcicfg #119] bus=0 dev=2 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #120] bus=0 dev=2 func=0 off=0x08 size=4 write=0 val=0x1060102 cfg=present
+[pcicfg #121] bus=0 dev=2 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #122] bus=0 dev=2 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #123] bus=0 dev=2 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #124] bus=0 dev=2 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #125] bus=0 dev=2 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #126] bus=0 dev=2 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #127] bus=0 dev=2 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #128] bus=0 dev=2 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #129] bus=0 dev=2 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #130] bus=0 dev=2 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #131] bus=0 dev=2 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #132] bus=0 dev=2 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #133] bus=0 dev=2 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #134] bus=0 dev=3 func=0 off=0x00 size=4 write=0 val=0x813910EC cfg=present
+[pcicfg #135] bus=0 dev=3 func=0 off=0x00 size=4 write=0 val=0x813910EC cfg=present
+[pcicfg #136] bus=0 dev=3 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #137] bus=0 dev=3 func=0 off=0x08 size=4 write=0 val=0x2000010 cfg=present
+[pcicfg #138] bus=0 dev=3 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #139] bus=0 dev=3 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #140] bus=0 dev=3 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #141] bus=0 dev=3 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #142] bus=0 dev=3 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #143] bus=0 dev=3 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #144] bus=0 dev=3 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #145] bus=0 dev=3 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #146] bus=0 dev=3 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #147] bus=0 dev=3 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #148] bus=0 dev=3 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #149] bus=0 dev=3 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #150] bus=0 dev=3 func=0 off=0x3C size=4 write=0 val=0x100 cfg=present
+[pcicfg #151] bus=0 dev=4 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #152] bus=0 dev=5 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #153] bus=0 dev=6 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #154] bus=0 dev=7 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #155] bus=0 dev=8 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #156] bus=0 dev=9 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #157] bus=0 dev=10 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #158] bus=0 dev=11 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #159] bus=0 dev=12 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #160] bus=0 dev=13 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #161] bus=0 dev=14 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #162] bus=0 dev=15 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #163] bus=0 dev=16 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #164] bus=0 dev=17 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #165] bus=0 dev=18 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #166] bus=0 dev=19 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #167] bus=0 dev=20 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #168] bus=0 dev=21 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #169] bus=0 dev=22 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #170] bus=0 dev=23 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #171] bus=0 dev=24 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #172] bus=0 dev=25 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #173] bus=0 dev=26 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #174] bus=0 dev=27 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #175] bus=0 dev=28 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #176] bus=0 dev=29 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #177] bus=0 dev=30 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #178] bus=0 dev=31 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #179] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #180] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #181] bus=0 dev=0 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #182] bus=0 dev=0 func=0 off=0x08 size=4 write=0 val=0x6000002 cfg=present
+[pcicfg #183] bus=0 dev=0 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #184] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #185] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #186] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #187] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #188] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #189] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #190] bus=0 dev=0 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #191] bus=0 dev=0 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #192] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #193] bus=0 dev=0 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #194] bus=0 dev=0 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #195] bus=0 dev=0 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #196] bus=0 dev=0 func=0 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #197] bus=0 dev=0 func=0 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #198] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #199] bus=0 dev=0 func=0 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #200] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #201] bus=0 dev=0 func=0 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #202] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #203] bus=0 dev=0 func=0 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #204] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #205] bus=0 dev=0 func=0 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #206] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #207] bus=0 dev=0 func=0 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #208] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #209] bus=0 dev=0 func=0 off=0x18 size=4 write=1 val=0x0 cfg=present
+[pcicfg #210] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #211] bus=0 dev=0 func=0 off=0x1C size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #212] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #213] bus=0 dev=0 func=0 off=0x1C size=4 write=1 val=0x0 cfg=present
+[pcicfg #214] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #215] bus=0 dev=0 func=0 off=0x20 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #216] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #217] bus=0 dev=0 func=0 off=0x20 size=4 write=1 val=0x0 cfg=present
+[pcicfg #218] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #219] bus=0 dev=0 func=0 off=0x24 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #220] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #221] bus=0 dev=0 func=0 off=0x24 size=4 write=1 val=0x0 cfg=present
+[pcicfg #222] bus=0 dev=0 func=0 off=0x30 size=4 write=1 val=0xFFFFFFFE cfg=present
+[pcicfg #223] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #224] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #225] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #226] bus=0 dev=1 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #227] bus=0 dev=1 func=0 off=0x08 size=4 write=0 val=0x6010000 cfg=present
+[pcicfg #228] bus=0 dev=1 func=0 off=0x0C size=4 write=0 val=0x800000 cfg=present
+[pcicfg #229] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #230] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #231] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #232] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #233] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #234] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #235] bus=0 dev=1 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #236] bus=0 dev=1 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #237] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #238] bus=0 dev=1 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #239] bus=0 dev=1 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #240] bus=0 dev=1 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #241] bus=0 dev=1 func=0 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #242] bus=0 dev=1 func=0 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #243] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #244] bus=0 dev=1 func=0 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #245] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #246] bus=0 dev=1 func=0 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #247] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #248] bus=0 dev=1 func=0 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #249] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #250] bus=0 dev=1 func=0 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #251] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #252] bus=0 dev=1 func=0 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #253] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #254] bus=0 dev=1 func=0 off=0x18 size=4 write=1 val=0x0 cfg=present
+[pcicfg #255] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #256] bus=0 dev=1 func=0 off=0x1C size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #257] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #258] bus=0 dev=1 func=0 off=0x1C size=4 write=1 val=0x0 cfg=present
+[pcicfg #259] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #260] bus=0 dev=1 func=0 off=0x20 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #261] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #262] bus=0 dev=1 func=0 off=0x20 size=4 write=1 val=0x0 cfg=present
+[pcicfg #263] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #264] bus=0 dev=1 func=0 off=0x24 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #265] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #266] bus=0 dev=1 func=0 off=0x24 size=4 write=1 val=0x0 cfg=present
+[pcicfg #267] bus=0 dev=1 func=0 off=0x30 size=4 write=1 val=0xFFFFFFFE cfg=present
+[pcicfg #268] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #269] bus=0 dev=1 func=1 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #270] bus=0 dev=1 func=2 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #271] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #272] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #273] bus=0 dev=1 func=3 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #274] bus=0 dev=1 func=3 off=0x08 size=4 write=0 val=0x6800000 cfg=present
+[pcicfg #275] bus=0 dev=1 func=3 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #276] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #277] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #278] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #279] bus=0 dev=1 func=3 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #280] bus=0 dev=1 func=3 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #281] bus=0 dev=1 func=3 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #282] bus=0 dev=1 func=3 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #283] bus=0 dev=1 func=3 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #284] bus=0 dev=1 func=3 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #285] bus=0 dev=1 func=3 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #286] bus=0 dev=1 func=3 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #287] bus=0 dev=1 func=3 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #288] bus=0 dev=1 func=3 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #289] bus=0 dev=1 func=3 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #290] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #291] bus=0 dev=1 func=3 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #292] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #293] bus=0 dev=1 func=3 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #294] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #295] bus=0 dev=1 func=3 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #296] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #297] bus=0 dev=1 func=3 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #298] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #299] bus=0 dev=1 func=3 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #300] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[heartbeat: exitCount=15000 elapsedSec=0.3 lastPort=0xCF8 write=1 val=0x89]
+[rtl8139] I/O BAR mapped at 0xC000
+[ahci] ABAR mapped at 0xC0000000
+[fwcfg] select #21: selector=0x22
+[acpi] acpiBuildTables() firing -- pmBase=0xB000
+[fwcfg] select #22: selector=0x20
+[fwcfg] select #23: selector=0x21
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[uart2] #1 port=0x2FF write=0 val=0x0
+[uart2] #2 port=0x2FF write=1 val=0xAA
+[uart2] #3 port=0x2FF write=0 val=0x0
+[uart2] #4 port=0x2FF write=1 val=0x55
+[uart2] #5 port=0x2FF write=0 val=0x0
+[uart2] #6 port=0x2FF write=1 val=0x0
+[uart2] #7 port=0x2FD write=0 val=0x0
+[uart2] #8 port=0x2FB write=0 val=0x0
+[uart2] #9 port=0x2FB write=1 val=0x0
+[uart2] #10 port=0x2F9 write=0 val=0x0
+[uart2] #11 port=0x2F9 write=1 val=0x0
+[uart2] #12 port=0x2FA write=1 val=0x0
+[uart2] #13 port=0x2FC write=0 val=0x0
+[uart2] #14 port=0x2FC write=1 val=0x0
+[uart2] #15 port=0x2FF write=1 val=0x0
+[uart2] #16 port=0x2FA write=1 val=0x7
+[uart2] #17 port=0x2FD write=0 val=0x0
+[uart2] #18 port=0x2FB write=0 val=0x0
+[uart2] #19 port=0x2FB write=1 val=0x80
+[uart2] #20 port=0x2F8 write=1 val=0x1
+[uart2] #21 port=0x2F9 write=1 val=0x0
+[uart2] #22 port=0x2FB write=1 val=0x3
+[uart2] #23 port=0x2FD write=0 val=0x0
+[uart2] #24 port=0x2FC write=0 val=0x0
+[uart2] #25 port=0x2FC write=1 val=0x0
+[uart2] #26 port=0x2FD write=0 val=0x0
+[uart2] #27 port=0x2FB write=0 val=0x0
+[uart2] #28 port=0x2FB write=1 val=0x83
+[uart2] #29 port=0x2F8 write=1 val=0x1
+[uart2] #30 port=0x2F9 write=1 val=0x0
+[uart2] #31 port=0x2FB write=1 val=0x3
+[uart2] #32 port=0x2FD write=0 val=0x0
+[uart2] #33 port=0x2F8 write=1 val=0x1B
+[uart2] #34 port=0x2FD write=0 val=0x0
+[uart2] #35 port=0x2F8 write=1 val=0x5B
+[uart2] #36 port=0x2FD write=0 val=0x0
+[uart2] #37 port=0x2F8 write=1 val=0x32
+[uart2] #38 port=0x2FD write=0 val=0x0
+[uart2] #39 port=0x2F8 write=1 val=0x4A
+[uart2] #40 port=0x2FD write=0 val=0x0
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;031;100t[2J[001;001H[heartbeat: exitCount=20000 elapsedSec=0.4 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=25000 elapsedSec=0.4 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=30000 elapsedSec=0.4 lastPort=0xB008 write=0 val=0x89]
+[aux] controller: disable AUX port
+[ahci] GHC.AE set -- controller enabled
+[ahci] PxCMD.ST set -- port 0 started
+[ahci] cmd #1: ataCmd=0xEC lba=0 count=1 prdtl=1
+[ahci] cmd #2: ataCmd=0xEF lba=0 count=1 prdtl=0
+[ahci] cmd #3: ataCmd=0xEC lba=0 count=256 prdtl=1
+[ahci] cmd #4: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #5: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #6: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #7: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #8: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #9: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #10: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #11: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #12: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #13: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #14: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #15: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #16: ataCmd=0x20 lba=32832 count=4 prdtl=1
+[ahci] cmd #17: ataCmd=0x20 lba=32832 count=1 prdtl=1
+[ahci] cmd #18: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #19: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #20: ataCmd=0x20 lba=33598 count=1 prdtl=1
+[ahci] cmd #21: ataCmd=0x20 lba=32769 count=1 prdtl=1
+[ahci] cmd #22: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #23: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #24: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #25: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #26: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #27: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #28: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #29: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #30: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #31: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #32: ataCmd=0x20 lba=34 count=1 prdtl=1
+[heartbeat: exitCount=35000 elapsedSec=0.5 lastPort=0xCF8 write=1 val=0x0]
+[ahci] cmd #33: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #34: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #35: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #36: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #37: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #38: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #39: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #40: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #41: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #42: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #43: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #44: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #45: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #46: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #47: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #48: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #49: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #50: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #51: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #52: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #53: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #54: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #55: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #56: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #57: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #58: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #59: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #60: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #61: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #62: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #63: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #64: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #65: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #66: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #67: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #68: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #69: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #70: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #71: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #72: ataCmd=0x20 lba=33598 count=64 prdtl=1
+[ahci] cmd #73: ataCmd=0x20 lba=65536 count=128 prdtl=1
+[ahci] cmd #74: ataCmd=0x20 lba=69504 count=128 prdtl=1
+[ahci] cmd #75: ataCmd=0x20 lba=69632 count=128 prdtl=1
+[ahci] cmd #76: ataCmd=0x20 lba=42814 count=64 prdtl=1
+[ahci] cmd #77: ataCmd=0x20 lba=9560960 count=128 prdtl=1
+[ahci] cmd #78: ataCmd=0x20 lba=9561088 count=256 prdtl=1
+[ahci] cmd #79: ataCmd=0x20 lba=9561344 count=256 prdtl=1
+[ahci] cmd #80: ataCmd=0x20 lba=9561600 count=256 prdtl=1
+[ahci] cmd #81: ataCmd=0x20 lba=9561856 count=256 prdtl=1
+[ahci] cmd #82: ataCmd=0x20 lba=9562112 count=256 prdtl=1
+[ahci] cmd #83: ataCmd=0x20 lba=9562368 count=256 prdtl=1
+[ahci] cmd #84: ataCmd=0x20 lba=9562624 count=256 prdtl=1
+[ahci] cmd #85: ataCmd=0x20 lba=9562880 count=256 prdtl=1
+[ahci] cmd #86: ataCmd=0x20 lba=9563136 count=256 prdtl=1
+[ahci] cmd #87: ataCmd=0x20 lba=9563392 count=256 prdtl=1
+[ahci] cmd #88: ataCmd=0x20 lba=9563648 count=256 prdtl=1
+[ahci] cmd #89: ataCmd=0x20 lba=9563904 count=128 prdtl=1
+[ahci] cmd #90: ataCmd=0x20 lba=9564032 count=128 prdtl=1
+BdsDxe: loading Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0[heartbeat: exitCount=40000 elapsedSec=0.6 lastPort=0x3FD write=0 val=0x0]
+x2,0x0)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[ahci] cmd #91: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #92: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #93: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #94: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #95: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #96: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #97: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #98: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #99: ataCmd=0x20 lba=32768 count=16 prdtl=1
+[ahci] cmd #100: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #101: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #102: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #103: ataCmd=0x20 lba=32768 count=64 prdtl=1
+[ahci] cmd #104: ataCmd=0x20 lba=33536 count=64 prdtl=1
+[ahci] cmd #105: ataCmd=0x20 lba=33600 count=64 prdtl=1
+[ahci] cmd #106: ataCmd=0x20 lba=65536 count=64 prdtl=1
+[ahci] cmd #107: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #108: ataCmd=0x20 lba=69568 count=64 prdtl=1
+[ahci] cmd #109: ataCmd=0x20 lba=69632 count=64 prdtl=1
+[ahci] cmd #110: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #111: ataCmd=0x20 lba=9564096 count=64 prdtl=1
+[ahci] cmd #112: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #113: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #114: ataCmd=0x20 lba=43326 count=4 prdtl=1
+[ahci] cmd #115: ataCmd=0x20 lba=10027016 count=40 prdtl=1
+[ahci] cmd #116: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #117: ataCmd=0x20 lba=43056 count=4 prdtl=1
+[ahci] cmd #118: ataCmd=0x20 lba=9750952 count=20 prdtl=1
+[ahci] cmd #119: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #120: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #121: ataCmd=0x20 lba=42870 count=4 prdtl=1
+[ahci] cmd #122: ataCmd=0x20 lba=42873 count=4 prdtl=1
+[ahci] cmd #123: ataCmd=0x20 lba=9561000 count=256 prdtl=1
+[ahci] cmd #124: ataCmd=0x20 lba=9561256 count=256 prdtl=1
+[ahci] cmd #125: ataCmd=0x20 lba=9561512 count=256 prdtl=1
+[ahci] cmd #126: ataCmd=0x20 lba=9561768 count=256 prdtl=1
+[ahci] cmd #127: ataCmd=0x20 lba=9562024 count=256 prdtl=1
+[ahci] cmd #128: ataCmd=0x20 lba=9562280 count=256 prdtl=1
+[ahci] cmd #129: ataCmd=0x20 lba=9562536 count=256 prdtl=1
+[ahci] cmd #130: ataCmd=0x20 lba=9562792 count=256 prdtl=1
+[ahci] cmd #131: ataCmd=0x20 lba=9563048 count=256 prdtl=1
+[ahci] cmd #132: ataCmd=0x20 lba=9563304 count=256 prdtl=1
+[ahci] cmd #133: ataCmd=0x20 lba=9563560 count=256 prdtl=1
+[ahci] cmd #134: ataCmd=0x20 lba=9563816 count=256 prdtl=1
+[ahci] cmd #135: ataCmd=0x20 lba=9564072 count=35 prdtl=1
+[ahci] cmd #136: ataCmd=0x20 lba=33598 count=4 prdtl=1
+[ahci] cmd #137: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #138: ataCmd=0x20 lba=34622 count=4 prdtl=1
+[ahci] cmd #139: ataCmd=0x20 lba=1114112 count=64 prdtl=1
+[ahci] cmd #140: ataCmd=0x20 lba=42814 count=4 prdtl=1
+[ahci] cmd #141: ataCmd=0x20 lba=9502720 count=64 prdtl=1
+[ahci] cmd #142: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #143: ataCmd=0x20 lba=34622 count=4 prdtl=1
+[ahci] cmd #144: ataCmd=0x20 lba=42814 count=4 prdtl=1
+[ahci] cmd #145: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #146: ataCmd=0x20 lba=33598 count=4 prdtl=1
+[ahci] cmd #147: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #148: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #149: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #150: ataCmd=0x20 lba=9754240 count=64 prdtl=1
+[ahci] cmd #151: ataCmd=0x20 lba=43091 count=4 prdtl=1
+[ahci] cmd #152: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #153: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #154: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #155: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #156: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #157: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #158: ataCmd=0x20 lba=9786872 count=7 prdtl=1
+[ahci] cmd #159: ataCmd=0x20 lba=9786878 count=4 prdtl=1
+[ahci] cmd #160: ataCmd=0x20 lba=9786881 count=1 prdtl=1
+[ahci] cmd #161: ataCmd=0x20 lba=9786881 count=4 prdtl=1
+[ahci] cmd #162: ataCmd=0x20 lba=9786884 count=137 prdtl=1
+[ahci] cmd #163: ataCmd=0x20 lba=9787020 count=4 prdtl=1
+[ahci] cmd #164: ataCmd=0x20 lba=9787023 count=1 prdtl=1
+[ahci] cmd #165: ataCmd=0x20 lba=9787023 count=1 prdtl=1
+[ahci] cmd #166: ataCmd=0x20 lba=9787023 count=16 prdtl=1
+[ahci] cmd #167: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #168: ataCmd=0x20 lba=43090 count=4 prdtl=1
+[ahci] cmd #169: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #170: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #171: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #172: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #173: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #174: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #175: ataCmd=0x20 lba=9786304 count=4 prdtl=1
+[ahci] cmd #176: ataCmd=0x20 lba=9786307 count=2 prdtl=1
+[ahci] cmd #177: ataCmd=0x20 lba=9786308 count=3 prdtl=1
+[ahci] cmd #178: ataCmd=0x20 lba=9786310 count=63 prdtl=1
+[ahci] cmd #179: ataCmd=0x20 lba=9786372 count=3 prdtl=1
+[ahci] cmd #180: ataCmd=0x20 lba=9786374 count=1 prdtl=1
+[ahci] cmd #181: ataCmd=0x20 lba=9786374 count=16 prdtl=1
+[ahci] cmd #182: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #183: ataCmd=0x20 lba=43091 count=4 prdtl=1
+[ahci] cmd #184: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #185: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #186: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #187: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #188: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #189: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #190: ataCmd=0x20 lba=9787040 count=7 prdtl=1
+[ahci] cmd #191: ataCmd=0x20 lba=9787046 count=4 prdtl=1
+[ahci] cmd #192: ataCmd=0x20 lba=9787049 count=3 prdtl=1
+[ahci] cmd #193: ataCmd=0x20 lba=9787051 count=1 prdtl=1
+[ahci] cmd #194: ataCmd=0x20 lba=9787051 count=3 prdtl=1
+[ahci] cmd #195: ataCmd=0x20 lba=9787053 count=14 prdtl=1
+[ahci] cmd #196: ataCmd=0x20 lba=9787066 count=48 prdtl=1
+[ahci] cmd #197: ataCmd=0x20 lba=9787113 count=6 prdtl=1
+[ahci] cmd #198: ataCmd=0x20 lba=9787118 count=15 prdtl=1
+[ahci] cmd #199: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[heartbeat: exitCount=45000 elapsedSec=0.8 lastPort=0xB008 write=0 val=0x89]
+[2J[001;001H[=3h[2J[001;001H[heartbeat: exitCount=50000 elapsedSec=0.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=55000 elapsedSec=0.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=60000 elapsedSec=1.0 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=65000 elapsedSec=1.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=70000 elapsedSec=1.4 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=75000 elapsedSec=1.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=80000 elapsedSec=1.6 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=85000 elapsedSec=2.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=90000 elapsedSec=2.3 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=95000 elapsedSec=2.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=100000 elapsedSec=2.7 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=105000 elapsedSec=2.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=110000 elapsedSec=3.2 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=115000 elapsedSec=5.2 lastPort=0x70 write=0 val=0x84]
+[aux] controller: disable AUX port
+[heartbeat: exitCount=120000 elapsedSec=6.6 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=125000 elapsedSec=6.7 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=130000 elapsedSec=6.7 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=135000 elapsedSec=6.8 lastPort=0xCF8 write=1 val=0x0]
+[ioapic #1] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA57DD write=1 insnLen=0 bytes=16
+[ioapic #2] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA57E3 write=1 insnLen=0 bytes=16
+[ioapic #3] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA57EA write=1 insnLen=0 bytes=16
+[ioapic #4] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA57F0 write=0 insnLen=0 bytes=16
+[ioapic #5] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA57F3 write=1 insnLen=0 bytes=16
+[ioapic #6] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA57F9 write=1 insnLen=0 bytes=16
+[ioapic #7] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5800 write=1 insnLen=0 bytes=16
+[ioapic #8] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5806 write=0 insnLen=0 bytes=16
+[ioapic #9] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5835 write=1 insnLen=0 bytes=16
+[ioapic #10] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA583B write=0 insnLen=0 bytes=16
+[ioapic #11] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5846 write=1 insnLen=0 bytes=16
+[ioapic #12] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #13] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #14] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #15] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #16] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #17] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #18] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #19] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #20] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #21] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #22] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #23] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #24] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #25] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #26] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #27] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #28] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #29] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #30] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #31] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #32] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #33] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #34] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #35] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #36] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #37] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #38] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #39] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #40] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #41] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #42] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #43] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #44] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #45] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #46] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #47] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #48] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #49] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #50] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #51] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #52] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #53] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #54] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #55] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #56] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #57] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #58] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #59] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #60] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #61] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #62] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #63] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #64] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #65] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #66] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #67] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #68] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #69] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #70] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #71] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #72] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #73] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #74] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #75] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #76] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #77] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #78] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #79] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #80] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #81] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #82] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #83] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #84] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #85] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #86] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #87] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #88] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #89] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #90] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #91] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #92] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #93] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #94] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #95] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[ioapic #96] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA5883 write=1 insnLen=0 bytes=16
+[ioapic #97] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA585D write=1 insnLen=0 bytes=16
+[ioapic #98] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA585F write=0 insnLen=0 bytes=16
+[ioapic #99] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF80419BA587A write=1 insnLen=0 bytes=16
+[ioapic #100] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF80419BA5881 write=1 insnLen=0 bytes=16
+[heartbeat: exitCount=140000 elapsedSec=6.9 lastPort=0xB008 write=0 val=0xFF]
+[cmos-ab] write reg=0x0A value=0x25 (RegA=0x25 RegB=0x02, PIE=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x20 value=0x000008D1 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x21 value=0x01000000 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x20 value=0x000008D1 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[cmos-ab] write reg=0x0B value=0x42 (RegA=0x25 RegB=0x42, PIE=1)
+[watchdog] STALL #1 (exitCount=143874 unchanged for 2s): rip=0xFFFFF80419A50D9C rsp=0xFFFFF8041F4752F0 rax=0x0 rcx=0x2B2C58 rdx=0x400000000 rbx=0x8DFE cr3=0x1AD002
+[watchdog] STALL #2 (exitCount=143874 unchanged for 4s): rip=0xFFFFF80419CBE7E2 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[kerneldiag] found PE header for owning module at guest VA 0xFFFFF80419800000 (rip=0xFFFFF80419CBE7E2, +0x4BE7E2 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] stack dump from rsp=0xFFFFF8041F488D80 (cr3=0x1AD002):
+  [rsp+0x00] = 0xFFFFF8041F488E58
+  [rsp+0x08] = 0xFFFFF80419AAA11E
+  [rsp+0x10] = 0xFFFFF8041F489330
+  [rsp+0x18] = 0xFFFFF80419AAE633
+  [rsp+0x20] = 0xFFFFF8041F488EC0
+  [rsp+0x30] = 0xFFFFF80416B7C180
+  [rsp+0x38] = 0xFFFFF80419D17D8A
+  [rsp+0x58] = 0xFFFFF8041F489D08
+  [rsp+0x60] = 0xFFFFF8041F488E30
+  [rsp+0x68] = 0xFFFFF80419C4D05A
+  [rsp+0x70] = 0xFFFFF8041F489330
+  [rsp+0x80] = 0xFFFFF8041F48A020
+  [rsp+0x98] = 0xFFFFF8041A527A00
+  [rsp+0xD0] = 0xFFFFF80416B7C180
+  [rsp+0xF0] = 0xFFFFFFFFFFFFFFFF
+  [rsp+0xF8] = 0xFFFF800000000000
+  [rsp+0x100] = 0xFFFFF80419D183B0
+[kerneldiag] KiBugCheckData: code=0x5C params=[0x110, 0xFFFFF7A00000C1C8, 0x19, 0xFFFFFFFFC0000001]
+[kerneldiag] memory at param2 (0xFFFFF7A00000C1C8):
+  +0x00: 60 BF 44 1A 04 F8 FF FF 00 C0 00 00 A0 F7 FF FF  `.D.............
+  +0x10: 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00   ...............
+  +0x20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x30: 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x40: 00 00 00 00 00 00 00 00 20 C3 00 00 A0 F7 FF FF  ........ .......
+  +0x50: 30 00 00 00 08 00 00 00 00 00 00 00 01 00 00 00  0...............
+  +0x60: 01 00 00 00 00 00 00 00 00 10 CC 19 04 F8 FF FF  ................
+  +0x70: 00 00 00 00 00 00 00 00 90 0C CC 19 04 F8 FF FF  ................
+  +0x80: 40 0E CC 19 04 F8 FF FF 10 11 CC 19 04 F8 FF FF  @...............
+  +0x90: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xA0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xB0: 00 00 00 00 00 00 00 00 46 00 00 00 00 00 00 00  ........F.......
+  +0xC0: 00 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xD0: 00 00 00 00 00 00 00 00 00 00 00 00 40 00 00 00  ............@...
+  +0xE0: 31 01 21 00 0C 00 00 00 00 00 00 00 00 00 00 00  1.!.............
+  +0xF0: 00 00 00 00 00 00 00 00 00 00 00 00 19 00 00 00  ................
+  +0x100: 00 00 00 00 00 00 00 00 A8 03 83 19 04 F8 FF FF  ................
+  +0x110: 18 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+[kerneldiag] descriptor+0xB8 = 0x46 -- bit2 (HalpTimerInitialize succeeded) is SET
+[kerneldiag] descriptor+0x120 (remap-info pointer) = 0x2
+[kerneldiag] remap-info+0x00 (type field HalpInterruptRemap switches on) = 0x0 (expects 0 or 3; anything else -> unhandled default STATUS_UNSUCCESSFUL)
+[kerneldiag] remap-info raw: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[kerneldiag] HalpWatchdogTimer = 0x0
+[kerneldiag] HalpTimerLastProblem=0x19 setter scan complete: 0 hit(s)
+[kerneldiag] dumped HalpInterruptSetLineState_ColdPath (1280 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineState_ColdPath.bin
+[kerneldiag] dumped HalpInterruptSetLineStateInternal (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineStateInternal.bin
+[kerneldiag] dumped HalpInterruptLookupController (768 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptLookupController.bin
+[kerneldiag] dumped HalpApicSetLineState_ColdPath (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpApicSetLineState_ColdPath.bin
+[kerneldiag] dumped HalpInterruptSetLineStateInternal_ColdPath (256 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineStateInternal_ColdPath.bin
+[kerneldiag] dumped HalpTimerInitializeClock_HotPath (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpTimerInitializeClock_HotPath.bin
+[kerneldiag] HalpInterruptControllerList head @0xFFFFF8041A44B910: Flink=0xFFFFF7A000001340 Blink=0xFFFFF7A000001930 -- MORE THAN ONE controller registered, walking all entries
+[kerneldiag] controller[0] @0xFFFFF7A000001340: +0xE8(id)=0x1 +0xDC(flags)=0xFF +0x10(self)=0xFFFFF7A0000014A0 +0x70(callback)=0xFFFFF80419B7D580
+[kerneldiag] controller[0] +0x100 (routing-candidate list) @0xFFFFF7A000001440: Flink=0xFFFFF7A000007540 Blink=0xFFFFF7A000007540 -- has entries
+[kerneldiag] controller[0] candidate[0] @0xFFFFF7A000007540: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x7
+[kerneldiag] controller[0] callback RVA = 0x37D580 (in-module)
+[kerneldiag] dumped controller[0] callback (1024 bytes from live pointer 0xFFFFF80419B7D580) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\InterruptControllerCallback_0.bin
+[kerneldiag] controller[1] @0xFFFFF7A000001568: +0xE8(id)=0x2 +0xDC(flags)=0xFF +0x10(self)=0xFFFFF7A0000016C8 +0x70(callback)=0xFFFFF80419B7D580
+[kerneldiag] controller[1] +0x100 (routing-candidate list) @0xFFFFF7A000001668: Flink=0xFFFFF7A00000A2A8 Blink=0xFFFFF7A00000A2A8 -- has entries
+[kerneldiag] controller[1] candidate[0] @0xFFFFF7A00000A2A8: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x7
+[kerneldiag] controller[1] callback RVA = 0x37D580 (in-module)
+[kerneldiag] controller[1] callback matches an already-dumped one, skipping
+[kerneldiag] controller[2] @0xFFFFF7A000001760: +0xE8(id)=0xB000 +0xDC(flags)=0x0 +0x10(self)=0xFFFFF7A0000018C0 +0x70(callback)=0xFFFFF80419CDD370
+[kerneldiag] controller[2] +0x100 (routing-candidate list) @0xFFFFF7A000001860: Flink=0xFFFFF7A000001B00 Blink=0xFFFFF7A000001B00 -- has entries
+[kerneldiag] controller[2] candidate[0] @0xFFFFF7A000001B00: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x2
+[kerneldiag] controller[2] callback RVA = 0x4DD370 (in-module)
+[kerneldiag] dumped controller[2] callback (1024 bytes from live pointer 0xFFFFF80419CDD370) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\InterruptControllerCallback_2.bin
+[kerneldiag] controller[3] @0xFFFFF7A000001930: +0xE8(id)=0xB001 +0xDC(flags)=0x0 +0x10(self)=0xFFFFF7A000001A90 +0x70(callback)=0xFFFFF80419CDD370
+[kerneldiag] controller[3] +0x100 (routing-candidate list) @0xFFFFF7A000001A30: Flink=0xFFFFF7A000001E38 Blink=0xFFFFF7A000001E38 -- has entries
+[kerneldiag] controller[3] candidate[0] @0xFFFFF7A000001E38: +0x10(dest)=0xB000 +0x14(prioLo)=0x2 +0x18(prioHi)=0x3
+[kerneldiag] controller[3] callback RVA = 0x4DD370 (in-module)
+[kerneldiag] controller[3] callback matches an already-dumped one, skipping
+[watchdog] STALL #3 (exitCount=143874 unchanged for 6s): rip=0xFFFFF80419CBE7FB rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #4 (exitCount=143874 unchanged for 8s): rip=0xFFFFF80419CBE7DC rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #5 (exitCount=143874 unchanged for 10s): rip=0xFFFFF80419CBE7E2 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #6 (exitCount=143874 unchanged for 12s): rip=0xFFFFF80419CBE7F5 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #7 (exitCount=143874 unchanged for 14s): rip=0xFFFFF80419CBE7F5 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #8 (exitCount=143874 unchanged for 16s): rip=0xFFFFF80419CBE7DC rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #9 (exitCount=143874 unchanged for 18s): rip=0xFFFFF80419CBE7E2 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #10 (exitCount=143874 unchanged for 20s): rip=0xFFFFF80419CBE7FB rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #11 (exitCount=143874 unchanged for 22s): rip=0xFFFFF80419CBE7DC rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #12 (exitCount=143874 unchanged for 24s): rip=0xFFFFF80419CBE7F5 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #13 (exitCount=143874 unchanged for 26s): rip=0xFFFFF80419CBE7FB rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #14 (exitCount=143874 unchanged for 28s): rip=0xFFFFF80419CBE7F5 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #15 (exitCount=143874 unchanged for 30s): rip=0xFFFFF80419CBE7E2 rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002
+[watchdog] STALL #16 (exitCount=143874 unchanged for 32s): rip=0xFFFFF80419CBE7DC rsp=0xFFFFF8041F488D80 rax=0xFFFFF80419CBE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002

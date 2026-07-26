@@ -1,0 +1,263 @@
+﻿0x4A5BE8:	mov	sil, 1
+0x4A5BEB:	mov	dword ptr [rbp + 0x60], 2
+0x4A5BF2:	jmp	0x103a3b2a    ; RVA 0x3A3B2A HalpInterruptSetLineState+0x42
+0x4A5BF7:	mov	sil, 1
+0x4A5BFA:	mov	dword ptr [rbp + 0x60], 1
+0x4A5C01:	jmp	0x103a3b2a    ; RVA 0x3A3B2A HalpInterruptSetLineState+0x42
+0x4A5C06:	mov	rax, qword ptr [rdi + 0x10]
+0x4A5C0A:	mov	qword ptr [rbp + 0x40], rax
+0x4A5C0E:	jmp	0x103a3b4a    ; RVA 0x3A3B4A HalpInterruptSetLineState+0x62
+0x4A5C13:	xor	r8d, r8d
+0x4A5C16:	mov	dword ptr [rsp + 0x20], 0x8ef
+0x4A5C1E:	lea	r9, [rip - 0x4964bd]
+0x4A5C25:	mov	rcx, rbx
+0x4A5C28:	lea	edx, [r8 + 0x20]
+0x4A5C2C:	call	0x104d2008    ; RVA 0x4D2008 HalpInterruptSetProblemEx
+0x4A5C31:	mov	r9d, dword ptr [rdi + 0x30]
+0x4A5C35:	mov	r8, rdi
+0x4A5C38:	mov	edx, 0x202
+0x4A5C3D:	mov	qword ptr [rsp + 0x20], r12
+0x4A5C42:	mov	ecx, 0x5c
+0x4A5C47:	call	0x103fd6f0    ; RVA 0x3FD6F0 KeBugCheckEx
+0x4A5C4C:	int3	
+0x4A5C4D:	mov	eax, 0x16
+0x4A5C52:	mov	dword ptr [rbx + 0x128], r8d
+0x4A5C59:	lea	r9, [rip - 0x4964f8]
+0x4A5C60:	mov	dword ptr [rip + 0x7a3a8e], eax
+0x4A5C66:	mov	dword ptr [rbx + 0x124], eax
+0x4A5C6C:	mov	qword ptr [rbx + 0x130], r9
+0x4A5C73:	mov	dword ptr [rbx + 0x138], 0x912
+0x4A5C7D:	jmp	0x103a3c8f    ; RVA 0x3A3C8F HalpInterruptSetLineState+0x1A7
+0x4A5C82:	test	r15b, r15b
+0x4A5C85:	je	0x103a3c98
+0x4A5C8B:	mov	rax, qword ptr [r14 + 0x28]
+0x4A5C8F:	mov	edx, dword ptr [rbp + 0x78]
+0x4A5C92:	movups	xmm0, xmmword ptr [rbp - 0x40]
+0x4A5C96:	movups	xmm1, xmmword ptr [rbp - 0x30]
+0x4A5C9A:	imul	rcx, rdx, 0x38
+0x4A5C9E:	add	rdx, rdx
+0x4A5CA1:	movups	xmmword ptr [rcx + rax], xmm0
+0x4A5CA5:	movups	xmm0, xmmword ptr [rbp - 0x20]
+0x4A5CA9:	movups	xmmword ptr [rcx + rax + 0x10], xmm1
+0x4A5CAE:	movsd	xmm1, qword ptr [rbp - 0x10]
+0x4A5CB3:	movups	xmmword ptr [rcx + rax + 0x20], xmm0
+0x4A5CB8:	movups	xmm0, xmmword ptr [rbp - 0x50]
+0x4A5CBC:	movsd	qword ptr [rcx + rax + 0x30], xmm1
+0x4A5CC2:	mov	rax, qword ptr [r14 + 0x30]
+0x4A5CC6:	movdqu	xmmword ptr [rax + rdx*8], xmm0
+0x4A5CCB:	jmp	0x103a3c98    ; RVA 0x3A3C98 HalpInterruptSetLineState+0x1B0
+0x4A5CD0:	and	dword ptr [rbx + 0x128], 0
+0x4A5CD7:	lea	r9, [rip - 0x496576]
+0x4A5CDE:	mov	eax, 0x13
+0x4A5CE3:	mov	qword ptr [rbx + 0x130], r9
+0x4A5CEA:	mov	dword ptr [rip + 0x7a3a04], eax
+0x4A5CF0:	mov	r8d, 0xc000000d
+0x4A5CF6:	mov	dword ptr [rbx + 0x124], eax
+0x4A5CFC:	mov	dword ptr [rbx + 0x138], 0x8c5
+0x4A5D06:	jmp	0x103a3c98    ; RVA 0x3A3C98 HalpInterruptSetLineState+0x1B0
+0x4A5D0B:	and	dword ptr [rbx + 0x128], 0
+0x4A5D12:	lea	r9, [rip - 0x4965b1]
+0x4A5D19:	mov	eax, 0x12
+0x4A5D1E:	mov	qword ptr [rbx + 0x130], r9
+0x4A5D25:	mov	dword ptr [rip + 0x7a39c9], eax
+0x4A5D2B:	mov	dword ptr [rbx + 0x124], eax
+0x4A5D31:	mov	dword ptr [rbx + 0x138], 0x8b8
+0x4A5D3B:	jmp	0x104a5d6a    ; RVA 0x4A5D6A HalpInterruptSetLineState+0x102282
+0x4A5D3D:	movsxd	r8, dword ptr [rip + 0x7a39b0]
+0x4A5D44:	mov	r9, rbx
+0x4A5D47:	mov	edx, 0x200
+0x4A5D4C:	mov	qword ptr [rsp + 0x20], 0x7931847
+0x4A5D55:	mov	ecx, 0x5c
+0x4A5D5A:	call	0x103fd6f0    ; RVA 0x3FD6F0 KeBugCheckEx
+0x4A5D5F:	int3	
+0x4A5D60:	mov	dword ptr [rip + 0x7a398a], 0x11
+0x4A5D6A:	mov	r8d, 0xc0000225
+0x4A5D70:	jmp	0x103a3c98    ; RVA 0x3A3C98 HalpInterruptSetLineState+0x1B0
+0x4A5D75:	int3	
+0x4A5D76:	lea	r9, [rip - 0x496325]
+0x4A5D7D:	mov	dword ptr [rip + 0x7a396d], 4
+0x4A5D87:	mov	qword ptr [rbx + 0x130], r9
+0x4A5D8E:	mov	dword ptr [rbx + 0x124], 4
+0x4A5D98:	mov	dword ptr [rbx + 0x128], eax
+0x4A5D9E:	mov	dword ptr [rbx + 0x138], 0x23b
+0x4A5DA8:	jmp	0x103a3e2b    ; RVA 0x3A3E2B HalpInterruptInitializeLocalUnit+0x12F
+0x4A5DAD:	mov	eax, dword ptr [rip + 0x7a38dd]
+0x4A5DB3:	cmp	eax, dword ptr [rip + 0x7a688b]
+0x4A5DB9:	jae	0x104a5de4
+0x4A5DBB:	test	ecx, ecx
+0x4A5DBD:	je	0x104a5de4
+0x4A5DBF:	mov	ecx, dword ptr [rip + 0x7a38eb]
+0x4A5DC5:	mov	dil, 1
+0x4A5DC8:	mov	dword ptr [rsp + 0x48], eax
+0x4A5DCC:	mov	eax, 1
+0x4A5DD1:	shl	eax, cl
+0x4A5DD3:	mov	dword ptr [rsp + 0x4c], eax
+0x4A5DD7:	mov	dword ptr [rsp + 0x40], 6
+0x4A5DDF:	jmp	0x103a3eb6    ; RVA 0x3A3EB6 HalpInterruptInitializeLocalUnit+0x1BA
+0x4A5DE4:	mov	eax, dword ptr [rsp + 0x80]
+0x4A5DEB:	mov	dword ptr [rsp + 0x48], eax
+0x4A5DEF:	mov	dword ptr [rsp + 0x40], 4
+0x4A5DF7:	test	dl, dl
+0x4A5DF9:	je	0x103a3eb6
+0x4A5DFF:	mov	rcx, qword ptr [rip + 0x7aa8ea]
+0x4A5E06:	mov	dword ptr [rcx + rbp*8], 4
+0x4A5E0D:	mov	eax, dword ptr [rsp + 0x80]
+0x4A5E14:	mov	dword ptr [rcx + rbp*8 + 8], eax
+0x4A5E18:	mov	edx, r14d
+0x4A5E1B:	lea	rcx, [rip + 0x7a5a3e]
+0x4A5E22:	call	0x1025a420    ; RVA 0x25A420 KeAddProcessorAffinityEx
+0x4A5E27:	nop	
+0x4A5E28:	jmp	0x103a3dce    ; RVA 0x3A3DCE HalpInterruptInitializeLocalUnit+0xD2
+0x4A5E2D:	mov	rax, qword ptr [rbx + 0x90]
+0x4A5E34:	test	rax, rax
+0x4A5E37:	je	0x104a5dff
+0x4A5E39:	mov	rcx, qword ptr [rbx + 0x10]
+0x4A5E3D:	lea	r8, [rsp + 0x40]
+0x4A5E42:	mov	r9b, 1
+0x4A5E45:	lea	rdx, [rsp + 0x80]
+0x4A5E4D:	xor	dil, dil
+0x4A5E50:	call	0x10407b40    ; RVA 0x407B40 guard_dispatch_icall
+0x4A5E55:	mov	edx, dword ptr [rsp + 0x40]
+0x4A5E59:	cmp	edx, 6
+0x4A5E5C:	jne	0x103a3ed5
+0x4A5E62:	mov	ecx, dword ptr [rsp + 0x48]
+0x4A5E66:	cmp	ecx, dword ptr [rip + 0x7a67d8]
+0x4A5E6C:	jb	0x103a3ed9
+0x4A5E72:	mov	ecx, dword ptr [rsp + 0x80]
+0x4A5E79:	mov	edx, 4
+0x4A5E7E:	mov	dword ptr [rsp + 0x40], edx
+0x4A5E82:	mov	eax, 0xc0000001
+0x4A5E87:	mov	dword ptr [rsp + 0x48], ecx
+0x4A5E8B:	jmp	0x103a3ed9    ; RVA 0x3A3ED9 HalpInterruptInitializeLocalUnit+0x1DD
+0x4A5E90:	cmp	ecx, dword ptr [rip + 0x7a37fa]
+0x4A5E96:	mov	byte ptr [rip + 0x7a385b], 1
+0x4A5E9D:	jbe	0x103a3ef1
+0x4A5EA3:	mov	dword ptr [rip + 0x7a37e7], ecx
+0x4A5EA9:	jmp	0x103a3ef1    ; RVA 0x3A3EF1 HalpInterruptInitializeLocalUnit+0x1F5
+0x4A5EAE:	mov	eax, dword ptr [rip + 0x7a37fc]
+0x4A5EB4:	inc	eax
+0x4A5EB6:	cmp	eax, dword ptr [rip + 0x7a678c]
+0x4A5EBC:	mov	dword ptr [rip + 0x7a37ee], eax
+0x4A5EC2:	jb	0x103a3efa
+0x4A5EC8:	and	dword ptr [rip + 0x7a37e1], 0
+0x4A5ECF:	inc	dword ptr [rip + 0x7a37bb]
+0x4A5ED5:	jmp	0x103a3efa    ; RVA 0x3A3EFA HalpInterruptInitializeLocalUnit+0x1FE
+0x4A5EDA:	lea	r9, [rip - 0x496489]
+0x4A5EE1:	mov	dword ptr [rsp + 0x20], 0x30e
+0x4A5EE9:	mov	edx, 6
+0x4A5EEE:	mov	rcx, rbx
+0x4A5EF1:	call	0x104d2008    ; RVA 0x4D2008 HalpInterruptSetProblemEx
+0x4A5EF6:	mov	rcx, r8
+0x4A5EF9:	mov	r9, rbx
+0x4A5EFC:	movsxd	r8, dword ptr [rip + 0x7a37f1]
+0x4A5F03:	mov	edx, 0x200
+0x4A5F08:	mov	qword ptr [rsp + 0x20], rcx
+0x4A5F0D:	mov	ecx, 0x5c
+0x4A5F12:	call	0x103fd6f0    ; RVA 0x3FD6F0 KeBugCheckEx
+0x4A5F17:	int3	
+0x4A5F18:	mov	eax, 0xa
+0x4A5F1D:	mov	dword ptr [rbx + 0x128], edi
+0x4A5F23:	lea	r9, [rip - 0x4964d2]
+0x4A5F2A:	mov	dword ptr [rip + 0x7a37c4], eax
+0x4A5F30:	mov	dword ptr [rbx + 0x124], eax
+0x4A5F36:	mov	qword ptr [rbx + 0x130], r9
+0x4A5F3D:	mov	dword ptr [rbx + 0x138], 0x323
+0x4A5F47:	jmp	0x103a3e2b    ; RVA 0x3A3E2B HalpInterruptInitializeLocalUnit+0x12F
+0x4A5F4C:	mov	eax, 0x26
+0x4A5F51:	mov	dword ptr [rbx + 0x128], edi
+0x4A5F57:	lea	r9, [rip - 0x496506]
+0x4A5F5E:	mov	dword ptr [rip + 0x7a3790], eax
+0x4A5F64:	mov	dword ptr [rbx + 0x124], eax
+0x4A5F6A:	mov	qword ptr [rbx + 0x130], r9
+0x4A5F71:	mov	dword ptr [rbx + 0x138], 0x330
+0x4A5F7B:	jmp	0x103a3e2b    ; RVA 0x3A3E2B HalpInterruptInitializeLocalUnit+0x12F
+0x4A5F80:	mov	eax, dword ptr [rbx + 0xe0]
+0x4A5F86:	test	al, 1
+0x4A5F88:	je	0x103a3e2b
+0x4A5F8E:	mov	dl, 1
+0x4A5F90:	mov	rcx, rbx
+0x4A5F93:	call	0x1038b2b0    ; RVA 0x38B2B0 HalpInterruptRestoreController
+0x4A5F98:	movsxd	rdi, eax
+0x4A5F9B:	test	eax, eax
+0x4A5F9D:	jns	0x103a3e2b
+0x4A5FA3:	movsxd	r8, dword ptr [rip + 0x7a374a]
+0x4A5FAA:	mov	ecx, 0x5c
+0x4A5FAF:	mov	edx, 0x200
+0x4A5FB4:	mov	qword ptr [rsp + 0x20], rdi
+0x4A5FB9:	lea	r9d, [rcx - 0x58]
+0x4A5FBD:	call	0x103fd6f0    ; RVA 0x3FD6F0 KeBugCheckEx
+0x4A5FC2:	int3	
+0x4A5FC3:	sti	
+0x4A5FC4:	jmp	0x103a3e34    ; RVA 0x3A3E34 HalpInterruptInitializeLocalUnit+0x138
+0x4A5FC9:	int3	
+0x4A5FCA:	and	dword ptr [rbp - 0x3c], 0
+0x4A5FCE:	mov	eax, 1
+0x4A5FD3:	and	dword ptr [rbp - 0x24], 0
+0x4A5FD7:	mov	rcx, rbx
+0x4A5FDA:	and	qword ptr [rbp - 0x1c], 0
+0x4A5FDF:	and	dword ptr [rbp - 0x14], 0
+0x4A5FE3:	or	dword ptr [rbp - 0x30], 0xffffffff
+0x4A5FE7:	lea	edx, [rax + 0x35]
+0x4A5FEA:	mov	dword ptr [rbp - 0x10], edx
+0x4A5FED:	mov	dword ptr [rbp - 0x40], eax
+0x4A5FF0:	mov	dword ptr [rbp - 0x38], eax
+0x4A5FF3:	mov	dword ptr [rbp - 0x34], 0x10
+0x4A5FFA:	mov	dword ptr [rbp - 0x2c], eax
+0x4A5FFD:	mov	dword ptr [rbp - 0x28], 4
+0x4A6004:	mov	dword ptr [rbp - 0x20], edi
+0x4A6007:	call	0x103a406c    ; RVA 0x3A406C HalpInterruptGetPriority
+0x4A600C:	lea	r8, [rbp - 0x40]
+0x4A6010:	mov	dword ptr [rbp - 0xc], eax
+0x4A6013:	lea	rdx, [rbp + 0x10]
+0x4A6017:	mov	rcx, rbx
+0x4A601A:	call	0x10378c7c    ; RVA 0x378C7C HalpInterruptSetLineStateInternal
+0x4A601F:	nop	
+0x4A6020:	jmp	0x103a3f8f    ; RVA 0x3A3F8F HalpInitializeDeferredErrorVector+0x57
+0x4A6025:	int3	
+0x4A6026:	test	di, di
+0x4A6029:	jne	0x103a4154
+0x4A602F:	test	r14b, r14b
+0x4A6032:	jne	0x103a4154
+0x4A6038:	jmp	0x103a4151    ; RVA 0x3A4151 HalpInterruptMarkProcessorStarted+0xB5
+0x4A603D:	mov	r8d, dword ptr [rdx + 0x30]
+0x4A6041:	mov	rcx, qword ptr [rdx + 0x30]
+0x4A6045:	shr	r8, 8
+0x4A6049:	xor	r8d, dword ptr [rdx + 0x30]
+0x4A604D:	and	r8d, 0xffffff
+0x4A6054:	shr	rcx, 8
+0x4A6058:	xor	r8d, ecx
+0x4A605B:	jmp	0x103a4164    ; RVA 0x3A4164 HalpInterruptMarkProcessorStarted+0xC8
+0x4A6060:	cmp	dword ptr [rcx], esi
+0x4A6062:	jne	0x103a41e8
+0x4A6068:	mov	byte ptr [rcx + 0xd], r12b
+0x4A606C:	mov	dword ptr [rcx + 0x10], eax
+0x4A606F:	mov	eax, dword ptr gs:[0x1a4]
+0x4A6077:	mov	dword ptr [rcx + 0x14], eax
+0x4A607A:	jmp	0x103a41f4    ; RVA 0x3A41F4 HalpInterruptMarkProcessorStarted+0x158
+0x4A607F:	int3	
+0x4A6080:	test	r15b, al
+0x4A6083:	je	0x103a42c0
+0x4A6089:	cmp	cl, 0xf
+0x4A608C:	ja	0x103a42c0
+0x4A6092:	mov	rax, qword ptr gs:[0x20]
+0x4A609B:	mov	rdx, r14
+0x4A609E:	movzx	ecx, cl
+0x4A60A1:	add	ecx, r15d
+0x4A60A4:	shl	rdx, cl
+0x4A60A7:	mov	r9, qword ptr [rax + 0x84b8]
+0x4A60AE:	and	edx, 4
+0x4A60B1:	mov	r8d, dword ptr [r9 + 0x14]
+0x4A60B5:	or	r8d, edx
+0x4A60B8:	mov	dword ptr [r9 + 0x14], r8d
+0x4A60BC:	jmp	0x103a42c0    ; RVA 0x3A42C0 MiQueuePinDriverAddressLog+0x7C
+0x4A60C1:	or	eax, 0xffffffff
+0x4A60C4:	mov	esi, eax
+0x4A60C6:	test	r8d, r8d
+0x4A60C9:	je	0x103a439b
+0x4A60CF:	lea	edx, [rdi + 1]
+0x4A60D2:	cmp	edx, ebx
+0x4A60D4:	cmova	edx, ebx
+0x4A60D7:	add	edx, eax
+0x4A60D9:	xor	r8d, r8d
+0x4A60DC:	jmp	0x103a4309    ; RVA 0x3A4309 MiQueuePinDriverAddressLog+0xC5
+0x4A60E1:	and	edi, 0xfffffcff

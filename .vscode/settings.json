@@ -1,0 +1,9 @@
+{
+    // Files VS Code opens automatically (like launch.json when a debug
+    // session starts) use a transient "preview" tab that gets replaced
+    // the next time something else is opened -- which is why it keeps
+    // reappearing every run unless it's already pinned open. Turning
+    // preview tabs off makes any auto-opened file a normal, persistent
+    // tab instead, so it only needs to be shown once.
+    "workbench.editor.enablePreview": false
+}

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LocalWare</title>
+
+<style>
+*{
+    margin:0;
+    padding:0;
+    box-sizing:border-box;
+    font-family:Segoe UI,Arial,sans-serif;
+}
+
+body{
+    background:#090909;
+    color:white;
+}
+
+header{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:20px 8%;
+    position:fixed;
+    width:100%;
+    background:rgba(9,9,9,.85);
+    backdrop-filter:blur(12px);
+}
+
+.logo{
+    font-size:28px;
+    font-weight:bold;
+}
+
+.logo span{
+    color:#3b82f6;
+}
+
+nav a{
+    color:white;
+    text-decoration:none;
+    margin-left:30px;
+    transition:.3s;
+}
+
+nav a:hover{
+    color:#3b82f6;
+}
+
+.hero{
+    min-height:100vh;
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    flex-direction:column;
+    text-align:center;
+    padding:0 20px;
+}
+
+.hero h1{
+    font-size:70px;
+    margin-bottom:20px;
+}
+
+.hero h1 span{
+    color:#3b82f6;
+}
+
+.hero p{
+    color:#bdbdbd;
+    font-size:22px;
+    max-width:750px;
+    line-height:1.7;
+}
+
+.buttons{
+    margin-top:40px;
+}
+
+.btn{
+    display:inline-block;
+    padding:15px 32px;
+    margin:10px;
+    border-radius:12px;
+    text-decoration:none;
+    font-weight:bold;
+    transition:.25s;
+}
+
+.primary{
+    background:#3b82f6;
+    color:white;
+}
+
+.primary:hover{
+    background:#2563eb;
+}
+
+.secondary{
+    border:2px solid #3b82f6;
+    color:#3b82f6;
+}
+
+.secondary:hover{
+    background:#3b82f6;
+    color:white;
+}
+
+.products{
+    padding:100px 8%;
+}
+
+.products h2{
+    text-align:center;
+    font-size:42px;
+    margin-bottom:50px;
+}
+
+.grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+    gap:25px;
+}
+
+.card{
+    background:#111;
+    border:1px solid #222;
+    border-radius:16px;
+    padding:30px;
+    transition:.3s;
+}
+
+.card:hover{
+    transform:translateY(-8px);
+    border-color:#3b82f6;
+}
+
+.card h3{
+    margin-bottom:15px;
+}
+
+.card p{
+    color:#bdbdbd;
+    line-height:1.6;
+}
+
+footer{
+    padding:35px;
+    text-align:center;
+    color:#888;
+    border-top:1px solid #222;
+}
+</style>
+
+</head>
+<body>
+
+<header>
+
+<div class="logo">
+Local<span>Ware</span>
+</div>
+
+<nav>
+<a href="#">Products</a>
+<a href="#">Downloads</a>
+<a href="#">Documentation</a>
+<a href="#">GitHub</a>
+<a href="#">Community</a>
+</nav>
+
+</header>
+
+<section class="hero">
+
+<h1>Software in the <span>Open World.</span></h1>
+
+<p>
+Building open, modern software for developers, creators, and curious minds.
+From virtualization to developer tools, LocalWare believes powerful software
+should be accessible to everyone.
+</p>
+
+<div class="buttons">
+<a class="btn primary" href="#">Download LocalHost™</a>
+<a class="btn secondary" href="#">Learn More</a>
+</div>
+
+</section>
+
+<section class="products">
+
+<h2>Products</h2>
+
+<div class="grid">
+
+<div class="card">
+<h3>🖥️ LocalHost™</h3>
+<p>
+A modern virtualization platform designed for speed,
+simplicity, and developers.
+</p>
+</div>
+
+<div class="card">
+<h3>⚡ Open Development</h3>
+<p>
+Built in the open with community contributions and transparent development.
+</p>
+</div>
+
+<div class="card">
+<h3>🔒 Security</h3>
+<p>
+Designed with reliability and security in mind for everyday workloads.
+</p>
+</div>
+
+</div>
+
+</section>
+
+<footer>
+
+© 2026 LocalWare. All rights reserved.<br><br>
+
+LocalHost™ and LocalWare™ are trademarks of LocalWare.
+
+Note: The Current version is an early access release. Features might be broken or missing. VMs are not gonna run, and the software is not production ready, note that this is not for commercial use and is still broken
+
+</footer>
+
+</body>
+</html>
