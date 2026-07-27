@@ -6180,7 +6180,16 @@ int main(int argc, char *argv[]) {
             QueryPerformanceCounter(&bpNow);
             double sinceLastMs = (lastBpDiscoveryAttempt.QuadPart == 0) ? 1e9 :
                 (double)(bpNow.QuadPart - lastBpDiscoveryAttempt.QuadPart) * 1000.0 / perfFrequency.QuadPart;
-            if (sinceLastMs >= 200.0) {
+            // U33b: the 200ms throttle is fine on pass 1 but it caps how early
+            // the U33 pool-descriptor poll can start on pass 2, because that poll
+            // needs g_bpModuleBase and so cannot run until discovery succeeds.
+            // Run 1 discovered the pass-2 kernel at exitCount 857744, leaving a
+            // ~200ms (~10k exit) blind window after the pass-2 kernel began
+            // executing -- and on pass 1 the descriptor init fires only ~10k
+            // exits after discovery, i.e. exactly inside a window that size. So a
+            // set-then-cleared sequence could hide there. Tighten the throttle
+            // once a reset has been seen to shrink that window ~20x.
+            if (sinceLastMs >= (g_sawReset ? 10.0 : 200.0)) {
                 lastBpDiscoveryAttempt = bpNow;
                 WHV_REGISTER_NAME cr3Name = WHvX64RegisterCr3;
                 WHV_REGISTER_VALUE cr3Val = { 0 };
@@ -6223,6 +6232,10 @@ int main(int argc, char *argv[]) {
                             g_helperEntryHitCount = 0;
                             g_loopAdvArmed = 0; // U28: armed later, in-window
                             g_loopAdvHitCount = 0;
+                            // U33b: exitCount here dates the start of the U33 poll's
+                            // validity, which run 1 could only infer from nearby
+                            // heartbeats. Needed to state the blind window exactly.
+                            printf("[wp] DISCOVERY at exitCount=%ld (pass %s)\n", exitCount, g_sawReset ? "2" : "1");
                             printf("[wp] armed breakpoints at module base 0x%llX (DR2 LFH-check armed=%d): DR0=+0x%X (HalpIommuInitSystem entry, VA=0x%llX), DR1=+0x%X (KeBugCheckEx, VA=0x%llX), DR2=+0x%X (RtlpHpLfhOwnerMoveSubsegment entry, VA=0x%llX), DR3=+0x%X (HalpIommuInitSystem ret, VA=0x%llX)\n",
                                    (unsigned long long)g_bpModuleBase, g_sawReset ? 1 : 0,
                                    WP_RETURN_RVA, (unsigned long long)g_wpTargetVA0,
