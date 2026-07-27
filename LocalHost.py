@@ -1632,7 +1632,7 @@ class LocalHostWindow(QMainWindow):
 
         self.get_started_btn = self._make_home_button("Get Started")
         self.create_vm_btn = self._make_home_button("Create a New Virtual Machine")
-        self.connect_server_btn = self._make_home_button("Connect to Server")
+        self.connect_server_btn = self._make_home_button("Connect to VPS")
 
         self.get_started_btn.clicked.connect(self.on_get_started)
         self.create_vm_btn.clicked.connect(self.on_create_vm)
