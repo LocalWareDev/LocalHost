@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <intrin.h>
 #include <stdarg.h>
+#include <errno.h>
 
 unsigned char cmosRegisters[256] = { 0 };
 unsigned char cmosSelectedReg = 0;
@@ -451,6 +452,42 @@ int g_getsubWindowArmed = 0;
 // (the context) is null, capture ptrB=[rsp+0x58] (what structure holds the null
 // context pointer) + dump around it -- identifies the true root datum.
 #define GETSUB_RVA 0x236C58          /* ExAllocateHeapPool, after r10=*(*(rsp+0x58)) */
+
+// U33 (2026-07-27): U32 proved the init gap (pass 1 populates the ExPoolState
+// pool descriptors, pass 2 leaves them zero) but sampled only every 200k exits,
+// which is far too coarse to answer the remaining question: is the descriptor
+// init NEVER RUN on pass 2, or is it run and then EXPLICITLY CLEARED without a
+// rebuild? Those are different bugs with different fixes, and the 2026-07-17
+// note ("investigate whether the array is never initialized post-reset or
+// explicitly cleared without rebuild") left it open.
+//
+// Deliberately a DATA instrument, not a breakpoint. A breakpoint on
+// ExInitializePoolHeapManagement (RVA 0x3C3B64, the only writer to this array
+// in the whole image) would very likely miss on pass 2 by construction:
+// breakpoints can only be armed after opportunistic module discovery (200ms
+// throttle, requires a canonical kernel RIP), while pool-heap init runs
+// extremely early in Phase 0. That is exactly the re-arm-lag trap that produced
+// U15's false "0 hits -> different caller" headline, later walked back by U17.
+// Polling guest memory needs no arming and cannot be outrun, so it is valid
+// from the first exit of each pass.
+//
+// EDGE-TRIGGERED: poll often but log only on CHANGE, so granularity can be
+// tight without flooding the log. A null->nonnull edge dates the init; a
+// nonnull->null edge would prove the clear-without-rebuild variant instead.
+#define U33_POLL_INTERVAL 2000L   /* exits between descriptor polls */
+#define U33_POOLS 4               /* pool types 0..3 */
+#define U33_MAX_EDGES 400         /* bound the log if something oscillates */
+#define EXPOOLSTATE_DESC_RVA 0xC57EC0ULL /* ExPoolState+0x3900, descriptor[0] */
+#define EXPOOLSTATE_DESC_STRIDE 0x20C0ULL
+
+// U27/U33: the kernel-image dump used to go to a session-scoped agent scratchpad
+// directory, which has now been purged TWICE (noted in U27, again on 2026-07-27),
+// silently breaking re-capture because fopen() on the dead path just fails. Use a
+// stable location outside the project instead: *.bin is gitignored so it would
+// never reach Git anyway, and keeping it out of the project also keeps the 16MB
+// blob out of every SD-card robocopy sync.
+#define KDUMP_DIR  "C:\\LocalHost-evidence"
+#define KDUMP_PATH KDUMP_DIR "\\ntoskrnl_dump.bin"
 
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
@@ -6222,8 +6259,17 @@ int main(int argc, char *argv[]) {
                             static int g_kernelDumped = 0;
                             if (!g_kernelDumped) {
                                 g_kernelDumped = 1;
-                                const char *dpath = "C:\\Users\\DELL\\AppData\\Local\\Temp\\claude\\c--Users-DELL-OneDrive-Desktop-LocalHost-py\\c66b1c4e-0568-43ec-a192-37631199a9df\\scratchpad\\ntoskrnl_dump.bin";
+                                const char *dpath = KDUMP_PATH;
+                                CreateDirectoryA(KDUMP_DIR, NULL); // harmless if it already exists
                                 FILE *df = fopen(dpath, "wb");
+                                if (!df) {
+                                    // Previously this failure was silent, and because the
+                                    // old path pointed into a purged session scratchpad it
+                                    // failed EVERY run -- the dump simply never reappeared.
+                                    printf("[u27] FAILED to open %s for the kernel dump (errno %d) -- offline disasm will be unavailable\n",
+                                           dpath, errno);
+                                    fflush(stdout);
+                                }
                                 if (df) {
                                     unsigned char page[0x1000];
                                     UINT64 off; int okPages = 0;
@@ -6248,26 +6294,83 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // U32: milestone dump of ExPoolState pool-descriptor +0x08/+0x10 fields
-        // to watch pool-heap init evolve across BOTH passes. +0x08 has a known
-        // writer (ExInitializePoolHeapManagement); +0x10 is the suspect that
-        // stays NULL. If +0x10 populates on pass 1 but not pass 2, that pins the
-        // skipped init step. Fires every 200k exits (bounded).
+        // U33: edge-triggered tracker for the ExPoolState pool-descriptor
+        // +0x08/+0x10 fields, replacing U32's every-200k unconditional dump.
+        // U32 already proved the gap; the open question is WHICH of the two
+        // mechanisms produces it, and 200k-exit granularity cannot tell them
+        // apart. See the U33 comment block near GETSUB_RVA for why this is a
+        // memory poll rather than a breakpoint on the (single) writer.
+        //
+        // Reading these fields costs a CR3 fetch + a page-table walk per pool,
+        // so poll on an interval but only PRINT on a transition. Each edge is
+        // reported with both absolute exitCount and, on pass 2, the offset from
+        // the reset -- the reset-relative number is the one comparable across
+        // runs, since the crash exitCount itself varies run-to-run (U28).
         if (g_bpModuleBase) {
-            static long g_nextPoolDumpEC = 200000L;
-            if (exitCount >= g_nextPoolDumpEC) {
-                g_nextPoolDumpEC = exitCount + 200000L;
+            static long g_nextPoolPollEC = 0;
+            static UINT64 g_lastF08[U33_POOLS], g_lastF10[U33_POOLS];
+            // Per-pool, NOT shared: a descriptor page can be unmapped on an early
+            // poll, and a shared flag would then mislabel that pool's first
+            // successful read as an INIT edge from a baseline it never actually
+            // observed. Each pool is primed only by its own first good read.
+            static int g_poolPrimed[U33_POOLS];
+            static int g_poolPollPass = 0;     /* pass the baselines belong to */
+            static int g_poolEdges = 0;
+            static int g_anyPrimed = 0;
+            int curPass = g_sawReset ? 2 : 1;
+            // Re-baseline at the pass boundary: pass 2 runs a freshly KASLR'd
+            // kernel, so pass-1 values are not a meaningful comparison point and
+            // carrying them over would fake an edge at the first pass-2 poll.
+            if (g_anyPrimed && curPass != g_poolPollPass) {
+                int rb;
+                for (rb = 0; rb < U33_POOLS; rb++) g_poolPrimed[rb] = 0;
+                g_anyPrimed = 0;
+                g_poolEdges = 0;
+                printf("[u33] pass boundary -- re-baselining pool-descriptor tracker for pass %d\n", curPass);
+                fflush(stdout);
+            }
+            if (exitCount >= g_nextPoolPollEC && g_poolEdges < U33_MAX_EDGES) {
+                g_nextPoolPollEC = exitCount + U33_POLL_INTERVAL;
                 WHV_REGISTER_NAME c3n = WHvX64RegisterCr3; WHV_REGISTER_VALUE c3v = { 0 };
                 if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, &c3n, 1, &c3v)) && c3v.Reg64) {
-                    printf("[u32ms] exitCount=%ld pass=%s ExPoolState desc +0x08/+0x10:", exitCount, g_sawReset ? "2" : "1");
                     int pi;
-                    for (pi = 0; pi < 4; pi++) {
-                        UINT64 descRva = 0xC57EC0ULL + (UINT64)pi * 0x20c0ULL;
+                    for (pi = 0; pi < U33_POOLS; pi++) {
+                        UINT64 descVA = g_bpModuleBase + EXPOOLSTATE_DESC_RVA + (UINT64)pi * EXPOOLSTATE_DESC_STRIDE;
                         unsigned char fld[0x18] = { 0 };
-                        if (kernelReadVA((unsigned char *)guestMemory, c3v.Reg64, g_bpModuleBase + descRva, fld, sizeof(fld)))
-                            printf(" p%d[+8=0x%llX +10=0x%llX]", pi, (unsigned long long)*(UINT64 *)&fld[0x08], (unsigned long long)*(UINT64 *)&fld[0x10]);
+                        if (!kernelReadVA((unsigned char *)guestMemory, c3v.Reg64, descVA, fld, sizeof(fld)))
+                            continue; // not mapped yet -- normal very early in a pass
+                        UINT64 f08 = *(UINT64 *)&fld[0x08], f10 = *(UINT64 *)&fld[0x10];
+                        if (g_poolPrimed[pi] && f08 == g_lastF08[pi] && f10 == g_lastF10[pi])
+                            continue; // unchanged -- the overwhelmingly common case
+                        if (!g_poolPrimed[pi]) {
+                            printf("[u33] baseline pass=%d exitCount=%ld pool[%d] +0x08=0x%llX +0x10=0x%llX\n",
+                                   curPass, exitCount, pi,
+                                   (unsigned long long)f08, (unsigned long long)f10);
+                        } else {
+                            // Classify each field's edge. null->nonnull = the init
+                            // running; nonnull->null = an explicit clear, which is
+                            // the hypothesis U33 exists to confirm or kill.
+                            const char *e08 = (g_lastF08[pi] == 0 && f08 != 0) ? " +0x08 INIT(null->set)" :
+                                              (g_lastF08[pi] != 0 && f08 == 0) ? " +0x08 CLEARED(set->null)" : "";
+                            const char *e10 = (g_lastF10[pi] == 0 && f10 != 0) ? " +0x10 INIT(null->set)" :
+                                              (g_lastF10[pi] != 0 && f10 == 0) ? " +0x10 CLEARED(set->null)" : "";
+                            printf("[u33] EDGE pass=%d exitCount=%ld", curPass, exitCount);
+                            if (curPass == 2 && g_resetExitCount)
+                                printf(" (reset+%ld)", exitCount - g_resetExitCount);
+                            printf(" pool[%d]: +0x08 0x%llX->0x%llX +0x10 0x%llX->0x%llX%s%s\n",
+                                   pi,
+                                   (unsigned long long)g_lastF08[pi], (unsigned long long)f08,
+                                   (unsigned long long)g_lastF10[pi], (unsigned long long)f10,
+                                   e08, e10);
+                            g_poolEdges++;
+                        }
+                        g_lastF08[pi] = f08;
+                        g_lastF10[pi] = f10;
+                        g_poolPrimed[pi] = 1;
+                        g_anyPrimed = 1;
+                        fflush(stdout);
                     }
-                    printf("\n"); fflush(stdout);
+                    g_poolPollPass = curPass;
                 }
             }
         }
