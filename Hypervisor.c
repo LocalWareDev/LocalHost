@@ -264,7 +264,24 @@ LARGE_INTEGER lastToggleTime;
 //     point (RVA 0x9A188F = entry+0x1DF, the `ret` instruction, EAX
 //     already holds its real return value at this exact point) -- reads
 //     EAX on every hit.
-#define WP_RETURN_RVA 0x9A16B0           /* HalpIommuInitSystem entry (U13, multi-shot like DR3) */
+// U34 (2026-07-27): DR0 retargeted from HalpIommuInitSystem entry (that whole
+// loop was proven to be normal boot activity, identical on both passes, by U20)
+// to ExInitializePoolHeapManagement's entry. U33 proved the ExPoolState pool
+// descriptors are never initialized on pass 2; the open question is whether this
+// function -- the only writer to that array in the image -- is even CALLED.
+//
+// RVA verified against ntkrnlmp.pdb via tools/pdbsym.py (whose selftest checks
+// five independently-established anchors first), not taken on faith from a
+// comment.
+//
+// This site is NOT subject to the U15 re-arm-lag trap that invalidated earlier
+// "0 hits" claims: U33 timed the pass-1 init at ~12000 exits AFTER module
+// discovery, and discovery is exactly when breakpoints are armed. So pass 1
+// firing is a positive control proving the instrument works, which is what makes
+// silence on pass 2 evidence rather than an artifact. One-shot per pass (the
+// function runs once), and it walks the stack to name its own callers, giving
+// the next rung to instrument if pass 2 turns out never to call it.
+#define WP_RETURN_RVA 0x3C3B64           /* ExInitializePoolHeapManagement entry (U34) */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
@@ -288,7 +305,7 @@ LARGE_INTEGER lastToggleTime;
 // corruption (the real lead).
 #define WP_PHASE1INIT_ENTRY_RVA 0x3FD6F0 /* KeBugCheckEx entry (U21) */
 #define CRASH_STACK_SCAN_BYTES 0x400     /* deep stack walk, kept for the (now unused) crash-site slot's code path */
-#define POOL_CALLER_MAX_HITS 200
+#define POOL_CALLER_MAX_HITS 1  /* U34: one-shot -- pool init runs once per boot */
 #define HELPER_ENTRY_MAX_HITS 3000
 
 // 2026-07-18, U10: the live check above (WP_RETURN_RVA) falsified the
@@ -6236,7 +6253,7 @@ int main(int argc, char *argv[]) {
                             // validity, which run 1 could only infer from nearby
                             // heartbeats. Needed to state the blind window exactly.
                             printf("[wp] DISCOVERY at exitCount=%ld (pass %s)\n", exitCount, g_sawReset ? "2" : "1");
-                            printf("[wp] armed breakpoints at module base 0x%llX (DR2 LFH-check armed=%d): DR0=+0x%X (HalpIommuInitSystem entry, VA=0x%llX), DR1=+0x%X (KeBugCheckEx, VA=0x%llX), DR2=+0x%X (RtlpHpLfhOwnerMoveSubsegment entry, VA=0x%llX), DR3=+0x%X (HalpIommuInitSystem ret, VA=0x%llX)\n",
+                            printf("[wp] armed breakpoints at module base 0x%llX (DR2 LFH-check armed=%d): DR0=+0x%X (U34 ExInitializePoolHeapManagement entry, VA=0x%llX), DR1=+0x%X (KeBugCheckEx, VA=0x%llX), DR2=+0x%X (RtlpHpLfhOwnerMoveSubsegment entry, VA=0x%llX), DR3=+0x%X (HalpIommuInitSystem ret, VA=0x%llX)\n",
                                    (unsigned long long)g_bpModuleBase, g_sawReset ? 1 : 0,
                                    WP_RETURN_RVA, (unsigned long long)g_wpTargetVA0,
                                    WP_PHASE1INIT_ENTRY_RVA, (unsigned long long)g_wpTargetVA1,
@@ -6393,7 +6410,14 @@ int main(int argc, char *argv[]) {
         // point DR2 at GetSubsegment+0x45 and set L2. This bounds the hot-site
         // overhead to the final pre-crash window while still containing the fatal
         // (already-corrupt) subsegment call.
-        if (g_wpArmed && g_sawReset && !g_getsubWindowArmed && g_bpModuleBase &&
+        // U34: disabled. This armed a HOT site (U28 measured 3.4M calls) purely to
+        // recover the null-owner subsegment, a question U29-U33 have since answered.
+        // Keeping it armed only adds timing distortion to the pass-2 window that U34
+        // now needs to observe cleanly. Set to 1 to re-enable if that capture is
+        // ever wanted again.
+#define U28_GETSUB_WINDOW_ENABLED 0
+        if (U28_GETSUB_WINDOW_ENABLED &&
+            g_wpArmed && g_sawReset && !g_getsubWindowArmed && g_bpModuleBase &&
             g_resetExitCount && exitCount > g_resetExitCount + GETSUB_WINDOW_START) {
             g_wpTargetVA = g_bpModuleBase + GETSUB_RVA;
             WHV_REGISTER_NAME awNames[2] = { WHvX64RegisterDr2, WHvX64RegisterDr7 };
@@ -7119,51 +7143,48 @@ int main(int argc, char *argv[]) {
                         break;
                     }
 
-                    // DR0 (repurposed for U13): multi-shot tracer at
-                    // HalpIommuInitSystem's own entry. RIP is AT the
-                    // function's entry, not yet executed -- RCX/RDX/R8/R9
-                    // are its real, live arguments (standard x64 calling
-                    // convention). Its own first instructions test RCX
-                    // (the outer loop index passed by HalpInitSystemHelper)
-                    // for zero, so this directly shows what it's being
-                    // invoked with on every retry.
+                    // DR0 (U34): one-shot tracer at ExInitializePoolHeapManagement's
+                    // entry -- the only writer to the ExPoolState pool-descriptor
+                    // array in the image, and the function U33 showed must have run
+                    // on pass 1 (descriptors populate) but appears not to on pass 2
+                    // (they stay zero through the crash).
+                    //
+                    // RIP is AT the entry, before the prologue, so [rsp+0x00] is
+                    // still the genuine return address and the qwords above it are
+                    // the caller frames. Walking them names the Phase-0/1 chain that
+                    // reaches this init on pass 1, which is the next rung to
+                    // instrument if pass 2 never gets here.
+                    //
+                    // One-shot: this runs once per boot, and leaving an exec
+                    // breakpoint armed on an executed entry re-faults on resume (no
+                    // RF handling -- see the U21 note), spewing duplicate hits.
                     if (wpRip == g_wpTargetVA0 && g_poolCallerArmed) {
                         g_poolCallerHitCount++;
-                        WHV_REGISTER_NAME poolRegNames[10] = { WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterRsp, WHvX64RegisterCr3, WHvX64RegisterRbx, WHvX64RegisterRsi, WHvX64RegisterRdi, WHvX64RegisterRbp };
-                        WHV_REGISTER_VALUE poolRegVals[10] = { 0 };
-                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, poolRegNames, 10, poolRegVals))) {
-                            // U18: rbx/rsi/rdi are non-volatile, so they still hold
-                            // HalpInitSystemHelper's live loop state here (ebx=outer
-                            // index, rsi=table ptr, edi=inner index). If identical
-                            // across consecutive pass-2 calls, the loop is frozen
-                            // (something external resets it); if advancing, cycling.
-                            // U19: rbp = ebp = the loop's outer LIMIT (edx arg
-                            // copied to ebp at helper+0x2D); ebx = outer index.
-                            // Loop exits when ebx > ebp. If ebp is huge/corrupt,
-                            // the outer loop iterates effectively forever.
-                            printf("    [loopstate] ebx=0x%llX ebp(limit)=0x%llX rsi=0x%llX edi=0x%llX\n",
-                                   (unsigned long long)poolRegVals[6].Reg64,
-                                   (unsigned long long)(poolRegVals[9].Reg64 & 0xFFFFFFFFULL),
-                                   (unsigned long long)poolRegVals[7].Reg64,
-                                   (unsigned long long)(poolRegVals[8].Reg64 & 0xFFFFFFFFULL));
-                            // U17: RIP is AT the function entry (not yet executed),
-                            // so [rsp+0x00] is the guaranteed real return address =
-                            // the caller. Read the top few stack qwords and resolve
-                            // each canonical kernel address to module+RVA.
+                        WHV_REGISTER_NAME poolRegNames[6] = { WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterRsp, WHvX64RegisterCr3 };
+                        WHV_REGISTER_VALUE poolRegVals[6] = { 0 };
+                        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, poolRegNames, 6, poolRegVals))) {
                             UINT64 iRsp = poolRegVals[4].Reg64, iCr3 = poolRegVals[5].Reg64;
-                            printf("[iommuargs] hit #%d: HalpIommuInitSystem called with rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX exitCount=%ld\n",
-                                   g_poolCallerHitCount,
+                            printf("[u34] *** ExInitializePoolHeapManagement ENTERED *** pass=%s exitCount=%ld",
+                                   g_sawReset ? "2" : "1", exitCount);
+                            if (g_sawReset && g_resetExitCount)
+                                printf(" (reset+%ld)", exitCount - g_resetExitCount);
+                            printf("\n[u34]   args rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX\n",
                                    (unsigned long long)poolRegVals[0].Reg64, (unsigned long long)poolRegVals[1].Reg64,
                                    (unsigned long long)poolRegVals[2].Reg64, (unsigned long long)poolRegVals[3].Reg64,
-                                   (unsigned long long)iRsp, exitCount);
-                            unsigned char iStk[0x40] = { 0 };
+                                   (unsigned long long)iRsp);
+                            // 0x80 rather than 0x40: the caller chain we actually want
+                            // (KiSystemStartup -> KiInitializeKernel -> ... -> here)
+                            // can sit several frames up, and non-canonical/garbage
+                            // slots are filtered out anyway.
+                            unsigned char iStk[0x80] = { 0 };
                             if (kernelReadVA((unsigned char *)guestMemory, iCr3, iRsp, iStk, sizeof(iStk))) {
                                 int isk;
+                                printf("[u34]   caller chain (resolve RVAs with tools/pdbsym.py rva <rva>):\n");
                                 for (isk = 0; isk < (int)sizeof(iStk); isk += 8) {
                                     UINT64 qv = *(UINT64 *)&iStk[isk];
                                     if (qv >= 0xFFFF800000000000ULL) {
                                         UINT64 cb = 0;
-                                        printf("    [rsp+0x%02X]=0x%llX", isk, (unsigned long long)qv);
+                                        printf("[u34]     [rsp+0x%02X]=0x%llX", isk, (unsigned long long)qv);
                                         if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, iCr3, qv, &cb))
                                             printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb, (unsigned long long)(qv - cb));
                                         printf("\n");
@@ -7176,7 +7197,7 @@ int main(int argc, char *argv[]) {
                         WHV_REGISTER_VALUE dr6ClearVal3 = { 0 };
                         WHvSetVirtualProcessorRegisters(partition, 0, &dr6ClearName3, 1, &dr6ClearVal3);
                         if (g_poolCallerHitCount >= POOL_CALLER_MAX_HITS) {
-                            printf("[iommuargs] cap reached (%d hits) -- disabling DR0 for this pass\n", POOL_CALLER_MAX_HITS);
+                            printf("[u34] one-shot fired (%d hit) -- disarming DR0 for this pass\n", POOL_CALLER_MAX_HITS);
                             fflush(stdout);
                             WHV_REGISTER_NAME dr7ReadName3 = WHvX64RegisterDr7;
                             WHV_REGISTER_VALUE dr7ReadVal3 = { 0 };
