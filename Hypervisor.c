@@ -281,7 +281,53 @@ LARGE_INTEGER lastToggleTime;
 // silence on pass 2 evidence rather than an artifact. One-shot per pass (the
 // function runs once), and it walks the stack to name its own callers, giving
 // the next rung to instrument if pass 2 turns out never to call it.
-#define WP_RETURN_RVA 0x3C3B64           /* ExInitializePoolHeapManagement entry (U34) */
+// U35 (2026-07-27): moved one rung up the chain. U34 established that
+// ExInitializePoolHeapManagement is never called on pass 2, and that its pass-1
+// caller is MiInitNucleus+0x44B -- so pool-heap init is reached from the memory
+// manager's Phase-0 nucleus init. The question becomes whether MiInitNucleus
+// itself runs on pass 2 (making the divergence a truncation INSIDE it, before
+// +0x44B) or never runs either (pushing the divergence further up into MM init).
+//
+// Positive-control caveat, to be checked in the log rather than assumed: on
+// pass 1 the pool init fired ~11800 exits after module discovery, and
+// MiInitNucleus entry precedes that call site by only a short distance. If
+// MiInitNucleus entry turns out to land BEFORE discovery on pass 1, this
+// breakpoint loses its control and a pass-2 miss would be uninterpretable --
+// the U15 trap. Verify pass 1 fires before drawing any pass-2 conclusion.
+// U36 (2026-07-27): chain resolved so far, bottom-up --
+//   InitBootProcessor+0x57A -> MmInitSystem+0xD5 -> MiInitNucleus+0x44B
+//   -> ExInitializePoolHeapManagement -> ExPoolState descriptors
+// U34 and U35 showed neither ExInitializePoolHeapManagement nor MiInitNucleus
+// runs on pass 2, both with a working pass-1 positive control.
+//
+// Skipping MmInitSystem deliberately: it calls MiInitNucleus only 0xD5 bytes in,
+// so if MmInitSystem ran at all, MiInitNucleus would almost certainly have been
+// reached. InitBootProcessor is the more informative target -- it has 0x57A
+// bytes of body before it calls MmInitSystem, i.e. real room to start and then
+// truncate. If it fires on pass 2, the divergence is localized INSIDE
+// InitBootProcessor; if it does not, the divergence is higher still
+// (KiSystemStartup / KiInitializeKernel level).
+//
+// U36 RESULT (2026-07-27): InitBootProcessor entry is NOT OBSERVABLE this way.
+// Armed at 0xA3D054 it fired on NEITHER pass -- including pass 1, which was the
+// positive control -- because its entry precedes module discovery (discovery at
+// 107795, pool-init edge at 119795). No control means a pass-2 miss carries no
+// information, so that run was discarded rather than interpreted. Do not retry
+// this site at its entry; anything at or above InitBootProcessor's entry is
+// unreachable by discovery-armed breakpoints.
+//
+// U37: back to MmInitSystem, the rung U36 skipped on the (sound but unverified)
+// argument that MiInitNucleus is called only 0xD5 into it. That shortcut was a
+// mistake: MmInitSystem is the ONLY rung in this region that is both above
+// MiInitNucleus and still testable, because its entry (~113700 on pass 1, per the
+// U35 run where MiInitNucleus hit at 113752) lands AFTER discovery. Outcomes:
+//   fires on pass 2  -> divergence is inside MmInitSystem's first 0xD5 bytes
+//   silent on pass 2 -> divergence is above it, i.e. InitBootProcessor never
+//                       reaches its +0x57A call, pushing the question into the
+//                       pre-discovery region that needs a different technique
+//                       (e.g. a data poll like U33, not a breakpoint).
+#define WP_RETURN_RVA 0xA56F60          /* MmInitSystem entry (U37) */
+#define U34_SITE_NAME "MmInitSystem"    /* label for the DR0 one-shot logging */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
@@ -7164,7 +7210,7 @@ int main(int argc, char *argv[]) {
                         WHV_REGISTER_VALUE poolRegVals[6] = { 0 };
                         if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, poolRegNames, 6, poolRegVals))) {
                             UINT64 iRsp = poolRegVals[4].Reg64, iCr3 = poolRegVals[5].Reg64;
-                            printf("[u34] *** ExInitializePoolHeapManagement ENTERED *** pass=%s exitCount=%ld",
+                            printf("[u34] *** " U34_SITE_NAME " ENTERED *** pass=%s exitCount=%ld",
                                    g_sawReset ? "2" : "1", exitCount);
                             if (g_sawReset && g_resetExitCount)
                                 printf(" (reset+%ld)", exitCount - g_resetExitCount);
