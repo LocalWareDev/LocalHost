@@ -602,6 +602,96 @@ int g_getsubWindowArmed = 0;
 #define KDUMP_DIR  "C:\\LocalHost-evidence"
 #define KDUMP_PATH KDUMP_DIR "\\ntoskrnl_dump.bin"
 
+// U40 (2026-07-28): arming-free RIP sampler.
+//
+// U36 and U39 established a hard floor on the breakpoint technique: on pass 1 the
+// sites at and below HalInitSystem's entry execute BEFORE module discovery, so
+// they can never be armed in time, and a pass-2 miss there carries no information.
+// U38 narrowed the pass-2 truncation to InitBootProcessor (+0x312, +0x348) -- i.e.
+// inside HalInitSystem -- but confirming pass 2 even REACHES HalInitSystem needs an
+// instrument that requires no arming at all.
+//
+// VpContext.Rip is already read every iteration of the run loop, so sampling it is
+// free and valid from the first exit of a pass, exactly like U33's memory poll was.
+// Bucket samples by 4KB page into a small open-addressed histogram (one per pass)
+// and keep a ring of recent samples. Dumped on reset, on the bugcheck, and
+// periodically. Raw pages are printed alongside pass-relative RVAs so the
+// pre-discovery samples (taken before any base is known) stay usable: resolve them
+// later with tools/pdbsym.py.
+// Pass 2's kernel turned out to execute only ~3200 exits before the bugcheck, so
+// the pass-1-calibrated 100-exit interval yields barely 30 kernel samples there.
+// Sample 10x denser once past the reset, and keep a longer ring, to resolve the
+// actual pass-2 kernel trace rather than just its endpoint.
+#define U40_SAMPLE_INTERVAL 100L   /* exits between RIP samples (pass 1) */
+#define U40_SAMPLE_INTERVAL_P2 10L /* denser once past the reset */
+#define U40_BUCKETS 1024           /* power of two, open addressing */
+#define U40_RING 256               /* recent samples kept verbatim */
+#define U40_TOPN 18                /* hottest pages reported per dump */
+#define U40_DUMP_INTERVAL 250000L  /* periodic dump cadence */
+
+typedef struct { UINT64 page; long count; } U40Bucket;
+static U40Bucket g_ripHist[2][U40_BUCKETS];
+static UINT64 g_ripRing[2][U40_RING];
+static long g_ripRingEC[2][U40_RING];
+static int g_ripRingPos[2];
+static long g_ripSamples[2];
+static UINT64 g_passModuleBase[2];   /* base discovered during each pass, for RVAs */
+
+static void u40Sample(UINT64 rip, int pass, long ec) {
+    UINT64 page = rip >> 12;
+    unsigned int h = (unsigned int)((page * 0x9E3779B1ULL) & (U40_BUCKETS - 1));
+    unsigned int i;
+    g_ripSamples[pass]++;
+    g_ripRing[pass][g_ripRingPos[pass]] = rip;
+    g_ripRingEC[pass][g_ripRingPos[pass]] = ec;
+    g_ripRingPos[pass] = (g_ripRingPos[pass] + 1) % U40_RING;
+    for (i = 0; i < U40_BUCKETS; i++) {
+        unsigned int slot = (h + i) & (U40_BUCKETS - 1);
+        if (g_ripHist[pass][slot].count == 0) {       /* empty -> claim it */
+            g_ripHist[pass][slot].page = page;
+            g_ripHist[pass][slot].count = 1;
+            return;
+        }
+        if (g_ripHist[pass][slot].page == page) {
+            g_ripHist[pass][slot].count++;
+            return;
+        }
+    }
+    /* Table full: drop the sample rather than evict, so counts stay truthful. */
+}
+
+static void u40Dump(int pass, const char *why) {
+    UINT64 base = g_passModuleBase[pass];
+    int shown, k;
+    printf("[u40] === RIP histogram pass %d (%s): %ld samples, base=0x%llX ===\n",
+           pass + 1, why, g_ripSamples[pass], (unsigned long long)base);
+    if (g_ripSamples[pass] == 0) { fflush(stdout); return; }
+    for (shown = 0; shown < U40_TOPN; shown++) {
+        int best = -1; long bestCount = 0;
+        for (k = 0; k < U40_BUCKETS; k++) {
+            if (g_ripHist[pass][k].count > bestCount) { bestCount = g_ripHist[pass][k].count; best = k; }
+        }
+        if (best < 0) break;
+        UINT64 pg = g_ripHist[pass][best].page;
+        UINT64 va = pg << 12;
+        printf("[u40]   %6ld  page 0x%llX", bestCount, (unsigned long long)va);
+        if (base && va >= base && va - base < 0x2000000ULL)
+            printf("  = base+0x%llX", (unsigned long long)(va - base));
+        printf("\n");
+        g_ripHist[pass][best].count = -bestCount;   /* mark as reported */
+    }
+    for (k = 0; k < U40_BUCKETS; k++)               /* restore counts */
+        if (g_ripHist[pass][k].count < 0) g_ripHist[pass][k].count = -g_ripHist[pass][k].count;
+    printf("[u40]   most recent %d samples (newest last):\n[u40]    ", U40_RING);
+    for (k = 0; k < U40_RING; k++) {
+        int idx = (g_ripRingPos[pass] + k) % U40_RING;
+        if (g_ripRing[pass][idx])
+            printf(" %llX@%ld", (unsigned long long)g_ripRing[pass][idx], g_ripRingEC[pass][idx]);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
 
@@ -5166,6 +5256,10 @@ DWORD WINAPI stallWatchdogThread(LPVOID param) {
                         } else {
                             printf("[kerneldiag] failed to read KiBugCheckData at VA 0x%llX\n", (unsigned long long)kiBugCheckDataVA);
                         }
+                        // U40: profile of the pass that just bugchecked. This is the
+                        // pass-2 execution picture that breakpoints cannot produce,
+                        // since it includes the pre-discovery region.
+                        u40Dump(g_sawReset ? 1 : 0, "at bugcheck");
 
                         // Bugcheck 0x139 (KERNEL_SECURITY_CHECK_FAILURE)
                         // seen after the experimental port-0x64/0xFE reset
@@ -6278,6 +6372,24 @@ int main(int argc, char *argv[]) {
         hr = WHvRunVirtualProcessor(partition, 0, &exitContext, sizeof(exitContext));
         if (FAILED(hr)) { printf("Failed to run vCPU. HRESULT: 0x%lx\n", hr); break; }
 
+        // U40: sample RIP. Free -- VpContext.Rip is already populated by the exit
+        // above, so no extra WHP register read. Needs no arming, so unlike a
+        // breakpoint it is valid from the first exit of each pass, which is the
+        // whole point (see the U40 comment block above).
+        {
+            int u40pass = g_sawReset ? 1 : 0;
+            static long g_nextRipSample = 0;
+            static long g_nextRipDump = U40_DUMP_INTERVAL;
+            if (exitCount >= g_nextRipSample) {
+                g_nextRipSample = exitCount + (g_sawReset ? U40_SAMPLE_INTERVAL_P2 : U40_SAMPLE_INTERVAL);
+                u40Sample(exitContext.VpContext.Rip, u40pass, exitCount);
+            }
+            if (exitCount >= g_nextRipDump) {
+                g_nextRipDump = exitCount + U40_DUMP_INTERVAL;
+                u40Dump(u40pass, "periodic");
+            }
+        }
+
         // Opportunistic breakpoint-site discovery: as soon as RIP looks
         // like a plausible canonical kernel address and we haven't
         // already located+patched this boot instance's ntoskrnl.exe,
@@ -6331,7 +6443,15 @@ int main(int argc, char *argv[]) {
                         // U28: DR2 (L2) is NOT armed at discovery -- the hot
                         // GetSubsegment site is armed later, only inside the narrow
                         // pre-crash exitCount window (see windowed-arm block below).
-                        wpVals[4].Reg64 = 0x1ULL | 0x4ULL | 0x40ULL | (1ULL << 10);
+                        // U40: L3 (DR3 at HalpIommuInitSystem's ret) deliberately NOT
+                        // set any more. That site is inside the very HAL code the RIP
+                        // sampler needs to observe, and per the U21 note an exec
+                        // breakpoint on an executed instruction re-faults on resume --
+                        // which pinned 30 of pass 2's ~30 kernel samples at
+                        // HalpIommuInitSystem+0x1DF in the first U40 run. That tail was
+                        // our own instrument, not guest behaviour. L0 (U34 site) and
+                        // L1 (KeBugCheckEx) only.
+                        wpVals[4].Reg64 = 0x1ULL | 0x4ULL | (1ULL << 10);
                         if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, wpNames, 5, wpVals))) {
                             g_wpArmed = 1;
                             g_wp0Fired = 0;
@@ -6349,6 +6469,7 @@ int main(int argc, char *argv[]) {
                             // validity, which run 1 could only infer from nearby
                             // heartbeats. Needed to state the blind window exactly.
                             printf("[wp] DISCOVERY at exitCount=%ld (pass %s)\n", exitCount, g_sawReset ? "2" : "1");
+                            g_passModuleBase[g_sawReset ? 1 : 0] = g_bpModuleBase; // U40: for RVA-relative histogram output
                             printf("[wp] armed breakpoints at module base 0x%llX (DR2 LFH-check armed=%d): DR0=+0x%X (U34 ExInitializePoolHeapManagement entry, VA=0x%llX), DR1=+0x%X (KeBugCheckEx, VA=0x%llX), DR2=+0x%X (RtlpHpLfhOwnerMoveSubsegment entry, VA=0x%llX), DR3=+0x%X (HalpIommuInitSystem ret, VA=0x%llX)\n",
                                    (unsigned long long)g_bpModuleBase, g_sawReset ? 1 : 0,
                                    WP_RETURN_RVA, (unsigned long long)g_wpTargetVA0,
@@ -6869,6 +6990,7 @@ int main(int argc, char *argv[]) {
                         g_getsubWindowArmed = 0;
 
                         printf("[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=%ld)\n", exitCount);
+                        u40Dump(0, "end of pass 1, at reset");  // U40: pass-1 profile baseline to compare pass 2 against
                         fflush(stdout);
                     }
 

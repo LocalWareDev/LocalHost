@@ -1,0 +1,2260 @@
+[net] backend initialized
+Detected Fixed VHD footer -- excluding it from disk geometry
+Attached disk C:\VHDs\win10_installer.vhd (16777216 sectors of 512 bytes)
+[cpuid] measured host TSC frequency: 1896006100 Hz
+[cpuid] leaf 1 override: host EBX=0x07100800 EDX=0xBFEBFBFF -> guest EBX=0x00010800 EDX=0xAFEBFBFF
+Loaded 4194304 bytes of UEFI firmware C:\Users\DELL\Downloads\RELEASEX64_OVMF.fd
+Mapped UEFI firmware at 0xFFC00000-0xFFFFFFFF, entering run loop
+[kd] named pipe \\.\pipe\LocalHostKD ready -- attach WinDbg with -k com:pipe,port=\\.\pipe\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)
+[kd-reader] outer loop #1: calling ConnectNamedPipe
+[pcicfg #1] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #2] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x0 cfg=present
+[pcicfg #3] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0x0 cfg=present
+[pcicfg #4] bus=0 dev=1 func=3 off=0x40 size=4 write=1 val=0xB000 cfg=present
+[pcicfg #5] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x0 cfg=present
+[pcicfg #6] bus=0 dev=1 func=3 off=0x80 size=1 write=1 val=0x1 cfg=present
+[pcicfg #7] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #8] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #9] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #10] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #11] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #12] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #13] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #14] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #15] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #16] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #17] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #18] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #1: selector=0x0
+[fwcfg] read #1: selector=0x0 offset=0 dataLen=4 stringOp=1 rep=1
+[fwcfg] select #2: selector=0x1
+[fwcfg] read #2: selector=0x1 offset=0 dataLen=4 stringOp=1 rep=1
+[fwcfg] select #3: selector=0x19
+[fwcfg] read #3: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #4: selector=0x19
+[fwcfg] read #4: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #5: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #6: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #7: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #8: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #9: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #10: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #11: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #12: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #13: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #14: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #15: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #16: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #17: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #18: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #19: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #20: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #5: selector=0x19
+[fwcfg] read #21: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #22: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #23: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #24: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #25: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #26: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #27: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #28: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #29: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #30: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #31: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #32: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #33: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #34: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #35: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #36: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #37: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #6: selector=0x19
+[fwcfg] read #38: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #39: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #40: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #41: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #42: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #43: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #44: selector=0x19 offset=72 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #45: selector=0x19 offset=74 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #46: selector=0x19 offset=76 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #47: selector=0x19 offset=132 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #48: selector=0x19 offset=136 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #49: selector=0x19 offset=138 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #50: selector=0x19 offset=140 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #51: selector=0x19 offset=196 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #52: selector=0x19 offset=200 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #53: selector=0x19 offset=202 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #54: selector=0x19 offset=204 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #7: selector=0x19
+[fwcfg] read #55: selector=0x19 offset=0 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #56: selector=0x19 offset=4 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #57: selector=0x19 offset=8 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #58: selector=0x19 offset=10 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #59: selector=0x19 offset=12 dataLen=260 stringOp=1 rep=1
+[fwcfg] read #60: selector=0x19 offset=68 dataLen=260 stringOp=1 rep=1
+[fwcfg] select #8: selector=0x19
+[fwcfg] select #9: selector=0x19
+[fwcfg] select #10: selector=0x19
+[fwcfg] select #11: selector=0x0
+[fwcfg] select #12: selector=0x1
+[fwcfg] select #13: selector=0x19
+[fwcfg] select #14: selector=0xE
+[pcicfg #19] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[fwcfg] select #15: selector=0x5
+[pcicfg #20] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #21] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #22] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #23] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #24] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #25] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #26] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #27] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #28] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #29] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #30] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #31] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #32] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[heartbeat: exitCount=5000 elapsedSec=0.0 lastPort=0xB008 write=0 val=0x2]
+[pcicfg #33] bus=0 dev=0 func=0 off=0x02 size=2 write=0 val=0x1237 cfg=present
+[pcicfg #34] bus=0 dev=1 func=3 off=0x80 size=1 write=0 val=0x1 cfg=present
+[pcicfg #35] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #36] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #37] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #38] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #39] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #40] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #41] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #42] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #43] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #44] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #45] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #46] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #47] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #48] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #49] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #16: selector=0x23
+[ramfb] configured: address=0xBE500000 800x600 stride=3200
+[pcicfg #50] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #51] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[cmos-ab] write reg=0x0A value=0x26 (RegA=0x26 RegB=0x06, PIE=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x26 RegB=0x02, PIE=0)
+[cmos-ab] write reg=0x0B value=0x82 (RegA=0x26 RegB=0x82, PIE=0)
+[cmos-ab] write reg=0x0A value=0x76 (RegA=0x76 RegB=0x82, PIE=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x76 RegB=0x02, PIE=0)
+[cmos-ab] write reg=0x0A value=0x26 (RegA=0x26 RegB=0x02, PIE=0)
+[pcicfg #52] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[fwcfg] select #17: selector=0x17
+[fwcfg] select #18: selector=0x8
+[fwcfg] select #19: selector=0xB
+[fwcfg] select #20: selector=0x14
+[pcicfg #53] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #54] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #55] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #56] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #57] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #58] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #59] bus=0 dev=1 func=3 off=0x40 size=4 write=0 val=0xB000 cfg=present
+[pcicfg #60] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #61] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #62] bus=0 dev=0 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #63] bus=0 dev=0 func=0 off=0x08 size=4 write=0 val=0x6000002 cfg=present
+[pcicfg #64] bus=0 dev=0 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #65] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #66] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #67] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #68] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #69] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #70] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #71] bus=0 dev=0 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #72] bus=0 dev=0 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #73] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #74] bus=0 dev=0 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #75] bus=0 dev=0 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #76] bus=0 dev=0 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #77] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #78] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #79] bus=0 dev=1 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #80] bus=0 dev=1 func=0 off=0x08 size=4 write=0 val=0x6010000 cfg=present
+[pcicfg #81] bus=0 dev=1 func=0 off=0x0C size=4 write=0 val=0x800000 cfg=present
+[pcicfg #82] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #83] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #84] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #85] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #86] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #87] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #88] bus=0 dev=1 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #89] bus=0 dev=1 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #90] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #91] bus=0 dev=1 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #92] bus=0 dev=1 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #93] bus=0 dev=1 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #94] bus=0 dev=1 func=1 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #95] bus=0 dev=1 func=2 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #96] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #97] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #98] bus=0 dev=1 func=3 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #99] bus=0 dev=1 func=3 off=0x08 size=4 write=0 val=0x6800000 cfg=present
+[pcicfg #100] bus=0 dev=1 func=3 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #101] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #102] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #103] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #104] bus=0 dev=1 func=3 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #105] bus=0 dev=1 func=3 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #106] bus=0 dev=1 func=3 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #107] bus=0 dev=1 func=3 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #108] bus=0 dev=1 func=3 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #109] bus=0 dev=1 func=3 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #110] bus=0 dev=1 func=3 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #111] bus=0 dev=1 func=3 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #112] bus=0 dev=1 func=3 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #113] bus=0 dev=1 func=4 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #114] bus=0 dev=1 func=5 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #115] bus=0 dev=1 func=6 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #116] bus=0 dev=1 func=7 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #117] bus=0 dev=2 func=0 off=0x00 size=4 write=0 val=0x29228086 cfg=present
+[pcicfg #118] bus=0 dev=2 func=0 off=0x00 size=4 write=0 val=0x29228086 cfg=present
+[pcicfg #119] bus=0 dev=2 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #120] bus=0 dev=2 func=0 off=0x08 size=4 write=0 val=0x1060102 cfg=present
+[pcicfg #121] bus=0 dev=2 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #122] bus=0 dev=2 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #123] bus=0 dev=2 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #124] bus=0 dev=2 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #125] bus=0 dev=2 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #126] bus=0 dev=2 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #127] bus=0 dev=2 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #128] bus=0 dev=2 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #129] bus=0 dev=2 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #130] bus=0 dev=2 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #131] bus=0 dev=2 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #132] bus=0 dev=2 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #133] bus=0 dev=2 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #134] bus=0 dev=3 func=0 off=0x00 size=4 write=0 val=0x813910EC cfg=present
+[pcicfg #135] bus=0 dev=3 func=0 off=0x00 size=4 write=0 val=0x813910EC cfg=present
+[pcicfg #136] bus=0 dev=3 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #137] bus=0 dev=3 func=0 off=0x08 size=4 write=0 val=0x2000010 cfg=present
+[pcicfg #138] bus=0 dev=3 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #139] bus=0 dev=3 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #140] bus=0 dev=3 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #141] bus=0 dev=3 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #142] bus=0 dev=3 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #143] bus=0 dev=3 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #144] bus=0 dev=3 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #145] bus=0 dev=3 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #146] bus=0 dev=3 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #147] bus=0 dev=3 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #148] bus=0 dev=3 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #149] bus=0 dev=3 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #150] bus=0 dev=3 func=0 off=0x3C size=4 write=0 val=0x100 cfg=present
+[pcicfg #151] bus=0 dev=4 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #152] bus=0 dev=5 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #153] bus=0 dev=6 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #154] bus=0 dev=7 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #155] bus=0 dev=8 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #156] bus=0 dev=9 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #157] bus=0 dev=10 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #158] bus=0 dev=11 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #159] bus=0 dev=12 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #160] bus=0 dev=13 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #161] bus=0 dev=14 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #162] bus=0 dev=15 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #163] bus=0 dev=16 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #164] bus=0 dev=17 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #165] bus=0 dev=18 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #166] bus=0 dev=19 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #167] bus=0 dev=20 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #168] bus=0 dev=21 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #169] bus=0 dev=22 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #170] bus=0 dev=23 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #171] bus=0 dev=24 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #172] bus=0 dev=25 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #173] bus=0 dev=26 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #174] bus=0 dev=27 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #175] bus=0 dev=28 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #176] bus=0 dev=29 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #177] bus=0 dev=30 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #178] bus=0 dev=31 func=0 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #179] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #180] bus=0 dev=0 func=0 off=0x00 size=4 write=0 val=0x12378086 cfg=present
+[pcicfg #181] bus=0 dev=0 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #182] bus=0 dev=0 func=0 off=0x08 size=4 write=0 val=0x6000002 cfg=present
+[pcicfg #183] bus=0 dev=0 func=0 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #184] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #185] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #186] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #187] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #188] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #189] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #190] bus=0 dev=0 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #191] bus=0 dev=0 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #192] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #193] bus=0 dev=0 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #194] bus=0 dev=0 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #195] bus=0 dev=0 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #196] bus=0 dev=0 func=0 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #197] bus=0 dev=0 func=0 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #198] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #199] bus=0 dev=0 func=0 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #200] bus=0 dev=0 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #201] bus=0 dev=0 func=0 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #202] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #203] bus=0 dev=0 func=0 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #204] bus=0 dev=0 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #205] bus=0 dev=0 func=0 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #206] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #207] bus=0 dev=0 func=0 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #208] bus=0 dev=0 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #209] bus=0 dev=0 func=0 off=0x18 size=4 write=1 val=0x0 cfg=present
+[pcicfg #210] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #211] bus=0 dev=0 func=0 off=0x1C size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #212] bus=0 dev=0 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #213] bus=0 dev=0 func=0 off=0x1C size=4 write=1 val=0x0 cfg=present
+[pcicfg #214] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #215] bus=0 dev=0 func=0 off=0x20 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #216] bus=0 dev=0 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #217] bus=0 dev=0 func=0 off=0x20 size=4 write=1 val=0x0 cfg=present
+[pcicfg #218] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #219] bus=0 dev=0 func=0 off=0x24 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #220] bus=0 dev=0 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #221] bus=0 dev=0 func=0 off=0x24 size=4 write=1 val=0x0 cfg=present
+[pcicfg #222] bus=0 dev=0 func=0 off=0x30 size=4 write=1 val=0xFFFFFFFE cfg=present
+[pcicfg #223] bus=0 dev=0 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #224] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #225] bus=0 dev=1 func=0 off=0x00 size=4 write=0 val=0x70008086 cfg=present
+[pcicfg #226] bus=0 dev=1 func=0 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #227] bus=0 dev=1 func=0 off=0x08 size=4 write=0 val=0x6010000 cfg=present
+[pcicfg #228] bus=0 dev=1 func=0 off=0x0C size=4 write=0 val=0x800000 cfg=present
+[pcicfg #229] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #230] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #231] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #232] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #233] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #234] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #235] bus=0 dev=1 func=0 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #236] bus=0 dev=1 func=0 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #237] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #238] bus=0 dev=1 func=0 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #239] bus=0 dev=1 func=0 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #240] bus=0 dev=1 func=0 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #241] bus=0 dev=1 func=0 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #242] bus=0 dev=1 func=0 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #243] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #244] bus=0 dev=1 func=0 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #245] bus=0 dev=1 func=0 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #246] bus=0 dev=1 func=0 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #247] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #248] bus=0 dev=1 func=0 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #249] bus=0 dev=1 func=0 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #250] bus=0 dev=1 func=0 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #251] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #252] bus=0 dev=1 func=0 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #253] bus=0 dev=1 func=0 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #254] bus=0 dev=1 func=0 off=0x18 size=4 write=1 val=0x0 cfg=present
+[pcicfg #255] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #256] bus=0 dev=1 func=0 off=0x1C size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #257] bus=0 dev=1 func=0 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #258] bus=0 dev=1 func=0 off=0x1C size=4 write=1 val=0x0 cfg=present
+[pcicfg #259] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #260] bus=0 dev=1 func=0 off=0x20 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #261] bus=0 dev=1 func=0 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #262] bus=0 dev=1 func=0 off=0x20 size=4 write=1 val=0x0 cfg=present
+[pcicfg #263] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #264] bus=0 dev=1 func=0 off=0x24 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #265] bus=0 dev=1 func=0 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #266] bus=0 dev=1 func=0 off=0x24 size=4 write=1 val=0x0 cfg=present
+[pcicfg #267] bus=0 dev=1 func=0 off=0x30 size=4 write=1 val=0xFFFFFFFE cfg=present
+[pcicfg #268] bus=0 dev=1 func=0 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #269] bus=0 dev=1 func=1 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #270] bus=0 dev=1 func=2 off=0x00 size=4 write=0 val=0xFFFFFFFF cfg=absent
+[pcicfg #271] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #272] bus=0 dev=1 func=3 off=0x00 size=4 write=0 val=0x71138086 cfg=present
+[pcicfg #273] bus=0 dev=1 func=3 off=0x04 size=4 write=0 val=0x0 cfg=present
+[pcicfg #274] bus=0 dev=1 func=3 off=0x08 size=4 write=0 val=0x6800000 cfg=present
+[pcicfg #275] bus=0 dev=1 func=3 off=0x0C size=4 write=0 val=0x0 cfg=present
+[pcicfg #276] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #277] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #278] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #279] bus=0 dev=1 func=3 off=0x1C size=4 write=0 val=0x0 cfg=present
+[pcicfg #280] bus=0 dev=1 func=3 off=0x20 size=4 write=0 val=0x0 cfg=present
+[pcicfg #281] bus=0 dev=1 func=3 off=0x24 size=4 write=0 val=0x0 cfg=present
+[pcicfg #282] bus=0 dev=1 func=3 off=0x28 size=4 write=0 val=0x0 cfg=present
+[pcicfg #283] bus=0 dev=1 func=3 off=0x2C size=4 write=0 val=0x0 cfg=present
+[pcicfg #284] bus=0 dev=1 func=3 off=0x30 size=4 write=0 val=0x0 cfg=present
+[pcicfg #285] bus=0 dev=1 func=3 off=0x34 size=4 write=0 val=0x0 cfg=present
+[pcicfg #286] bus=0 dev=1 func=3 off=0x38 size=4 write=0 val=0x0 cfg=present
+[pcicfg #287] bus=0 dev=1 func=3 off=0x3C size=4 write=0 val=0x0 cfg=present
+[pcicfg #288] bus=0 dev=1 func=3 off=0x04 size=2 write=0 val=0x0 cfg=present
+[pcicfg #289] bus=0 dev=1 func=3 off=0x04 size=2 write=1 val=0x0 cfg=present
+[pcicfg #290] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #291] bus=0 dev=1 func=3 off=0x10 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #292] bus=0 dev=1 func=3 off=0x10 size=4 write=0 val=0x0 cfg=present
+[pcicfg #293] bus=0 dev=1 func=3 off=0x10 size=4 write=1 val=0x0 cfg=present
+[pcicfg #294] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #295] bus=0 dev=1 func=3 off=0x14 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #296] bus=0 dev=1 func=3 off=0x14 size=4 write=0 val=0x0 cfg=present
+[pcicfg #297] bus=0 dev=1 func=3 off=0x14 size=4 write=1 val=0x0 cfg=present
+[pcicfg #298] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[pcicfg #299] bus=0 dev=1 func=3 off=0x18 size=4 write=1 val=0xFFFFFFFF cfg=present
+[pcicfg #300] bus=0 dev=1 func=3 off=0x18 size=4 write=0 val=0x0 cfg=present
+[heartbeat: exitCount=10000 elapsedSec=0.3 lastPort=0xCF8 write=1 val=0x89]
+[rtl8139] I/O BAR mapped at 0xC000
+[ahci] ABAR mapped at 0xC0000000 (WHvMapGpaRange hr=0x0 OK)
+[fwcfg] select #21: selector=0x22
+[acpi] acpiBuildTables() firing -- pmBase=0xB000
+[fwcfg] select #22: selector=0x20
+[fwcfg] select #23: selector=0x21
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[uart2] #1 port=0x2FF write=0 val=0x0
+[uart2] #2 port=0x2FF write=1 val=0xAA
+[uart2] #3 port=0x2FF write=0 val=0x0
+[uart2] #4 port=0x2FF write=1 val=0x55
+[uart2] #5 port=0x2FF write=0 val=0x0
+[uart2] #6 port=0x2FF write=1 val=0x0
+[uart2] #7 port=0x2FD write=0 val=0x0
+[uart2] #8 port=0x2FB write=0 val=0x0
+[uart2] #9 port=0x2FB write=1 val=0x0
+[uart2] #10 port=0x2F9 write=0 val=0x0
+[uart2] #11 port=0x2F9 write=1 val=0x0
+[uart2] #12 port=0x2FA write=1 val=0x0
+[uart2] #13 port=0x2FC write=0 val=0x0
+[uart2] #14 port=0x2FC write=1 val=0x0
+[uart2] #15 port=0x2FF write=1 val=0x0
+[uart2] #16 port=0x2FA write=1 val=0x7
+[uart2] #17 port=0x2FD write=0 val=0x0
+[uart2] #18 port=0x2FB write=0 val=0x0
+[uart2] #19 port=0x2FB write=1 val=0x80
+[uart2] #20 port=0x2F8 write=1 val=0x1
+[uart2] #21 port=0x2F9 write=1 val=0x0
+[uart2] #22 port=0x2FB write=1 val=0x3
+[uart2] #23 port=0x2FD write=0 val=0x0
+[uart2] #24 port=0x2FC write=0 val=0x0
+[uart2] #25 port=0x2FC write=1 val=0x0
+[uart2] #26 port=0x2FD write=0 val=0x0
+[uart2] #27 port=0x2FB write=0 val=0x0
+[uart2] #28 port=0x2FB write=1 val=0x83
+[uart2] #29 port=0x2F8 write=1 val=0x1
+[uart2] #30 port=0x2F9 write=1 val=0x0
+[uart2] #31 port=0x2FB write=1 val=0x3
+[uart2] #32 port=0x2FD write=0 val=0x0
+[uart2] #33 port=0x2F8 write=1 val=0x1B
+[uart2] #34 port=0x2FD write=0 val=0x0
+[uart2] #35 port=0x2F8 write=1 val=0x5B
+[uart2] #36 port=0x2FD write=0 val=0x0
+[uart2] #37 port=0x2F8 write=1 val=0x32
+[uart2] #38 port=0x2FD write=0 val=0x0
+[uart2] #39 port=0x2F8 write=1 val=0x4A
+[uart2] #40 port=0x2FD write=0 val=0x0
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;031;100t[2J[001;001H[heartbeat: exitCount=15000 elapsedSec=0.4 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=20000 elapsedSec=0.5 lastPort=0xB008 write=0 val=0x89]
+[aux] controller: disable AUX port
+[heartbeat: exitCount=25000 elapsedSec=0.6 lastPort=0xCF8 write=1 val=0x0]
+[ahci] GHC.AE set -- controller enabled
+[ahci] PxCMD.ST set -- port 0 started
+[ahci] cmd #1: ataCmd=0xEC lba=0 count=1 prdtl=1
+[ahci] cmd #2: ataCmd=0xEF lba=0 count=1 prdtl=0
+[ahci] cmd #3: ataCmd=0xEC lba=0 count=256 prdtl=1
+[ahci] cmd #4: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #5: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #6: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #7: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #8: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #9: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #10: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #11: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #12: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #13: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #14: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #15: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #16: ataCmd=0x20 lba=32832 count=4 prdtl=1
+[ahci] cmd #17: ataCmd=0x20 lba=32832 count=1 prdtl=1
+[ahci] cmd #18: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #19: ataCmd=0x20 lba=32768 count=1 prdtl=1
+[ahci] cmd #20: ataCmd=0x20 lba=33598 count=1 prdtl=1
+[ahci] cmd #21: ataCmd=0x20 lba=32769 count=1 prdtl=1
+[ahci] cmd #22: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #23: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #24: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #25: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #26: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #27: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #28: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #29: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #30: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #31: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #32: ataCmd=0x20 lba=34 count=1 prdtl=1
+[heartbeat: exitCount=30000 elapsedSec=0.7 lastPort=0xCF8 write=1 val=0x0]
+[ahci] cmd #33: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #34: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #35: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #36: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #37: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #38: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #39: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #40: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #41: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #42: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #43: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #44: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #45: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #46: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #47: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #48: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #49: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #50: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #51: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #52: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #53: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #54: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #55: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #56: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #57: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #58: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #59: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #60: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #61: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #62: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #63: ataCmd=0x20 lba=16777215 count=1 prdtl=1
+[ahci] cmd #64: ataCmd=0x20 lba=16777183 count=32 prdtl=1
+[ahci] cmd #65: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #66: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #67: ataCmd=0x20 lba=98 count=4 prdtl=1
+[ahci] cmd #68: ataCmd=0x20 lba=98 count=1 prdtl=1
+[ahci] cmd #69: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #70: ataCmd=0x20 lba=34 count=1 prdtl=1
+[ahci] cmd #71: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #72: ataCmd=0x20 lba=33598 count=64 prdtl=1
+[ahci] cmd #73: ataCmd=0x20 lba=65536 count=128 prdtl=1
+[ahci] cmd #74: ataCmd=0x20 lba=69504 count=128 prdtl=1
+[ahci] cmd #75: ataCmd=0x20 lba=69632 count=128 prdtl=1
+[ahci] cmd #76: ataCmd=0x20 lba=42814 count=64 prdtl=1
+[ahci] cmd #77: ataCmd=0x20 lba=9560960 count=128 prdtl=1
+[ahci] cmd #78: ataCmd=0x20 lba=9561088 count=256 prdtl=1
+[ahci] cmd #79: ataCmd=0x20 lba=9561344 count=256 prdtl=1
+[ahci] cmd #80: ataCmd=0x20 lba=9561600 count=256 prdtl=1
+[ahci] cmd #81: ataCmd=0x20 lba=9561856 count=256 prdtl=1
+[ahci] cmd #82: ataCmd=0x20 lba=9562112 count=256 prdtl=1
+[ahci] cmd #83: ataCmd=0x20 lba=9562368 count=256 prdtl=1
+[ahci] cmd #84: ataCmd=0x20 lba=9562624 count=256 prdtl=1
+[ahci] cmd #85: ataCmd=0x20 lba=9562880 count=256 prdtl=1
+[ahci] cmd #86: ataCmd=0x20 lba=9563136 count=256 prdtl=1
+[ahci] cmd #87: ataCmd=0x20 lba=9563392 count=256 prdtl=1
+[ahci] cmd #88: ataCmd=0x20 lba=9563648 count=256 prdtl=1
+[ahci] cmd #89: ataCmd=0x20 lba=9563904 count=128 prdtl=1
+[ahci] cmd #90: ataCmd=0x20 lba=9564032 count=128 prdtl=1
+BdsDxe: loading Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[heartbeat: exitCount=35000 elapsedSec=0.9 lastPort=0xB008 write=0 val=0x2]
+[ahci] cmd #91: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #92: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #93: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #94: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #95: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #96: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #97: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #98: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #99: ataCmd=0x20 lba=32768 count=16 prdtl=1
+[ahci] cmd #100: ataCmd=0x20 lba=0 count=1 prdtl=1
+[ahci] cmd #101: ataCmd=0x20 lba=1 count=1 prdtl=1
+[ahci] cmd #102: ataCmd=0x20 lba=2 count=32 prdtl=1
+[ahci] cmd #103: ataCmd=0x20 lba=32768 count=64 prdtl=1
+[ahci] cmd #104: ataCmd=0x20 lba=33536 count=64 prdtl=1
+[ahci] cmd #105: ataCmd=0x20 lba=33600 count=64 prdtl=1
+[ahci] cmd #106: ataCmd=0x20 lba=65536 count=64 prdtl=1
+[ahci] cmd #107: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #108: ataCmd=0x20 lba=69568 count=64 prdtl=1
+[ahci] cmd #109: ataCmd=0x20 lba=69632 count=64 prdtl=1
+[ahci] cmd #110: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #111: ataCmd=0x20 lba=9564096 count=64 prdtl=1
+[ahci] cmd #112: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #113: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #114: ataCmd=0x20 lba=43326 count=4 prdtl=1
+[ahci] cmd #115: ataCmd=0x20 lba=10027016 count=40 prdtl=1
+[ahci] cmd #116: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #117: ataCmd=0x20 lba=43056 count=4 prdtl=1
+[ahci] cmd #118: ataCmd=0x20 lba=9750952 count=20 prdtl=1
+[ahci] cmd #119: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #120: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #121: ataCmd=0x20 lba=42870 count=4 prdtl=1
+[ahci] cmd #122: ataCmd=0x20 lba=42873 count=4 prdtl=1
+[ahci] cmd #123: ataCmd=0x20 lba=9561000 count=256 prdtl=1
+[ahci] cmd #124: ataCmd=0x20 lba=9561256 count=256 prdtl=1
+[ahci] cmd #125: ataCmd=0x20 lba=9561512 count=256 prdtl=1
+[ahci] cmd #126: ataCmd=0x20 lba=9561768 count=256 prdtl=1
+[ahci] cmd #127: ataCmd=0x20 lba=9562024 count=256 prdtl=1
+[ahci] cmd #128: ataCmd=0x20 lba=9562280 count=256 prdtl=1
+[ahci] cmd #129: ataCmd=0x20 lba=9562536 count=256 prdtl=1
+[ahci] cmd #130: ataCmd=0x20 lba=9562792 count=256 prdtl=1
+[ahci] cmd #131: ataCmd=0x20 lba=9563048 count=256 prdtl=1
+[ahci] cmd #132: ataCmd=0x20 lba=9563304 count=256 prdtl=1
+[ahci] cmd #133: ataCmd=0x20 lba=9563560 count=256 prdtl=1
+[ahci] cmd #134: ataCmd=0x20 lba=9563816 count=256 prdtl=1
+[ahci] cmd #135: ataCmd=0x20 lba=9564072 count=35 prdtl=1
+[ahci] cmd #136: ataCmd=0x20 lba=33598 count=4 prdtl=1
+[ahci] cmd #137: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #138: ataCmd=0x20 lba=34622 count=4 prdtl=1
+[ahci] cmd #139: ataCmd=0x20 lba=1114112 count=64 prdtl=1
+[ahci] cmd #140: ataCmd=0x20 lba=42814 count=4 prdtl=1
+[ahci] cmd #141: ataCmd=0x20 lba=9502720 count=64 prdtl=1
+[ahci] cmd #142: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #143: ataCmd=0x20 lba=34622 count=4 prdtl=1
+[ahci] cmd #144: ataCmd=0x20 lba=42814 count=4 prdtl=1
+[ahci] cmd #145: ataCmd=0x20 lba=33602 count=4 prdtl=1
+[ahci] cmd #146: ataCmd=0x20 lba=33598 count=4 prdtl=1
+[ahci] cmd #147: ataCmd=0x20 lba=33601 count=4 prdtl=1
+[ahci] cmd #148: ataCmd=0x20 lba=42874 count=4 prdtl=1
+[ahci] cmd #149: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #150: ataCmd=0x20 lba=9754240 count=64 prdtl=1
+[ahci] cmd #151: ataCmd=0x20 lba=43091 count=4 prdtl=1
+[ahci] cmd #152: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #153: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #154: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #155: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #156: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #157: ataCmd=0x20 lba=9786872 count=1 prdtl=1
+[ahci] cmd #158: ataCmd=0x20 lba=9786872 count=7 prdtl=1
+[ahci] cmd #159: ataCmd=0x20 lba=9786878 count=4 prdtl=1
+[ahci] cmd #160: ataCmd=0x20 lba=9786881 count=1 prdtl=1
+[ahci] cmd #161: ataCmd=0x20 lba=9786881 count=4 prdtl=1
+[ahci] cmd #162: ataCmd=0x20 lba=9786884 count=137 prdtl=1
+[ahci] cmd #163: ataCmd=0x20 lba=9787020 count=4 prdtl=1
+[ahci] cmd #164: ataCmd=0x20 lba=9787023 count=1 prdtl=1
+[ahci] cmd #165: ataCmd=0x20 lba=9787023 count=1 prdtl=1
+[ahci] cmd #166: ataCmd=0x20 lba=9787023 count=16 prdtl=1
+[ahci] cmd #167: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #168: ataCmd=0x20 lba=43090 count=4 prdtl=1
+[ahci] cmd #169: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #170: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #171: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #172: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #173: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #174: ataCmd=0x20 lba=9786304 count=1 prdtl=1
+[ahci] cmd #175: ataCmd=0x20 lba=9786304 count=4 prdtl=1
+[ahci] cmd #176: ataCmd=0x20 lba=9786307 count=2 prdtl=1
+[ahci] cmd #177: ataCmd=0x20 lba=9786308 count=3 prdtl=1
+[ahci] cmd #178: ataCmd=0x20 lba=9786310 count=63 prdtl=1
+[ahci] cmd #179: ataCmd=0x20 lba=9786372 count=3 prdtl=1
+[ahci] cmd #180: ataCmd=0x20 lba=9786374 count=1 prdtl=1
+[ahci] cmd #181: ataCmd=0x20 lba=9786374 count=16 prdtl=1
+[ahci] cmd #182: ataCmd=0x20 lba=43059 count=4 prdtl=1
+[ahci] cmd #183: ataCmd=0x20 lba=43091 count=4 prdtl=1
+[ahci] cmd #184: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #185: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #186: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #187: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #188: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #189: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[ahci] cmd #190: ataCmd=0x20 lba=9787040 count=7 prdtl=1
+[ahci] cmd #191: ataCmd=0x20 lba=9787046 count=4 prdtl=1
+[ahci] cmd #192: ataCmd=0x20 lba=9787049 count=3 prdtl=1
+[ahci] cmd #193: ataCmd=0x20 lba=9787051 count=1 prdtl=1
+[ahci] cmd #194: ataCmd=0x20 lba=9787051 count=3 prdtl=1
+[ahci] cmd #195: ataCmd=0x20 lba=9787053 count=14 prdtl=1
+[ahci] cmd #196: ataCmd=0x20 lba=9787066 count=48 prdtl=1
+[ahci] cmd #197: ataCmd=0x20 lba=9787113 count=6 prdtl=1
+[ahci] cmd #198: ataCmd=0x20 lba=9787118 count=15 prdtl=1
+[ahci] cmd #199: ataCmd=0x20 lba=9787040 count=1 prdtl=1
+[2J[001;001H[=3h[2J[001;001H[heartbeat: exitCount=40000 elapsedSec=1.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=45000 elapsedSec=1.2 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=50000 elapsedSec=1.3 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=55000 elapsedSec=1.4 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=60000 elapsedSec=1.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=65000 elapsedSec=1.6 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=70000 elapsedSec=1.7 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=75000 elapsedSec=1.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=80000 elapsedSec=2.0 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=85000 elapsedSec=2.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=90000 elapsedSec=2.2 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=95000 elapsedSec=2.3 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=100000 elapsedSec=2.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=105000 elapsedSec=2.6 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=110000 elapsedSec=2.7 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=115000 elapsedSec=4.5 lastPort=0x71 write=0 val=0x82]
+[aux] controller: disable AUX port
+[heartbeat: exitCount=120000 elapsedSec=5.4 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=125000 elapsedSec=5.5 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=130000 elapsedSec=5.6 lastPort=0xCF8 write=1 val=0x0]
+[kerneldiag] candidate address 0xFFFFF8050ABA57DD resolves to module base 0xFFFFF8050A800000 (+0x3A57DD into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[wp] DISCOVERY at exitCount=133917 (pass 1)
+[wp] armed breakpoints at module base 0xFFFFF8050A800000 (DR2 LFH-check armed=0): DR0=+0xA773D8 (U34 ExInitializePoolHeapManagement entry, VA=0xFFFFF8050B2773D8), DR1=+0x3FD6F0 (KeBugCheckEx, VA=0xFFFFF8050ABFD6F0), DR2=+0x343B49 (RtlpHpLfhOwnerMoveSubsegment entry, VA=0xFFFFF8050AB43B49), DR3=+0x9A188F (HalpIommuInitSystem ret, VA=0xFFFFF8050B1A188F)
+[u32] ExPoolState pool-descriptor fields (pass 1):
+[u32]   pool[0] desc@RVA0xC57EC0: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[1] desc@RVA0xC59F80: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[2] desc@RVA0xC5C040: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[3] desc@RVA0xC5E100: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[4] desc@RVA0xC601C0: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[5] desc@RVA0xC62280: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[6] desc@RVA0xC64340: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[7] desc@RVA0xC66400: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u27] dumped kernel image to ntoskrnl_dump.bin (4096/4096 pages readable)
+[u33] baseline pass=1 exitCount=133917 pool[0] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=1 exitCount=133917 pool[1] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=1 exitCount=133917 pool[2] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=1 exitCount=133917 pool[3] +0x08=0x0 +0x10=0x0
+[ioapic #1] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA57DD write=1 insnLen=0 bytes=16
+[ioapic #2] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA57E3 write=1 insnLen=0 bytes=16
+[ioapic #3] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA57EA write=1 insnLen=0 bytes=16
+[ioapic #4] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA57F0 write=0 insnLen=0 bytes=16
+[ioapic #5] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA57F3 write=1 insnLen=0 bytes=16
+[ioapic #6] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA57F9 write=1 insnLen=0 bytes=16
+[ioapic #7] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5800 write=1 insnLen=0 bytes=16
+[ioapic #8] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5806 write=0 insnLen=0 bytes=16
+[ioapic #9] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5835 write=1 insnLen=0 bytes=16
+[ioapic #10] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA583B write=0 insnLen=0 bytes=16
+[ioapic #11] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5846 write=1 insnLen=0 bytes=16
+[ioapic #12] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #13] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #14] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #15] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #16] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #17] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #18] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #19] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #20] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #21] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #22] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #23] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #24] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #25] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #26] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #27] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #28] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #29] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #30] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #31] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #32] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #33] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #34] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #35] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #36] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #37] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #38] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #39] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #40] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #41] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #42] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #43] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #44] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #45] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #46] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #47] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #48] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #49] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #50] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #51] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #52] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #53] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #54] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #55] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #56] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #57] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #58] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #59] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #60] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #61] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #62] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #63] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #64] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #65] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #66] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #67] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #68] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #69] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #70] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #71] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #72] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #73] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #74] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #75] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #76] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #77] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #78] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #79] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #80] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #81] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #82] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #83] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #84] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #85] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #86] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #87] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #88] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #89] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #90] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #91] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #92] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #93] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #94] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #95] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[ioapic #96] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA5883 write=1 insnLen=0 bytes=16
+[ioapic #97] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA585D write=1 insnLen=0 bytes=16
+[ioapic #98] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA585F write=0 insnLen=0 bytes=16
+[ioapic #99] gpa=0xFEC00010 pageOff=0x10 rip=0xFFFFF8050ABA587A write=1 insnLen=0 bytes=16
+[ioapic #100] gpa=0xFEC00000 pageOff=0x0 rip=0xFFFFF8050ABA5881 write=1 insnLen=0 bytes=16
+[heartbeat: exitCount=135000 elapsedSec=5.8 lastPort=0xB008 write=0 val=0xFF]
+[heartbeat: exitCount=140000 elapsedSec=5.9 lastPort=0xB008 write=0 val=0xFF]
+[cmos-ab] write reg=0x0A value=0x25 (RegA=0x25 RegB=0x02, PIE=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x20 value=0x000008D1 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x21 value=0x01000000 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x20 value=0x000008D1 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[cmos-ab] write reg=0x0B value=0x42 (RegA=0x25 RegB=0x42, PIE=1)
+[rtc-diag] tick #1 FIRED vector=0xD1, skippedTotal=0 firedTotal=1
+[heartbeat: exitCount=145000 elapsedSec=5.9 lastPort=0xB008 write=0 val=0xC]
+[rtc-diag] tick #2 FIRED vector=0xD1, skippedTotal=0 firedTotal=2
+[rtc-diag] tick #3 FIRED vector=0xD1, skippedTotal=0 firedTotal=3
+[rtc-diag] tick #4 FIRED vector=0xD1, skippedTotal=0 firedTotal=4
+[rtc-diag] tick #5 FIRED vector=0xD1, skippedTotal=0 firedTotal=5
+[rtc-diag] tick #6 FIRED vector=0xD1, skippedTotal=0 firedTotal=6
+[rtc-diag] tick #7 FIRED vector=0xD1, skippedTotal=0 firedTotal=7
+[rtc-diag] tick #8 FIRED vector=0xD1, skippedTotal=0 firedTotal=8
+[rtc-diag] tick #9 FIRED vector=0xD1, skippedTotal=0 firedTotal=9
+[rtc-diag] tick #10 FIRED vector=0xD1, skippedTotal=0 firedTotal=10
+[rtc-diag] tick #11 FIRED vector=0xD1, skippedTotal=0 firedTotal=11
+[rtc-diag] tick #12 FIRED vector=0xD1, skippedTotal=0 firedTotal=12
+[rtc-diag] tick #13 FIRED vector=0xD1, skippedTotal=0 firedTotal=13
+[rtc-diag] tick #14 FIRED vector=0xD1, skippedTotal=0 firedTotal=14
+[rtc-diag] tick #15 FIRED vector=0xD1, skippedTotal=0 firedTotal=15
+[rtc-diag] tick #16 FIRED vector=0xD1, skippedTotal=0 firedTotal=16
+[rtc-diag] tick #17 FIRED vector=0xD1, skippedTotal=0 firedTotal=17
+[rtc-diag] tick #18 FIRED vector=0xD1, skippedTotal=0 firedTotal=18
+[rtc-diag] tick #19 FIRED vector=0xD1, skippedTotal=0 firedTotal=19
+[rtc-diag] tick #20 FIRED vector=0xD1, skippedTotal=0 firedTotal=20
+[rtc-diag] tick #21 FIRED vector=0xD1, skippedTotal=0 firedTotal=21
+[rtc-diag] tick #22 FIRED vector=0xD1, skippedTotal=0 firedTotal=22
+[rtc-diag] tick #23 FIRED vector=0xD1, skippedTotal=0 firedTotal=23
+[rtc-diag] tick #24 FIRED vector=0xD1, skippedTotal=0 firedTotal=24
+[rtc-diag] tick #25 FIRED vector=0xD1, skippedTotal=0 firedTotal=25
+[rtc-diag] tick #26 FIRED vector=0xD1, skippedTotal=0 firedTotal=26
+[rtc-diag] tick #27 FIRED vector=0xD1, skippedTotal=0 firedTotal=27
+[rtc-diag] tick #28 FIRED vector=0xD1, skippedTotal=0 firedTotal=28
+[rtc-diag] tick #29 FIRED vector=0xD1, skippedTotal=0 firedTotal=29
+[rtc-diag] tick #30 FIRED vector=0xD1, skippedTotal=0 firedTotal=30
+[u33] EDGE pass=1 exitCount=145917 pool[0]: +0x08 0x0->0xFFFFB50971C02000 +0x10 0x0->0xFFFFE30AEE200000 +0x08 INIT(null->set) +0x10 INIT(null->set)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[heartbeat: exitCount=150000 elapsedSec=7.4 lastPort=0xCF8 write=1 val=0xC]
+[heartbeat: exitCount=155000 elapsedSec=7.5 lastPort=0xCFC write=0 val=0xC]
+[heartbeat: exitCount=160000 elapsedSec=7.6 lastPort=0xCF8 write=1 val=0xC]
+[heartbeat: exitCount=165000 elapsedSec=7.7 lastPort=0xCF8 write=1 val=0xC]
+[heartbeat: exitCount=170000 elapsedSec=7.8 lastPort=0xCFC write=0 val=0xC]
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x21 value=0x01000000 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[ioapic-rte] controller id=1 entry=8 reg=0x20 value=0x000008D1 -> full RTE now 0x01000000000008D1 (vector=0xD1 masked=0)
+[cmos-ab] write reg=0x0B value=0x42 (RegA=0x25 RegB=0x42, PIE=1)
+[heartbeat: exitCount=175000 elapsedSec=8.0 lastPort=0xB008 write=0 val=0x9]
+[heartbeat: exitCount=180000 elapsedSec=8.5 lastPort=0xCF8 write=1 val=0xC]
+
+[BUGCHECK] hit #1: KeBugCheckEx code=0xA5 p1=0x11 p2=0x3 p3=0x0 exitCount=181500
+[BUGCHECK]   p4=0x0  caller(return)=0xFFFFF8050C9C0454[kerneldiag] candidate address 0xFFFFF8050C9C0454 resolves to module base 0xFFFFF8050C900000 (+0xC0454 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x73F3C
+[kerneldiag] module PDB name: acpi.pdb guid=662B8231-E47D-1FF9-F7E8C8FD1B44A572 age=1
+  (base 0xFFFFF8050C900000 RVA 0xC0454)
+[BUGCHECK]   stack (canonical kernel qwords):
+[BUGCHECK]     [rsp+0x00]=0xFFFFF8050C9C0454[kerneldiag] candidate address 0xFFFFF8050C9C0454 resolves to module base 0xFFFFF8050C900000 (+0xC0454 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x73F3C
+[kerneldiag] module PDB name: acpi.pdb guid=662B8231-E47D-1FF9-F7E8C8FD1B44A572 age=1
+  (RVA 0xC0454)
+[BUGCHECK]     [rsp+0x10]=0xFFFFF8050C9701CA[kerneldiag] candidate address 0xFFFFF8050C9701CA resolves to module base 0xFFFFF8050C900000 (+0x701CA into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x73F3C
+[kerneldiag] module PDB name: acpi.pdb guid=662B8231-E47D-1FF9-F7E8C8FD1B44A572 age=1
+  (RVA 0x701CA)
+[BUGCHECK]     [rsp+0x18]=0xFFFFB5097245DA60[kerneldiag] no PE header found scanning VA back from 0xFFFFB5097245DA60
+
+[BUGCHECK]     [rsp+0x20]=0xFFFFB5097227EF60[kerneldiag] no PE header found scanning VA back from 0xFFFFB5097227EF60
+
+[BUGCHECK]     [rsp+0x30]=0xFFFFF805C0140019[kerneldiag] no PE header found scanning VA back from 0xFFFFF805C0140019
+
+[heartbeat: exitCount=185000 elapsedSec=8.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=190000 elapsedSec=8.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=195000 elapsedSec=8.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=200000 elapsedSec=8.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=205000 elapsedSec=8.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=210000 elapsedSec=8.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=215000 elapsedSec=9.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=220000 elapsedSec=9.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=225000 elapsedSec=9.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=230000 elapsedSec=9.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=235000 elapsedSec=9.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=240000 elapsedSec=9.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=245000 elapsedSec=9.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=250000 elapsedSec=9.5 lastPort=0xB008 write=0 val=0xC]
+[u40] === RIP histogram pass 1 (periodic): 2500 samples, base=0xFFFFF8050A800000 ===
+[u40]      896  page 0xFFFFF8050AB65000  = base+0x365000
+[u40]      790  page 0xBEA03000
+[u40]      165  page 0x1DD9000
+[u40]      164  page 0xFFFFF8050ABBD000  = base+0x3BD000
+[u40]      119  page 0xBF14E000
+[u40]      109  page 0xBE41C000
+[u40]       84  page 0xFFFFF8050ABBC000  = base+0x3BC000
+[u40]       58  page 0xBFC50000
+[u40]       37  page 0xBFD68000
+[u40]       23  page 0xBE422000
+[u40]       15  page 0xBF174000
+[u40]       14  page 0xBF16B000
+[u40]       13  page 0xFFFFF8050ACCC000  = base+0x4CC000
+[u40]        6  page 0xBF14F000
+[u40]        2  page 0x848000
+[u40]        2  page 0xFFFFF8050ABA5000  = base+0x3A5000
+[u40]        1  page 0xBFA20000
+[u40]        1  page 0xFFFFF8050ABFD000  = base+0x3FD000
+[u40]   most recent 256 samples (newest last):
+[u40]     FFFFF8050AB65444@224401 FFFFF8050AB65444@224501 FFFFF8050AB65444@224601 FFFFF8050AB65444@224701 FFFFF8050AB65444@224801 FFFFF8050AB65444@224901 FFFFF8050AB65444@225001 FFFFF8050AB65444@225101 FFFFF8050AB65444@225201 FFFFF8050AB65444@225301 FFFFF8050AB65444@225401 FFFFF8050AB65444@225501 FFFFF8050AB65444@225601 FFFFF8050AB65444@225701 FFFFF8050AB65444@225801 FFFFF8050AB65444@225901 FFFFF8050AB65444@226001 FFFFF8050AB65444@226101 FFFFF8050AB65444@226201 FFFFF8050AB65444@226301 FFFFF8050AB65444@226401 FFFFF8050AB65444@226501 FFFFF8050AB65444@226601 FFFFF8050AB65444@226701 FFFFF8050AB65444@226801 FFFFF8050AB65444@226901 FFFFF8050AB65444@227001 FFFFF8050AB65444@227101 FFFFF8050AB65444@227201 FFFFF8050AB65444@227301 FFFFF8050AB65444@227401 FFFFF8050AB65444@227501 FFFFF8050AB65444@227601 FFFFF8050AB65444@227701 FFFFF8050AB65444@227801 FFFFF8050AB65444@227901 FFFFF8050AB65444@228001 FFFFF8050AB65444@228101 FFFFF8050AB65444@228201 FFFFF8050AB65444@228301 FFFFF8050AB65444@228401 FFFFF8050AB65444@228501 FFFFF8050AB65444@228601 FFFFF8050AB65444@228701 FFFFF8050AB65444@228801 FFFFF8050AB65444@228901 FFFFF8050AB65444@229001 FFFFF8050AB65444@229101 FFFFF8050AB65444@229201 FFFFF8050AB65444@229301 FFFFF8050AB65444@229401 FFFFF8050AB65444@229501 FFFFF8050AB65444@229601 FFFFF8050AB65444@229701 FFFFF8050AB65444@229801 FFFFF8050AB65444@229901 FFFFF8050AB65444@230001 FFFFF8050AB65444@230101 FFFFF8050AB65444@230201 FFFFF8050AB65444@230301 FFFFF8050AB65444@230401 FFFFF8050AB65444@230501 FFFFF8050AB65444@230601 FFFFF8050AB65444@230701 FFFFF8050AB65444@230801 FFFFF8050AB65444@230901 FFFFF8050AB65444@231001 FFFFF8050AB65444@231101 FFFFF8050AB65444@231201 FFFFF8050AB65444@231301 FFFFF8050AB65444@231401 FFFFF8050AB65444@231501 FFFFF8050AB65444@231601 FFFFF8050AB65444@231701 FFFFF8050AB65444@231801 FFFFF8050AB65444@231901 FFFFF8050AB65444@232001 FFFFF8050AB65444@232101 FFFFF8050AB65444@232201 FFFFF8050AB65444@232301 FFFFF8050AB65444@232401 FFFFF8050AB65444@232501 FFFFF8050AB65444@232601 FFFFF8050AB65444@232701 FFFFF8050AB65444@232801 FFFFF8050AB65444@232901 FFFFF8050AB65444@233001 FFFFF8050AB65444@233101 FFFFF8050AB65444@233201 FFFFF8050AB65444@233301 FFFFF8050AB65444@233401 FFFFF8050AB65444@233501 FFFFF8050AB65444@233601 FFFFF8050AB65444@233701 FFFFF8050AB65444@233801 FFFFF8050AB65444@233901 FFFFF8050AB65444@234001 FFFFF8050AB65444@234101 FFFFF8050AB65444@234201 FFFFF8050AB65444@234301 FFFFF8050AB65444@234401 FFFFF8050AB65444@234501 FFFFF8050AB65444@234601 FFFFF8050AB65444@234701 FFFFF8050AB65444@234801 FFFFF8050AB65444@234901 FFFFF8050AB65444@235001 FFFFF8050AB65444@235101 FFFFF8050AB65444@235201 FFFFF8050AB65444@235301 FFFFF8050AB65444@235401 FFFFF8050AB65444@235501 FFFFF8050AB65444@235601 FFFFF8050AB65444@235701 FFFFF8050AB65444@235801 FFFFF8050AB65444@235901 FFFFF8050AB65444@236001 FFFFF8050AB65444@236101 FFFFF8050AB65444@236201 FFFFF8050AB65444@236301 FFFFF8050AB65444@236401 FFFFF8050AB65444@236501 FFFFF8050AB65444@236601 FFFFF8050AB65444@236701 FFFFF8050AB65444@236801 FFFFF8050AB65444@236901 FFFFF8050AB65444@237001 FFFFF8050AB65444@237101 FFFFF8050AB65444@237201 FFFFF8050AB65444@237301 FFFFF8050AB65444@237401 FFFFF8050AB65444@237501 FFFFF8050AB65444@237601 FFFFF8050AB65444@237701 FFFFF8050AB65444@237801 FFFFF8050AB65444@237901 FFFFF8050AB65444@238001 FFFFF8050AB65444@238101 FFFFF8050AB65444@238201 FFFFF8050AB65444@238301 FFFFF8050AB65444@238401 FFFFF8050AB65444@238501 FFFFF8050AB65444@238601 FFFFF8050AB65444@238701 FFFFF8050AB65444@238801 FFFFF8050AB65444@238901 FFFFF8050AB65444@239001 FFFFF8050AB65444@239101 FFFFF8050AB65444@239201 FFFFF8050AB65444@239301 FFFFF8050AB65444@239401 FFFFF8050AB65444@239501 FFFFF8050AB65444@239601 FFFFF8050AB65444@239701 FFFFF8050AB65444@239801 FFFFF8050AB65444@239901 FFFFF8050AB65444@240001 FFFFF8050AB65444@240101 FFFFF8050AB65444@240201 FFFFF8050AB65444@240301 FFFFF8050AB65444@240401 FFFFF8050AB65444@240501 FFFFF8050AB65444@240601 FFFFF8050AB65444@240701 FFFFF8050AB65444@240801 FFFFF8050AB65444@240901 FFFFF8050AB65444@241001 FFFFF8050AB65444@241101 FFFFF8050AB65444@241201 FFFFF8050AB65444@241301 FFFFF8050AB65444@241401 FFFFF8050AB65444@241501 FFFFF8050AB65444@241601 FFFFF8050AB65444@241701 FFFFF8050AB65444@241801 FFFFF8050AB65444@241901 FFFFF8050AB65444@242001 FFFFF8050AB65444@242101 FFFFF8050AB65444@242201 FFFFF8050AB65444@242301 FFFFF8050AB65444@242401 FFFFF8050AB65444@242501 FFFFF8050AB65444@242601 FFFFF8050AB65444@242701 FFFFF8050AB65444@242801 FFFFF8050AB65444@242901 FFFFF8050AB65444@243001 FFFFF8050AB65444@243101 FFFFF8050AB65444@243201 FFFFF8050AB65444@243301 FFFFF8050AB65444@243401 FFFFF8050AB65444@243501 FFFFF8050AB65444@243601 FFFFF8050AB65444@243701 FFFFF8050AB65444@243801 FFFFF8050AB65444@243901 FFFFF8050AB65444@244001 FFFFF8050AB65444@244101 FFFFF8050AB65444@244201 FFFFF8050AB65444@244301 FFFFF8050AB65444@244401 FFFFF8050AB65444@244501 FFFFF8050AB65444@244601 FFFFF8050AB65444@244701 FFFFF8050AB65444@244801 FFFFF8050AB65444@244901 FFFFF8050AB65444@245001 FFFFF8050AB65444@245101 FFFFF8050AB65444@245201 FFFFF8050AB65444@245301 FFFFF8050AB65444@245401 FFFFF8050AB65444@245501 FFFFF8050AB65444@245601 FFFFF8050AB65444@245701 FFFFF8050AB65444@245801 FFFFF8050AB65444@245901 FFFFF8050AB65444@246001 FFFFF8050AB65444@246101 FFFFF8050AB65444@246201 FFFFF8050AB65444@246301 FFFFF8050AB65444@246401 FFFFF8050AB65444@246501 FFFFF8050AB65444@246601 FFFFF8050AB65444@246701 FFFFF8050AB65444@246801 FFFFF8050AB65444@246901 FFFFF8050AB65444@247001 FFFFF8050AB65444@247101 FFFFF8050AB65444@247201 FFFFF8050AB65444@247301 FFFFF8050AB65444@247401 FFFFF8050AB65444@247501 FFFFF8050AB65444@247601 FFFFF8050AB65444@247701 FFFFF8050AB65444@247801 FFFFF8050AB65444@247901 FFFFF8050AB65444@248001 FFFFF8050AB65444@248101 FFFFF8050AB65444@248201 FFFFF8050AB65444@248301 FFFFF8050AB65444@248401 FFFFF8050AB65444@248501 FFFFF8050AB65444@248601 FFFFF8050AB65444@248701 FFFFF8050AB65444@248801 FFFFF8050AB65444@248901 FFFFF8050AB65444@249001 FFFFF8050AB65444@249101 FFFFF8050AB65444@249201 FFFFF8050AB65444@249301 FFFFF8050AB65444@249401 FFFFF8050AB65444@249501 FFFFF8050AB65444@249601 FFFFF8050AB65444@249701 FFFFF8050AB65444@249801 FFFFF8050AB65444@249901
+[heartbeat: exitCount=255000 elapsedSec=9.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=260000 elapsedSec=9.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=265000 elapsedSec=9.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=270000 elapsedSec=9.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=275000 elapsedSec=9.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=280000 elapsedSec=9.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=285000 elapsedSec=10.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=290000 elapsedSec=10.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=295000 elapsedSec=10.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=300000 elapsedSec=10.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=305000 elapsedSec=10.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=310000 elapsedSec=10.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=315000 elapsedSec=10.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=320000 elapsedSec=10.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=325000 elapsedSec=10.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=330000 elapsedSec=10.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=335000 elapsedSec=10.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=340000 elapsedSec=10.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=345000 elapsedSec=10.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=350000 elapsedSec=10.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=355000 elapsedSec=10.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=360000 elapsedSec=11.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=365000 elapsedSec=11.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=370000 elapsedSec=11.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=375000 elapsedSec=11.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=380000 elapsedSec=11.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=385000 elapsedSec=11.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=390000 elapsedSec=11.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=395000 elapsedSec=11.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=400000 elapsedSec=11.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=405000 elapsedSec=11.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=410000 elapsedSec=11.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=415000 elapsedSec=11.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=420000 elapsedSec=11.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=425000 elapsedSec=11.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=430000 elapsedSec=11.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=435000 elapsedSec=12.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=440000 elapsedSec=12.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=445000 elapsedSec=12.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=450000 elapsedSec=12.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=455000 elapsedSec=12.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=460000 elapsedSec=12.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=465000 elapsedSec=12.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=470000 elapsedSec=12.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=475000 elapsedSec=12.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=480000 elapsedSec=12.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=485000 elapsedSec=12.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=490000 elapsedSec=12.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=495000 elapsedSec=12.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=500000 elapsedSec=12.8 lastPort=0xB008 write=0 val=0xC]
+[u40] === RIP histogram pass 1 (periodic): 5000 samples, base=0xFFFFF8050A800000 ===
+[u40]     3396  page 0xFFFFF8050AB65000  = base+0x365000
+[u40]      790  page 0xBEA03000
+[u40]      165  page 0x1DD9000
+[u40]      164  page 0xFFFFF8050ABBD000  = base+0x3BD000
+[u40]      119  page 0xBF14E000
+[u40]      109  page 0xBE41C000
+[u40]       84  page 0xFFFFF8050ABBC000  = base+0x3BC000
+[u40]       58  page 0xBFC50000
+[u40]       37  page 0xBFD68000
+[u40]       23  page 0xBE422000
+[u40]       15  page 0xBF174000
+[u40]       14  page 0xBF16B000
+[u40]       13  page 0xFFFFF8050ACCC000  = base+0x4CC000
+[u40]        6  page 0xBF14F000
+[u40]        2  page 0x848000
+[u40]        2  page 0xFFFFF8050ABA5000  = base+0x3A5000
+[u40]        1  page 0xBFA20000
+[u40]        1  page 0xFFFFF8050ABFD000  = base+0x3FD000
+[u40]   most recent 256 samples (newest last):
+[u40]     FFFFF8050AB65444@474401 FFFFF8050AB65444@474501 FFFFF8050AB65444@474601 FFFFF8050AB65444@474701 FFFFF8050AB65444@474801 FFFFF8050AB65444@474901 FFFFF8050AB65444@475001 FFFFF8050AB65444@475101 FFFFF8050AB65444@475201 FFFFF8050AB65444@475301 FFFFF8050AB65444@475401 FFFFF8050AB65444@475501 FFFFF8050AB65444@475601 FFFFF8050AB65444@475701 FFFFF8050AB65444@475801 FFFFF8050AB65444@475901 FFFFF8050AB65444@476001 FFFFF8050AB65444@476101 FFFFF8050AB65444@476201 FFFFF8050AB65444@476301 FFFFF8050AB65444@476401 FFFFF8050AB65444@476501 FFFFF8050AB65444@476601 FFFFF8050AB65444@476701 FFFFF8050AB65444@476801 FFFFF8050AB65444@476901 FFFFF8050AB65444@477001 FFFFF8050AB65444@477101 FFFFF8050AB65444@477201 FFFFF8050AB65444@477301 FFFFF8050AB65444@477401 FFFFF8050AB65444@477501 FFFFF8050AB65444@477601 FFFFF8050AB65444@477701 FFFFF8050AB65444@477801 FFFFF8050AB65444@477901 FFFFF8050AB65444@478001 FFFFF8050AB65444@478101 FFFFF8050AB65444@478201 FFFFF8050AB65444@478301 FFFFF8050AB65444@478401 FFFFF8050AB65444@478501 FFFFF8050AB65444@478601 FFFFF8050AB65444@478701 FFFFF8050AB65444@478801 FFFFF8050AB65444@478901 FFFFF8050AB65444@479001 FFFFF8050AB65444@479101 FFFFF8050AB65444@479201 FFFFF8050AB65444@479301 FFFFF8050AB65444@479401 FFFFF8050AB65444@479501 FFFFF8050AB65444@479601 FFFFF8050AB65444@479701 FFFFF8050AB65444@479801 FFFFF8050AB65444@479901 FFFFF8050AB65444@480001 FFFFF8050AB65444@480101 FFFFF8050AB65444@480201 FFFFF8050AB65444@480301 FFFFF8050AB65444@480401 FFFFF8050AB65444@480501 FFFFF8050AB65444@480601 FFFFF8050AB65444@480701 FFFFF8050AB65444@480801 FFFFF8050AB65444@480901 FFFFF8050AB65444@481001 FFFFF8050AB65444@481101 FFFFF8050AB65444@481201 FFFFF8050AB65444@481301 FFFFF8050AB65444@481401 FFFFF8050AB65444@481501 FFFFF8050AB65444@481601 FFFFF8050AB65444@481701 FFFFF8050AB65444@481801 FFFFF8050AB65444@481901 FFFFF8050AB65444@482001 FFFFF8050AB65444@482101 FFFFF8050AB65444@482201 FFFFF8050AB65444@482301 FFFFF8050AB65444@482401 FFFFF8050AB65444@482501 FFFFF8050AB65444@482601 FFFFF8050AB65444@482701 FFFFF8050AB65444@482801 FFFFF8050AB65444@482901 FFFFF8050AB65444@483001 FFFFF8050AB65444@483101 FFFFF8050AB65444@483201 FFFFF8050AB65444@483301 FFFFF8050AB65444@483401 FFFFF8050AB65444@483501 FFFFF8050AB65444@483601 FFFFF8050AB65444@483701 FFFFF8050AB65444@483801 FFFFF8050AB65444@483901 FFFFF8050AB65444@484001 FFFFF8050AB65444@484101 FFFFF8050AB65444@484201 FFFFF8050AB65444@484301 FFFFF8050AB65444@484401 FFFFF8050AB65444@484501 FFFFF8050AB65444@484601 FFFFF8050AB65444@484701 FFFFF8050AB65444@484801 FFFFF8050AB65444@484901 FFFFF8050AB65444@485001 FFFFF8050AB65444@485101 FFFFF8050AB65444@485201 FFFFF8050AB65444@485301 FFFFF8050AB65444@485401 FFFFF8050AB65444@485501 FFFFF8050AB65444@485601 FFFFF8050AB65444@485701 FFFFF8050AB65444@485801 FFFFF8050AB65444@485901 FFFFF8050AB65444@486001 FFFFF8050AB65444@486101 FFFFF8050AB65444@486201 FFFFF8050AB65444@486301 FFFFF8050AB65444@486401 FFFFF8050AB65444@486501 FFFFF8050AB65444@486601 FFFFF8050AB65444@486701 FFFFF8050AB65444@486801 FFFFF8050AB65444@486901 FFFFF8050AB65444@487001 FFFFF8050AB65444@487101 FFFFF8050AB65444@487201 FFFFF8050AB65444@487301 FFFFF8050AB65444@487401 FFFFF8050AB65444@487501 FFFFF8050AB65444@487601 FFFFF8050AB65444@487701 FFFFF8050AB65444@487801 FFFFF8050AB65444@487901 FFFFF8050AB65444@488001 FFFFF8050AB65444@488101 FFFFF8050AB65444@488201 FFFFF8050AB65444@488301 FFFFF8050AB65444@488401 FFFFF8050AB65444@488501 FFFFF8050AB65444@488601 FFFFF8050AB65444@488701 FFFFF8050AB65444@488801 FFFFF8050AB65444@488901 FFFFF8050AB65444@489001 FFFFF8050AB65444@489101 FFFFF8050AB65444@489201 FFFFF8050AB65444@489301 FFFFF8050AB65444@489401 FFFFF8050AB65444@489501 FFFFF8050AB65444@489601 FFFFF8050AB65444@489701 FFFFF8050AB65444@489801 FFFFF8050AB65444@489901 FFFFF8050AB65444@490001 FFFFF8050AB65444@490101 FFFFF8050AB65444@490201 FFFFF8050AB65444@490301 FFFFF8050AB65444@490401 FFFFF8050AB65444@490501 FFFFF8050AB65444@490601 FFFFF8050AB65444@490701 FFFFF8050AB65444@490801 FFFFF8050AB65444@490901 FFFFF8050AB65444@491001 FFFFF8050AB65444@491101 FFFFF8050AB65444@491201 FFFFF8050AB65444@491301 FFFFF8050AB65444@491401 FFFFF8050AB65444@491501 FFFFF8050AB65444@491601 FFFFF8050AB65444@491701 FFFFF8050AB65444@491801 FFFFF8050AB65444@491901 FFFFF8050AB65444@492001 FFFFF8050AB65444@492101 FFFFF8050AB65444@492201 FFFFF8050AB65444@492301 FFFFF8050AB65444@492401 FFFFF8050AB65444@492501 FFFFF8050AB65444@492601 FFFFF8050AB65444@492701 FFFFF8050AB65444@492801 FFFFF8050AB65444@492901 FFFFF8050AB65444@493001 FFFFF8050AB65444@493101 FFFFF8050AB65444@493201 FFFFF8050AB65444@493301 FFFFF8050AB65444@493401 FFFFF8050AB65444@493501 FFFFF8050AB65444@493601 FFFFF8050AB65444@493701 FFFFF8050AB65444@493801 FFFFF8050AB65444@493901 FFFFF8050AB65444@494001 FFFFF8050AB65444@494101 FFFFF8050AB65444@494201 FFFFF8050AB65444@494301 FFFFF8050AB65444@494401 FFFFF8050AB65444@494501 FFFFF8050AB65444@494601 FFFFF8050AB65444@494701 FFFFF8050AB65444@494801 FFFFF8050AB65444@494901 FFFFF8050AB65444@495001 FFFFF8050AB65444@495101 FFFFF8050AB65444@495201 FFFFF8050AB65444@495301 FFFFF8050AB65444@495401 FFFFF8050AB65444@495501 FFFFF8050AB65444@495601 FFFFF8050AB65444@495701 FFFFF8050AB65444@495801 FFFFF8050AB65444@495901 FFFFF8050AB65444@496001 FFFFF8050AB65444@496101 FFFFF8050AB65444@496201 FFFFF8050AB65444@496301 FFFFF8050AB65444@496401 FFFFF8050AB65444@496501 FFFFF8050AB65444@496601 FFFFF8050AB65444@496701 FFFFF8050AB65444@496801 FFFFF8050AB65444@496901 FFFFF8050AB65444@497001 FFFFF8050AB65444@497101 FFFFF8050AB65444@497201 FFFFF8050AB65444@497301 FFFFF8050AB65444@497401 FFFFF8050AB65444@497501 FFFFF8050AB65444@497601 FFFFF8050AB65444@497701 FFFFF8050AB65444@497801 FFFFF8050AB65444@497901 FFFFF8050AB65444@498001 FFFFF8050AB65444@498101 FFFFF8050AB65444@498201 FFFFF8050AB65444@498301 FFFFF8050AB65444@498401 FFFFF8050AB65444@498501 FFFFF8050AB65444@498601 FFFFF8050AB65444@498701 FFFFF8050AB65444@498801 FFFFF8050AB65444@498901 FFFFF8050AB65444@499001 FFFFF8050AB65444@499101 FFFFF8050AB65444@499201 FFFFF8050AB65444@499301 FFFFF8050AB65444@499401 FFFFF8050AB65444@499501 FFFFF8050AB65444@499601 FFFFF8050AB65444@499701 FFFFF8050AB65444@499801 FFFFF8050AB65444@499901
+[heartbeat: exitCount=505000 elapsedSec=12.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=510000 elapsedSec=13.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=515000 elapsedSec=13.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=520000 elapsedSec=13.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=525000 elapsedSec=13.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=530000 elapsedSec=13.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=535000 elapsedSec=13.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=540000 elapsedSec=13.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=545000 elapsedSec=13.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=550000 elapsedSec=13.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=555000 elapsedSec=13.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=560000 elapsedSec=13.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=565000 elapsedSec=13.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=570000 elapsedSec=13.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=575000 elapsedSec=13.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=580000 elapsedSec=13.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=585000 elapsedSec=13.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=590000 elapsedSec=14.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=595000 elapsedSec=14.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=600000 elapsedSec=14.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=605000 elapsedSec=14.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=610000 elapsedSec=14.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=615000 elapsedSec=14.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=620000 elapsedSec=14.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=625000 elapsedSec=14.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=630000 elapsedSec=14.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=635000 elapsedSec=14.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=640000 elapsedSec=14.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=645000 elapsedSec=14.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=650000 elapsedSec=14.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=655000 elapsedSec=14.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=660000 elapsedSec=14.9 lastPort=0xB008 write=0 val=0xC]
+[rtc-diag] tick #500 SKIPPED (interrupts disabled), skippedTotal=423 firedTotal=77
+[heartbeat: exitCount=665000 elapsedSec=15.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=670000 elapsedSec=15.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=675000 elapsedSec=15.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=680000 elapsedSec=15.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=685000 elapsedSec=15.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=690000 elapsedSec=15.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=695000 elapsedSec=15.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=700000 elapsedSec=15.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=705000 elapsedSec=15.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=710000 elapsedSec=15.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=715000 elapsedSec=15.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=720000 elapsedSec=15.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=725000 elapsedSec=15.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=730000 elapsedSec=15.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=735000 elapsedSec=15.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=740000 elapsedSec=16.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=745000 elapsedSec=16.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=750000 elapsedSec=16.1 lastPort=0xB008 write=0 val=0xC]
+[u40] === RIP histogram pass 1 (periodic): 7500 samples, base=0xFFFFF8050A800000 ===
+[u40]     5896  page 0xFFFFF8050AB65000  = base+0x365000
+[u40]      790  page 0xBEA03000
+[u40]      165  page 0x1DD9000
+[u40]      164  page 0xFFFFF8050ABBD000  = base+0x3BD000
+[u40]      119  page 0xBF14E000
+[u40]      109  page 0xBE41C000
+[u40]       84  page 0xFFFFF8050ABBC000  = base+0x3BC000
+[u40]       58  page 0xBFC50000
+[u40]       37  page 0xBFD68000
+[u40]       23  page 0xBE422000
+[u40]       15  page 0xBF174000
+[u40]       14  page 0xBF16B000
+[u40]       13  page 0xFFFFF8050ACCC000  = base+0x4CC000
+[u40]        6  page 0xBF14F000
+[u40]        2  page 0x848000
+[u40]        2  page 0xFFFFF8050ABA5000  = base+0x3A5000
+[u40]        1  page 0xBFA20000
+[u40]        1  page 0xFFFFF8050ABFD000  = base+0x3FD000
+[u40]   most recent 256 samples (newest last):
+[u40]     FFFFF8050AB65444@724401 FFFFF8050AB65444@724501 FFFFF8050AB65444@724601 FFFFF8050AB65444@724701 FFFFF8050AB65444@724801 FFFFF8050AB65444@724901 FFFFF8050AB65444@725001 FFFFF8050AB65444@725101 FFFFF8050AB65444@725201 FFFFF8050AB65444@725301 FFFFF8050AB65444@725401 FFFFF8050AB65444@725501 FFFFF8050AB65444@725601 FFFFF8050AB65444@725701 FFFFF8050AB65444@725801 FFFFF8050AB65444@725901 FFFFF8050AB65444@726001 FFFFF8050AB65444@726101 FFFFF8050AB65444@726201 FFFFF8050AB65444@726301 FFFFF8050AB65444@726401 FFFFF8050AB65444@726501 FFFFF8050AB65444@726601 FFFFF8050AB65444@726701 FFFFF8050AB65444@726801 FFFFF8050AB65444@726901 FFFFF8050AB65444@727001 FFFFF8050AB65444@727101 FFFFF8050AB65444@727201 FFFFF8050AB65444@727301 FFFFF8050AB65444@727401 FFFFF8050AB65444@727501 FFFFF8050AB65444@727601 FFFFF8050AB65444@727701 FFFFF8050AB65444@727801 FFFFF8050AB65444@727901 FFFFF8050AB65444@728001 FFFFF8050AB65444@728101 FFFFF8050AB65444@728201 FFFFF8050AB65444@728301 FFFFF8050AB65444@728401 FFFFF8050AB65444@728501 FFFFF8050AB65444@728601 FFFFF8050AB65444@728701 FFFFF8050AB65444@728801 FFFFF8050AB65444@728901 FFFFF8050AB65444@729001 FFFFF8050AB65444@729101 FFFFF8050AB65444@729201 FFFFF8050AB65444@729301 FFFFF8050AB65444@729401 FFFFF8050AB65444@729501 FFFFF8050AB65444@729601 FFFFF8050AB65444@729701 FFFFF8050AB65444@729801 FFFFF8050AB65444@729901 FFFFF8050AB65444@730001 FFFFF8050AB65444@730101 FFFFF8050AB65444@730201 FFFFF8050AB65444@730301 FFFFF8050AB65444@730401 FFFFF8050AB65444@730501 FFFFF8050AB65444@730601 FFFFF8050AB65444@730701 FFFFF8050AB65444@730801 FFFFF8050AB65444@730901 FFFFF8050AB65444@731001 FFFFF8050AB65444@731101 FFFFF8050AB65444@731201 FFFFF8050AB65444@731301 FFFFF8050AB65444@731401 FFFFF8050AB65444@731501 FFFFF8050AB65444@731601 FFFFF8050AB65444@731701 FFFFF8050AB65444@731801 FFFFF8050AB65444@731901 FFFFF8050AB65444@732001 FFFFF8050AB65444@732101 FFFFF8050AB65444@732201 FFFFF8050AB65444@732301 FFFFF8050AB65444@732401 FFFFF8050AB65444@732501 FFFFF8050AB65444@732601 FFFFF8050AB65444@732701 FFFFF8050AB65444@732801 FFFFF8050AB65444@732901 FFFFF8050AB65444@733001 FFFFF8050AB65444@733101 FFFFF8050AB65444@733201 FFFFF8050AB65444@733301 FFFFF8050AB65444@733401 FFFFF8050AB65444@733501 FFFFF8050AB65444@733601 FFFFF8050AB65444@733701 FFFFF8050AB65444@733801 FFFFF8050AB65444@733901 FFFFF8050AB65444@734001 FFFFF8050AB65444@734101 FFFFF8050AB65444@734201 FFFFF8050AB65444@734301 FFFFF8050AB65444@734401 FFFFF8050AB65444@734501 FFFFF8050AB65444@734601 FFFFF8050AB65444@734701 FFFFF8050AB65444@734801 FFFFF8050AB65444@734901 FFFFF8050AB65444@735001 FFFFF8050AB65444@735101 FFFFF8050AB65444@735201 FFFFF8050AB65444@735301 FFFFF8050AB65444@735401 FFFFF8050AB65444@735501 FFFFF8050AB65444@735601 FFFFF8050AB65444@735701 FFFFF8050AB65444@735801 FFFFF8050AB65444@735901 FFFFF8050AB65444@736001 FFFFF8050AB65444@736101 FFFFF8050AB65444@736201 FFFFF8050AB65444@736301 FFFFF8050AB65444@736401 FFFFF8050AB65444@736501 FFFFF8050AB65444@736601 FFFFF8050AB65444@736701 FFFFF8050AB65444@736801 FFFFF8050AB65444@736901 FFFFF8050AB65444@737001 FFFFF8050AB65444@737101 FFFFF8050AB65444@737201 FFFFF8050AB65444@737301 FFFFF8050AB65444@737401 FFFFF8050AB65444@737501 FFFFF8050AB65444@737601 FFFFF8050AB65444@737701 FFFFF8050AB65444@737801 FFFFF8050AB65444@737901 FFFFF8050AB65444@738001 FFFFF8050AB65444@738101 FFFFF8050AB65444@738201 FFFFF8050AB65444@738301 FFFFF8050AB65444@738401 FFFFF8050AB65444@738501 FFFFF8050AB65444@738601 FFFFF8050AB65444@738701 FFFFF8050AB65444@738801 FFFFF8050AB65444@738901 FFFFF8050AB65444@739001 FFFFF8050AB65444@739101 FFFFF8050AB65444@739201 FFFFF8050AB65444@739301 FFFFF8050AB65444@739401 FFFFF8050AB65444@739501 FFFFF8050AB65444@739601 FFFFF8050AB65444@739701 FFFFF8050AB65444@739801 FFFFF8050AB65444@739901 FFFFF8050AB65444@740001 FFFFF8050AB65444@740101 FFFFF8050AB65444@740201 FFFFF8050AB65444@740301 FFFFF8050AB65444@740401 FFFFF8050AB65444@740501 FFFFF8050AB65444@740601 FFFFF8050AB65444@740701 FFFFF8050AB65444@740801 FFFFF8050AB65444@740901 FFFFF8050AB65444@741001 FFFFF8050AB65444@741101 FFFFF8050AB65444@741201 FFFFF8050AB65444@741301 FFFFF8050AB65444@741401 FFFFF8050AB65444@741501 FFFFF8050AB65444@741601 FFFFF8050AB65444@741701 FFFFF8050AB65444@741801 FFFFF8050AB65444@741901 FFFFF8050AB65444@742001 FFFFF8050AB65444@742101 FFFFF8050AB65444@742201 FFFFF8050AB65444@742301 FFFFF8050AB65444@742401 FFFFF8050AB65444@742501 FFFFF8050AB65444@742601 FFFFF8050AB65444@742701 FFFFF8050AB65444@742801 FFFFF8050AB65444@742901 FFFFF8050AB65444@743001 FFFFF8050AB65444@743101 FFFFF8050AB65444@743201 FFFFF8050AB65444@743301 FFFFF8050AB65444@743401 FFFFF8050AB65444@743501 FFFFF8050AB65444@743601 FFFFF8050AB65444@743701 FFFFF8050AB65444@743801 FFFFF8050AB65444@743901 FFFFF8050AB65444@744001 FFFFF8050AB65444@744101 FFFFF8050AB65444@744201 FFFFF8050AB65444@744301 FFFFF8050AB65444@744401 FFFFF8050AB65444@744501 FFFFF8050AB65444@744601 FFFFF8050AB65444@744701 FFFFF8050AB65444@744801 FFFFF8050AB65444@744901 FFFFF8050AB65444@745001 FFFFF8050AB65444@745101 FFFFF8050AB65444@745201 FFFFF8050AB65444@745301 FFFFF8050AB65444@745401 FFFFF8050AB65444@745501 FFFFF8050AB65444@745601 FFFFF8050AB65444@745701 FFFFF8050AB65444@745801 FFFFF8050AB65444@745901 FFFFF8050AB65444@746001 FFFFF8050AB65444@746101 FFFFF8050AB65444@746201 FFFFF8050AB65444@746301 FFFFF8050AB65444@746401 FFFFF8050AB65444@746501 FFFFF8050AB65444@746601 FFFFF8050AB65444@746701 FFFFF8050AB65444@746801 FFFFF8050AB65444@746901 FFFFF8050AB65444@747001 FFFFF8050AB65444@747101 FFFFF8050AB65444@747201 FFFFF8050AB65444@747301 FFFFF8050AB65444@747401 FFFFF8050AB65444@747501 FFFFF8050AB65444@747601 FFFFF8050AB65444@747701 FFFFF8050AB65444@747801 FFFFF8050AB65444@747901 FFFFF8050AB65444@748001 FFFFF8050AB65444@748101 FFFFF8050AB65444@748201 FFFFF8050AB65444@748301 FFFFF8050AB65444@748401 FFFFF8050AB65444@748501 FFFFF8050AB65444@748601 FFFFF8050AB65444@748701 FFFFF8050AB65444@748801 FFFFF8050AB65444@748901 FFFFF8050AB65444@749001 FFFFF8050AB65444@749101 FFFFF8050AB65444@749201 FFFFF8050AB65444@749301 FFFFF8050AB65444@749401 FFFFF8050AB65444@749501 FFFFF8050AB65444@749601 FFFFF8050AB65444@749701 FFFFF8050AB65444@749801 FFFFF8050AB65444@749901
+[heartbeat: exitCount=755000 elapsedSec=16.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=760000 elapsedSec=16.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=765000 elapsedSec=16.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=770000 elapsedSec=16.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=775000 elapsedSec=16.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=780000 elapsedSec=16.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=785000 elapsedSec=16.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=790000 elapsedSec=16.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=795000 elapsedSec=16.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=800000 elapsedSec=16.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=805000 elapsedSec=16.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=810000 elapsedSec=16.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=815000 elapsedSec=16.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=820000 elapsedSec=17.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=825000 elapsedSec=17.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=830000 elapsedSec=17.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=835000 elapsedSec=17.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=840000 elapsedSec=17.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=845000 elapsedSec=17.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=850000 elapsedSec=17.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=855000 elapsedSec=17.5 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=860000 elapsedSec=17.6 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=865000 elapsedSec=17.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=870000 elapsedSec=17.7 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=875000 elapsedSec=17.8 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=880000 elapsedSec=17.9 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=885000 elapsedSec=18.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=890000 elapsedSec=18.0 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=895000 elapsedSec=18.1 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=900000 elapsedSec=18.2 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=905000 elapsedSec=18.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=910000 elapsedSec=18.3 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=915000 elapsedSec=18.4 lastPort=0xB008 write=0 val=0xC]
+[heartbeat: exitCount=920000 elapsedSec=18.5 lastPort=0xB008 write=0 val=0xC]
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[cmos-ab] write reg=0x0B value=0x02 (RegA=0x25 RegB=0x02, PIE=0)
+[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=923839)
+[u40] === RIP histogram pass 1 (end of pass 1, at reset): 9239 samples, base=0xFFFFF8050A800000 ===
+[u40]     7635  page 0xFFFFF8050AB65000  = base+0x365000
+[u40]      790  page 0xBEA03000
+[u40]      165  page 0x1DD9000
+[u40]      164  page 0xFFFFF8050ABBD000  = base+0x3BD000
+[u40]      119  page 0xBF14E000
+[u40]      109  page 0xBE41C000
+[u40]       84  page 0xFFFFF8050ABBC000  = base+0x3BC000
+[u40]       58  page 0xBFC50000
+[u40]       37  page 0xBFD68000
+[u40]       23  page 0xBE422000
+[u40]       15  page 0xBF174000
+[u40]       14  page 0xBF16B000
+[u40]       13  page 0xFFFFF8050ACCC000  = base+0x4CC000
+[u40]        6  page 0xBF14F000
+[u40]        2  page 0x848000
+[u40]        2  page 0xFFFFF8050ABA5000  = base+0x3A5000
+[u40]        1  page 0xBFA20000
+[u40]        1  page 0xFFFFF8050ABFD000  = base+0x3FD000
+[u40]   most recent 256 samples (newest last):
+[u40]     FFFFF8050AB65444@898301 FFFFF8050AB65444@898401 FFFFF8050AB65444@898501 FFFFF8050AB65444@898601 FFFFF8050AB65444@898701 FFFFF8050AB65444@898801 FFFFF8050AB65444@898901 FFFFF8050AB65444@899001 FFFFF8050AB65444@899101 FFFFF8050AB65444@899201 FFFFF8050AB65444@899301 FFFFF8050AB65444@899401 FFFFF8050AB65444@899501 FFFFF8050AB65444@899601 FFFFF8050AB65444@899701 FFFFF8050AB65444@899801 FFFFF8050AB65444@899901 FFFFF8050AB65444@900001 FFFFF8050AB65444@900101 FFFFF8050AB65444@900201 FFFFF8050AB65444@900301 FFFFF8050AB65444@900401 FFFFF8050AB65444@900501 FFFFF8050AB65444@900601 FFFFF8050AB65444@900701 FFFFF8050AB65444@900801 FFFFF8050AB65444@900901 FFFFF8050AB65444@901001 FFFFF8050AB65444@901101 FFFFF8050AB65444@901201 FFFFF8050AB65444@901301 FFFFF8050AB65444@901401 FFFFF8050AB65444@901501 FFFFF8050AB65444@901601 FFFFF8050AB65444@901701 FFFFF8050AB65444@901801 FFFFF8050AB65444@901901 FFFFF8050AB65444@902001 FFFFF8050AB65444@902101 FFFFF8050AB65444@902201 FFFFF8050AB65444@902301 FFFFF8050AB65444@902401 FFFFF8050AB65444@902501 FFFFF8050AB65444@902601 FFFFF8050AB65444@902701 FFFFF8050AB65444@902801 FFFFF8050AB65444@902901 FFFFF8050AB65444@903001 FFFFF8050AB65444@903101 FFFFF8050AB65444@903201 FFFFF8050AB65444@903301 FFFFF8050AB65444@903401 FFFFF8050AB65444@903501 FFFFF8050AB65444@903601 FFFFF8050AB65444@903701 FFFFF8050AB65444@903801 FFFFF8050AB65444@903901 FFFFF8050AB65444@904001 FFFFF8050AB65444@904101 FFFFF8050AB65444@904201 FFFFF8050AB65444@904301 FFFFF8050AB65444@904401 FFFFF8050AB65444@904501 FFFFF8050AB65444@904601 FFFFF8050AB65444@904701 FFFFF8050AB65444@904801 FFFFF8050AB65444@904901 FFFFF8050AB65444@905001 FFFFF8050AB65444@905101 FFFFF8050AB65444@905201 FFFFF8050AB65444@905301 FFFFF8050AB65444@905401 FFFFF8050AB65444@905501 FFFFF8050AB65444@905601 FFFFF8050AB65444@905701 FFFFF8050AB65444@905801 FFFFF8050AB65444@905901 FFFFF8050AB65444@906001 FFFFF8050AB65444@906101 FFFFF8050AB65444@906201 FFFFF8050AB65444@906301 FFFFF8050AB65444@906401 FFFFF8050AB65444@906501 FFFFF8050AB65444@906601 FFFFF8050AB65444@906701 FFFFF8050AB65444@906801 FFFFF8050AB65444@906901 FFFFF8050AB65444@907001 FFFFF8050AB65444@907101 FFFFF8050AB65444@907201 FFFFF8050AB65444@907301 FFFFF8050AB65444@907401 FFFFF8050AB65444@907501 FFFFF8050AB65444@907601 FFFFF8050AB65444@907701 FFFFF8050AB65444@907801 FFFFF8050AB65444@907901 FFFFF8050AB65444@908001 FFFFF8050AB65444@908101 FFFFF8050AB65444@908201 FFFFF8050AB65444@908301 FFFFF8050AB65444@908401 FFFFF8050AB65444@908501 FFFFF8050AB65444@908601 FFFFF8050AB65444@908701 FFFFF8050AB65444@908801 FFFFF8050AB65444@908901 FFFFF8050AB65444@909001 FFFFF8050AB65444@909101 FFFFF8050AB65444@909201 FFFFF8050AB65444@909301 FFFFF8050AB65444@909401 FFFFF8050AB65444@909501 FFFFF8050AB65444@909601 FFFFF8050AB65444@909701 FFFFF8050AB65444@909801 FFFFF8050AB65444@909901 FFFFF8050AB65444@910001 FFFFF8050AB65444@910101 FFFFF8050AB65444@910201 FFFFF8050AB65444@910301 FFFFF8050AB65444@910401 FFFFF8050AB65444@910501 FFFFF8050AB65444@910601 FFFFF8050AB65444@910701 FFFFF8050AB65444@910801 FFFFF8050AB65444@910901 FFFFF8050AB65444@911001 FFFFF8050AB65444@911101 FFFFF8050AB65444@911201 FFFFF8050AB65444@911301 FFFFF8050AB65444@911401 FFFFF8050AB65444@911501 FFFFF8050AB65444@911601 FFFFF8050AB65444@911701 FFFFF8050AB65444@911801 FFFFF8050AB65444@911901 FFFFF8050AB65444@912001 FFFFF8050AB65444@912101 FFFFF8050AB65444@912201 FFFFF8050AB65444@912301 FFFFF8050AB65444@912401 FFFFF8050AB65444@912501 FFFFF8050AB65444@912601 FFFFF8050AB65444@912701 FFFFF8050AB65444@912801 FFFFF8050AB65444@912901 FFFFF8050AB65444@913001 FFFFF8050AB65444@913101 FFFFF8050AB65444@913201 FFFFF8050AB65444@913301 FFFFF8050AB65444@913401 FFFFF8050AB65444@913501 FFFFF8050AB65444@913601 FFFFF8050AB65444@913701 FFFFF8050AB65444@913801 FFFFF8050AB65444@913901 FFFFF8050AB65444@914001 FFFFF8050AB65444@914101 FFFFF8050AB65444@914201 FFFFF8050AB65444@914301 FFFFF8050AB65444@914401 FFFFF8050AB65444@914501 FFFFF8050AB65444@914601 FFFFF8050AB65444@914701 FFFFF8050AB65444@914801 FFFFF8050AB65444@914901 FFFFF8050AB65444@915001 FFFFF8050AB65444@915101 FFFFF8050AB65444@915201 FFFFF8050AB65444@915301 FFFFF8050AB65444@915401 FFFFF8050AB65444@915501 FFFFF8050AB65444@915601 FFFFF8050AB65444@915701 FFFFF8050AB65444@915801 FFFFF8050AB65444@915901 FFFFF8050AB65444@916001 FFFFF8050AB65444@916101 FFFFF8050AB65444@916201 FFFFF8050AB65444@916301 FFFFF8050AB65444@916401 FFFFF8050AB65444@916501 FFFFF8050AB65444@916601 FFFFF8050AB65444@916701 FFFFF8050AB65444@916801 FFFFF8050AB65444@916901 FFFFF8050AB65444@917001 FFFFF8050AB65444@917101 FFFFF8050AB65444@917201 FFFFF8050AB65444@917301 FFFFF8050AB65444@917401 FFFFF8050AB65444@917501 FFFFF8050AB65444@917601 FFFFF8050AB65444@917701 FFFFF8050AB65444@917801 FFFFF8050AB65444@917901 FFFFF8050AB65444@918001 FFFFF8050AB65444@918101 FFFFF8050AB65444@918201 FFFFF8050AB65444@918301 FFFFF8050AB65444@918401 FFFFF8050AB65444@918501 FFFFF8050AB65444@918601 FFFFF8050AB65444@918701 FFFFF8050AB65444@918801 FFFFF8050AB65444@918901 FFFFF8050AB65444@919001 FFFFF8050AB65444@919101 FFFFF8050AB65444@919201 FFFFF8050AB65444@919301 FFFFF8050AB65444@919401 FFFFF8050AB65444@919501 FFFFF8050AB65444@919601 FFFFF8050AB65444@919701 FFFFF8050AB65444@919801 FFFFF8050AB65444@919901 FFFFF8050AB65444@920001 FFFFF8050AB65444@920101 FFFFF8050AB65444@920201 FFFFF8050AB65444@920301 FFFFF8050AB65444@920401 FFFFF8050AB65444@920501 FFFFF8050AB65444@920601 FFFFF8050AB65444@920701 FFFFF8050AB65444@920801 FFFFF8050AB65444@920901 FFFFF8050AB65444@921001 FFFFF8050AB65444@921101 FFFFF8050AB65444@921201 FFFFF8050AB65444@921301 FFFFF8050AB65444@921401 FFFFF8050AB65444@921501 FFFFF8050AB65444@921601 FFFFF8050AB65444@921701 FFFFF8050AB65444@921801 FFFFF8050AB65444@921901 FFFFF8050AB65444@922001 FFFFF8050AB65444@922101 FFFFF8050AB65444@922201 FFFFF8050AB65444@922301 FFFFF8050AB65444@922401 FFFFF8050AB65444@922501 FFFFF8050AB65444@922601 FFFFF8050AB65444@922701 FFFFF8050AB65444@922801 FFFFF8050AB65444@922901 FFFFF8050AB65444@923001 FFFFF8050AB65444@923101 FFFFF8050AB65444@923201 FFFFF8050AB65444@923301 FFFFF8050AB65444@923401 FFFFF8050AB65444@923501 FFFFF8050AB65444@923601 FFFFF8050AB65444@923701 FFFFF8050AB65444@923801
+[fwcfg] select #24: selector=0x0
+[fwcfg] select #25: selector=0x1
+[fwcfg] select #26: selector=0x19
+[fwcfg] select #27: selector=0x19
+[fwcfg] select #28: selector=0x19
+[fwcfg] select #29: selector=0x19
+[fwcfg] select #30: selector=0x19
+[fwcfg] select #31: selector=0x19
+[fwcfg] select #32: selector=0x19
+[fwcfg] select #33: selector=0x19
+[fwcfg] select #34: selector=0x0
+[fwcfg] select #35: selector=0x1
+[fwcfg] select #36: selector=0x19
+[fwcfg] select #37: selector=0xE
+[fwcfg] select #38: selector=0x5
+[heartbeat: exitCount=925000 elapsedSec=18.7 lastPort=0xB008 write=0 val=0x2]
+[heartbeat: exitCount=930000 elapsedSec=18.8 lastPort=0xB008 write=0 val=0x2]
+[fwcfg] select #39: selector=0x23
+[ramfb] configured: address=0xBE500000 800x600 stride=3200
+[cmos-ab] write reg=0x0A value=0x26 (RegA=0x26 RegB=0x02, PIE=0)
+[fwcfg] select #40: selector=0x17
+[heartbeat: exitCount=935000 elapsedSec=18.9 lastPort=0xCF8 write=1 val=0x89]
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;031;100t[2J[001;001H[aux] controller: disable AUX port
+[heartbeat: exitCount=940000 elapsedSec=19.0 lastPort=0xCFC write=0 val=0x0]
+[heartbeat: exitCount=945000 elapsedSec=19.1 lastPort=0xB008 write=0 val=0x0]
+BdsDxe: loading Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0002 "UEFI LocalHost Virtual Disk LH0001 " from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[heartbeat: exitCount=950000 elapsedSec=19.4 lastPort=0xB008 write=0 val=0x89]
+[2J[001;001H[=3h[2J[001;001H[heartbeat: exitCount=955000 elapsedSec=19.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=960000 elapsedSec=19.6 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=965000 elapsedSec=19.7 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=970000 elapsedSec=19.8 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=975000 elapsedSec=19.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=980000 elapsedSec=20.0 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=985000 elapsedSec=20.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=990000 elapsedSec=20.2 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=995000 elapsedSec=20.3 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1000000 elapsedSec=20.4 lastPort=0xB008 write=0 val=0x89]
+[u40] === RIP histogram pass 2 (periodic): 7610 samples, base=0x0 ===
+[u40]     5300  page 0xBEA03000
+[u40]     1070  page 0xBF14E000
+[u40]      595  page 0xBFC50000
+[u40]      179  page 0xBF14F000
+[u40]      176  page 0xBE422000
+[u40]      143  page 0xBF174000
+[u40]       81  page 0xBF16B000
+[u40]       22  page 0xBFD68000
+[u40]       14  page 0x848000
+[u40]        8  page 0xBE41C000
+[u40]        5  page 0x83D000
+[u40]        2  page 0xBFF79000
+[u40]        1  page 0xBF115000
+[u40]        1  page 0xBFE5E000
+[u40]        1  page 0xBEA2F000
+[u40]        1  page 0x835000
+[u40]        1  page 0xBEA07000
+[u40]        1  page 0xBFF78000
+[u40]   most recent 256 samples (newest last):
+[u40]     BEA03B01@997441 BEA03B01@997451 BEA03B01@997461 BEA03B01@997471 BEA03B01@997481 BEA03B01@997491 BEA03B01@997501 BEA03B01@997511 BEA03B01@997521 BEA03B01@997531 BEA03B01@997541 BEA03B01@997551 BEA03B01@997561 BEA03B01@997571 BEA03B01@997581 BEA03B01@997591 BEA03B01@997601 BEA03B01@997611 BEA03B01@997621 BEA03B01@997631 BEA03B01@997641 BEA03B01@997651 BEA03B01@997661 BEA03B01@997671 BEA03B01@997681 BEA03B01@997691 BEA03B01@997701 BEA03B01@997711 BEA03B01@997721 BEA03B01@997731 BEA03B01@997741 BEA03B01@997751 BEA03B01@997761 BEA03B01@997771 BEA03B01@997781 BEA03B01@997791 BEA03B01@997801 BEA03B01@997811 BEA03B01@997821 BEA03B01@997831 BEA03B01@997841 BEA03B01@997851 BEA03B01@997861 BEA03B01@997871 BEA03B01@997881 BEA03B01@997891 BEA03B01@997901 BEA03B01@997911 BEA03B01@997921 BEA03B01@997931 BEA03B01@997941 BEA03B01@997951 BEA03B01@997961 BEA03B01@997971 BEA03B01@997981 BEA03B01@997991 BEA03B01@998001 BEA03B01@998011 BEA03B01@998021 BEA03B01@998031 BEA03B01@998041 BEA03B01@998051 BEA03B01@998061 BEA03B01@998071 BEA03B01@998081 BEA03B01@998091 BEA03B01@998101 BEA03B01@998111 BEA03B01@998121 BEA03B01@998131 BEA03B01@998141 BEA03B01@998151 BEA03B01@998161 BEA03B01@998171 BEA03B01@998181 BEA03B01@998191 BEA03B01@998201 BEA03B01@998211 BEA03B01@998221 BEA03B01@998231 BEA03B01@998241 BEA03B01@998251 BEA03B01@998261 BEA03B01@998271 BEA03B01@998281 BEA03B01@998291 BEA03B01@998301 BEA03B01@998311 BEA03B01@998321 BEA03B01@998331 BEA03B01@998341 BEA03B01@998351 BEA03B01@998361 BEA03B01@998371 BEA03B01@998381 BEA03B01@998391 BEA03B01@998401 BEA03B01@998411 BEA03B01@998421 BEA03B01@998431 BEA03B01@998441 BEA03B01@998451 BEA03B01@998461 BEA03B01@998471 BEA03B01@998481 BEA03B01@998491 BEA03B01@998501 BEA03B01@998511 BEA03B01@998521 BEA03B01@998531 BEA03B01@998541 BEA03B01@998551 BEA03B01@998561 BEA03B01@998571 BEA03B01@998581 BEA03B01@998591 BEA03B01@998601 BEA03B01@998611 BEA03B01@998621 BEA03B01@998631 BEA03B01@998641 BEA03B01@998651 BEA03B01@998661 BEA03B01@998671 BEA03B01@998681 BEA03B01@998691 BEA03B01@998701 BEA03B01@998711 BEA03B01@998721 BEA03B01@998731 BEA03B01@998741 BEA03B01@998751 BEA03B01@998761 BEA03B01@998771 BEA03B01@998781 BEA03B01@998791 BEA03B01@998801 BEA03B01@998811 BEA03B01@998821 BEA03B01@998831 BEA03B01@998841 BEA03B01@998851 BEA03B01@998861 BEA03B01@998871 BEA03B01@998881 BEA03B01@998891 BEA03B01@998901 BEA03B01@998911 BEA03B01@998921 BEA03B01@998931 BEA03B01@998941 BEA03B01@998951 BEA03B01@998961 BEA03B01@998971 BEA03B01@998981 BEA03B01@998991 BEA03B01@999001 BEA03B01@999011 BEA03B01@999021 BEA03B01@999031 BEA03B01@999041 BEA03B01@999051 BEA03B01@999061 BEA03B01@999071 BEA03B01@999081 BEA03B01@999091 BEA03B01@999101 BEA03B01@999111 BEA03B01@999121 BEA03B01@999131 BEA03B01@999141 BEA03B01@999151 BEA03B01@999161 BEA03B01@999171 BEA03B01@999181 BEA03B01@999191 BEA03B01@999201 BEA03B01@999211 BEA03B01@999221 BEA03B01@999231 BEA03B01@999241 BEA03B01@999251 BEA03B01@999261 BEA03B01@999271 BEA03B01@999281 BEA03B01@999291 BEA03B01@999301 BEA03B01@999311 BEA03B01@999321 BEA03B01@999331 BEA03B01@999341 BEA03B01@999351 BEA03B01@999361 BEA03B01@999371 BEA03B01@999381 BEA03B01@999391 BEA03B01@999401 BEA03B01@999411 BEA03B01@999421 BEA03B01@999431 BEA03B01@999441 BEA03B01@999451 BEA03B01@999461 BEA03B01@999471 BEA03B01@999481 BEA03B01@999491 BEA03B01@999501 BEA03B01@999511 BEA03B01@999521 BEA03B01@999531 BEA03B01@999541 BEA03B01@999551 BEA03B01@999561 BEA03B01@999571 BEA03B01@999581 BEA03B01@999591 BEA03B01@999601 BEA03B01@999611 BEA03B01@999621 BEA03B01@999631 BEA03B01@999641 BEA03B01@999651 BEA03B01@999661 BEA03B01@999671 BEA03B01@999681 BEA03B01@999691 BEA03B01@999701 BEA03B01@999711 BEA03B01@999721 BEA03B01@999731 BEA03B01@999741 BEA03B01@999751 BEA03B01@999761 BEA03B01@999771 BEA03B01@999781 BEA03B01@999791 BEA03B01@999801 BEA03B01@999811 BEA03B01@999821 BEA03B01@999831 BEA03B01@999841 BEA03B01@999851 BEA03B01@999861 BEA03B01@999871 BEA03B01@999881 BEA03B01@999891 BEA03B01@999901 BEA03B01@999911 BEA03B01@999921 BEA03B01@999931 BEA03B01@999941 BEA03B01@999951 BEA03B01@999961 BEA03B01@999971 BEA03B01@999981 BEA03B01@999991
+[heartbeat: exitCount=1005000 elapsedSec=20.5 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1010000 elapsedSec=20.6 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1015000 elapsedSec=20.7 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1020000 elapsedSec=20.8 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1025000 elapsedSec=20.9 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1030000 elapsedSec=21.0 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1035000 elapsedSec=21.1 lastPort=0xB008 write=0 val=0x89]
+[heartbeat: exitCount=1040000 elapsedSec=21.9 lastPort=0x70 write=0 val=0x89]
+[aux] controller: disable AUX port
+[heartbeat: exitCount=1045000 elapsedSec=23.0 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=1050000 elapsedSec=23.1 lastPort=0xCF8 write=1 val=0x0]
+[heartbeat: exitCount=1055000 elapsedSec=23.2 lastPort=0xCF8 write=1 val=0x0]
+[kerneldiag] candidate address 0xFFFFF803467A57DD resolves to module base 0xFFFFF80346400000 (+0x3A57DD into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[wp] DISCOVERY at exitCount=1059891 (pass 2)
+[wp] armed breakpoints at module base 0xFFFFF80346400000 (DR2 LFH-check armed=1): DR0=+0xA773D8 (U34 ExInitializePoolHeapManagement entry, VA=0xFFFFF80346E773D8), DR1=+0x3FD6F0 (KeBugCheckEx, VA=0xFFFFF803467FD6F0), DR2=+0x343B49 (RtlpHpLfhOwnerMoveSubsegment entry, VA=0xFFFFF80346743B49), DR3=+0x9A188F (HalpIommuInitSystem ret, VA=0xFFFFF80346DA188F)
+[u32] ExPoolState pool-descriptor fields (pass 2):
+[u32]   pool[0] desc@RVA0xC57EC0: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[1] desc@RVA0xC59F80: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[2] desc@RVA0xC5C040: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[3] desc@RVA0xC5E100: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[4] desc@RVA0xC601C0: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[5] desc@RVA0xC62280: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[6] desc@RVA0xC64340: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u32]   pool[7] desc@RVA0xC66400: +0x08=0x0 +0x10=0x0  <== +0x10 NULL
+[u33] pass boundary -- re-baselining pool-descriptor tracker for pass 2
+[u33] baseline pass=2 exitCount=1059891 pool[0] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=2 exitCount=1059891 pool[1] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=2 exitCount=1059891 pool[2] +0x08=0x0 +0x10=0x0
+[u33] baseline pass=2 exitCount=1059891 pool[3] +0x08=0x0 +0x10=0x0
+[heartbeat: exitCount=1060000 elapsedSec=23.3 lastPort=0xCFC write=0 val=0x0]
+
+[BUGCHECK] hit #1: KeBugCheckEx code=0x139 p1=0x3 p2=0xFFFFF8034C674CB0 p3=0xFFFFF8034C674C08 exitCount=1060163
+[BUGCHECK]   p4=0x0  caller(return)=0xFFFFF80346811AA9[kerneldiag] candidate address 0xFFFFF80346811AA9 resolves to module base 0xFFFFF80346400000 (+0x411AA9 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+  (base 0xFFFFF80346400000 RVA 0x411AA9)
+[BUGCHECK]   stack (canonical kernel qwords):
+[BUGCHECK]     [rsp+0x00]=0xFFFFF80346811AA9[kerneldiag] candidate address 0xFFFFF80346811AA9 resolves to module base 0xFFFFF80346400000 (+0x411AA9 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+  (RVA 0x411AA9)
+[BUGCHECK]     [rsp+0x08]=0xFFFFF8034C674FF8[kerneldiag] candidate address 0xFFFFF8034C674FF8 resolves to module base 0xFFFFF8034C3F0000 (+0x284FF8 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+  (RVA 0x284FF8)
+[BUGCHECK]     [rsp+0x18]=0xFFFFF8034C674A30[kerneldiag] candidate address 0xFFFFF8034C674A30 resolves to module base 0xFFFFF8034C3F0000 (+0x284A30 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+  (RVA 0x284A30)
+[BUGCHECK]     [rsp+0x30]=0xFFFFF803467D25F9[kerneldiag] candidate address 0xFFFFF803467D25F9 resolves to module base 0xFFFFF80346400000 (+0x3D25F9 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+  (RVA 0x3D25F9)
+[BUGCHECK]   0x139 EXCEPTION_RECORD.ExceptionAddress=0xFFFFF80346744214[kerneldiag] candidate address 0xFFFFF80346744214 resolves to module base 0xFFFFF80346400000 (+0x344214 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+  (RVA 0x344214)  <== DETECTOR
+[BUGCHECK]   0x139 TRAP_FRAME.Rip=0xFFFFF80346744214[kerneldiag] candidate address 0xFFFFF80346744214 resolves to module base 0xFFFFF80346400000 (+0x344214 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+  (RVA 0x344214)  Rsp=0xFFFFF8034C674E48
+[BUGCHECK]   0x139 raw trap-frame qwords 0x00-0xF8:
+[BUGCHECK]     tf+0x00=0x0000000000000000
+[BUGCHECK]     tf+0x08=0x0000000000000000
+[BUGCHECK]     tf+0x10=0x0000000000000000
+[BUGCHECK]     tf+0x18=0x0000000000000000
+[BUGCHECK]     tf+0x20=0x0000000000000000
+[BUGCHECK]     tf+0x28=0x00001F8001000000
+[BUGCHECK]     tf+0x30=0x0000000000000000
+[BUGCHECK]     tf+0x38=0x0000000000000003  <== (==3, likely rcx/fastfail code)
+[BUGCHECK]     tf+0x40=0x0000000000000000
+[BUGCHECK]     tf+0x48=0x0000000000000000
+[BUGCHECK]     tf+0x50=0x0000000000000008
+[BUGCHECK]     tf+0x58=0x0000000000000000
+[BUGCHECK]     tf+0x60=0x0000000000000000
+[BUGCHECK]     tf+0x68=0x0000000000000000
+[BUGCHECK]     tf+0x70=0x0000000000000000
+[BUGCHECK]     tf+0x78=0x0000000000000000
+[BUGCHECK]     tf+0x80=0x0000000000000000
+[BUGCHECK]     tf+0x88=0x0000000000000000
+[BUGCHECK]     tf+0x90=0x0056004500440042
+[BUGCHECK]     tf+0x98=0x003000300030005F
+[BUGCHECK]     tf+0xA0=0x0045005200260031
+[BUGCHECK]     tf+0xA8=0x00300030005F0056
+[BUGCHECK]     tf+0xB0=0x0055002600310030
+[BUGCHECK]     tf+0xB8=0x0030005F00440049
+[BUGCHECK]     tf+0xC0=0x0000000000000001
+[BUGCHECK]     tf+0xC8=0x0000000000000000
+[BUGCHECK]     tf+0xD0=0x0000000000000000
+[BUGCHECK]     tf+0xD8=0x0000000000000000
+[BUGCHECK]     tf+0xE0=0x0000000000000000
+[BUGCHECK]     tf+0xE8=0x0000000000000000
+[BUGCHECK]     tf+0xF0=0x0000000000000000
+[BUGCHECK]     tf+0xF8=0x0000000000000000
+[BUGCHECK]   0x139 full trap-frame scan (off: value -> [Flink,Blink] consistency):
+[BUGCHECK]     tf+0x120=0xFFFFF80347128050[kerneldiag] candidate address 0xFFFFF80347128050 resolves to module base 0xFFFFF80346400000 (+0xD28050 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+ (RVA 0xD28050)
+[BUGCHECK]     tf+0x128=0xFFFFF8034664545E[kerneldiag] candidate address 0xFFFFF8034664545E resolves to module base 0xFFFFF80346400000 (+0x24545E into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+ (RVA 0x24545E)
+[BUGCHECK]     tf+0x130=0xFFFFF80347127A00[kerneldiag] candidate address 0xFFFFF80347127A00 resolves to module base 0xFFFFF80346400000 (+0xD27A00 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+ (RVA 0xD27A00)
+[BUGCHECK]     tf+0x168=0xFFFFF80346744214[kerneldiag] candidate address 0xFFFFF80346744214 resolves to module base 0xFFFFF80346400000 (+0x344214 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+ (RVA 0x344214)
+[BUGCHECK]     tf+0x180=0xFFFFF8034C674E48[kerneldiag] candidate address 0xFFFFF8034C674E48 resolves to module base 0xFFFFF8034C3F0000 (+0x284E48 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+ (RVA 0x284E48)
+[BUGCHECK]   0x139 crashing-thread stack scan (0x400, broadened LIST_ENTRY test):
+[kerneldiag] candidate address 0xFFFFF80346743B64 resolves to module base 0xFFFFF80346400000 (+0x343B64 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFFFFFFFFFFFFF
+[kerneldiag] candidate address 0xFFFFF8034669F612 resolves to module base 0xFFFFF80346400000 (+0x29F612 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C674FB0 resolves to module base 0xFFFFF8034C3F0000 (+0x284FB0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803466382C6 resolves to module base 0xFFFFF80346400000 (+0x2382C6 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFA1FD00000000
+[kerneldiag] no PE header found scanning VA back from 0xFFFFFFFFFFFFFFFF
+[kerneldiag] candidate address 0xFFFFF803467A75D0 resolves to module base 0xFFFFF80346400000 (+0x3A75D0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF80346408160 resolves to module base 0xFFFFF80346400000 (+0x8160 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675130 resolves to module base 0xFFFFF8034C3F0000 (+0x285130 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C674FFF resolves to module base 0xFFFFF8034C3F0000 (+0x284FFF into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C6750F0 resolves to module base 0xFFFFF8034C3F0000 (+0x2850F0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C675030 resolves to module base 0xFFFFF8034C3F0000 (+0x285030 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C675197 resolves to module base 0xFFFFF8034C3F0000 (+0x285197 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C675130 resolves to module base 0xFFFFF8034C3F0000 (+0x285130 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C675070 resolves to module base 0xFFFFF8034C3F0000 (+0x285070 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803467D65B3 resolves to module base 0xFFFFF80346400000 (+0x3D65B3 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675130 resolves to module base 0xFFFFF8034C3F0000 (+0x285130 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803467D6578 resolves to module base 0xFFFFF80346400000 (+0x3D6578 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675130 resolves to module base 0xFFFFF8034C3F0000 (+0x285130 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C6750E1 resolves to module base 0xFFFFF8034C3F0000 (+0x2850E1 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF80346636CA1 resolves to module base 0xFFFFF80346400000 (+0x236CA1 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675050 resolves to module base 0xFFFFF8034C3F0000 (+0x285050 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C6751E0 resolves to module base 0xFFFFF8034C3F0000 (+0x2851E0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFA1FDD44091A4
+[kerneldiag] candidate address 0xFFFFF8034C675300 resolves to module base 0xFFFFF8034C3F0000 (+0x285300 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803467B3393 resolves to module base 0xFFFFF80346400000 (+0x3B3393 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C6750F0 resolves to module base 0xFFFFF8034C3F0000 (+0x2850F0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF8034C6751E0 resolves to module base 0xFFFFF8034C3F0000 (+0x2851E0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803467B32EE resolves to module base 0xFFFFF80346400000 (+0x3B32EE into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF803467A1FFA resolves to module base 0xFFFFF80346400000 (+0x3A1FFA into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF8030000004B
+[kerneldiag] candidate address 0xFFFFF8034C675130 resolves to module base 0xFFFFF8034C3F0000 (+0x285130 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] candidate address 0xFFFFF803467BBB6E resolves to module base 0xFFFFF80346400000 (+0x3BBB6E into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF80346408160 resolves to module base 0xFFFFF80346400000 (+0x8160 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF80346DB7074 resolves to module base 0xFFFFF80346400000 (+0x9B7074 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675270 resolves to module base 0xFFFFF8034C3F0000 (+0x285270 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFFB7B30646142
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF80300000000
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF80342EE65F0
+[kerneldiag] candidate address 0xFFFFF803467DC921 resolves to module base 0xFFFFF80346400000 (+0x3DC921 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] candidate address 0xFFFFF8034C675209 resolves to module base 0xFFFFF8034C3F0000 (+0x285209 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF80300000000
+[kerneldiag] candidate address 0xFFFFF803467B2A7B resolves to module base 0xFFFFF80346400000 (+0x3B2A7B into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF7D780001568
+[kerneldiag] no PE header found scanning VA back from 0xFFFFA1FDD4408FF4
+[kerneldiag] candidate address 0xFFFFF803467B2A7B resolves to module base 0xFFFFF80346400000 (+0x3B2A7B into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF7D780001568
+[kerneldiag] no PE header found scanning VA back from 0xFFFFF80342EE65F0
+[kerneldiag] candidate address 0xFFFFF80346408160 resolves to module base 0xFFFFF80346400000 (+0x8160 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[BUGCHECK]   0x139 recovered rbx(bucket listhead)=0x18
+[watchdog] STALL #1 (exitCount=1060164 unchanged for 2s): rip=0xFFFFF803468BE7F5 rsp=0xFFFFF8034C688D80 rax=0xFFFFF803468BE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002 cr8(irql)=0xF(HIGH_LEVEL)
+[watchdog] STALL #2 (exitCount=1060164 unchanged for 4s): rip=0xFFFFF803468BE7FB rsp=0xFFFFF8034C688D80 rax=0xFFFFF803468BE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002 cr8(irql)=0xF(HIGH_LEVEL)
+[kerneldiag] found PE header for owning module at guest VA 0xFFFFF80346400000 (rip=0xFFFFF803468BE7FB, +0x4BE7FB into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] last 512 PCI config accesses before this stall:
+  bus=240 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=240 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=241 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=242 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=243 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=244 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=245 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=246 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=247 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=248 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=249 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=250 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=251 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=252 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=253 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=254 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=0 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=1 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=2 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=3 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=4 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=5 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=6 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=7 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=8 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=9 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=10 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=11 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=12 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=13 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=14 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=15 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=16 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=17 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=18 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=19 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=20 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=21 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=22 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=23 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=24 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=25 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=26 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=27 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=28 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=29 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=30 func=0 off=0x00 write=0 val=0xFFFFFFFF
+  bus=255 dev=31 func=0 off=0x00 write=0 val=0xFFFFFFFF
+[kerneldiag] dumped 768 bytes around live RIP (starting 0xFFFFF803468BE7BB, RIP itself at offset 0x40) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\NewStallRip.bin
+[kerneldiag] spin-wait target VA=0xFFFFF803468BF85B initial value=0x8357DC058AFFE877 -- will re-poll on later stall ticks
+[kerneldiag] module PE: 33 sections, watched target RVA=0x4BF85B
+[kerneldiag] section[0] name=.rdata VA=0x1000 VSize=0xC7420 RawPtr=0x800 RawSize=0xC7600 chars=0x48000040
+[kerneldiag] section[1] name=.pdata VA=0xC9000 VSize=0x67914 RawPtr=0xC7E00 RawSize=0x67A00 chars=0x48000040
+[kerneldiag] section[2] name=.idata VA=0x131000 VSize=0x20C2 RawPtr=0x12F800 RawSize=0x2200 chars=0x48000040
+[kerneldiag] section[3] name=.edata VA=0x134000 VSize=0x18D7E RawPtr=0x131A00 RawSize=0x18E00 chars=0x40000040
+[kerneldiag] section[4] name=PROTDATA VA=0x14D000 VSize=0x1 RawPtr=0x14A800 RawSize=0x200 chars=0x48000040
+[kerneldiag] section[5] name=GFIDS VA=0x14E000 VSize=0x8C38 RawPtr=0x14AA00 RawSize=0x8E00 chars=0x42000040
+[kerneldiag] section[6] name=Pad1 VA=0x157000 VSize=0xA9000 RawPtr=0x0 RawSize=0x0 chars=0x42000080
+[kerneldiag] section[7] name=.text VA=0x200000 VSize=0x3CC289 RawPtr=0x153800 RawSize=0x3CC400 chars=0x68000020  <-- CONTAINS WATCHED TARGET
+[kerneldiag] section[8] name=PAGE VA=0x5CD000 VSize=0x3C46A6 RawPtr=0x51FC00 RawSize=0x3C4800 chars=0x60000020
+[kerneldiag] section[9] name=PAGELK VA=0x992000 VSize=0x24EC4 RawPtr=0x8E4400 RawSize=0x25000 chars=0x60000020
+[kerneldiag] section[10] name=POOLCODE VA=0x9B7000 VSize=0x48B RawPtr=0x909400 RawSize=0x600 chars=0x68000020
+[kerneldiag] section[11] name=PAGEKD VA=0x9B8000 VSize=0x5B92 RawPtr=0x909A00 RawSize=0x5C00 chars=0x60000020
+[kerneldiag] section[12] name=PAGEVRFY VA=0x9BE000 VSize=0x3210C RawPtr=0x90F600 RawSize=0x32200 chars=0x60000020
+[kerneldiag] section[13] name=PAGEHDLS VA=0x9F1000 VSize=0x25D6 RawPtr=0x941800 RawSize=0x2600 chars=0x60000020
+[kerneldiag] section[14] name=PAGEBGFX VA=0x9F4000 VSize=0x69DA RawPtr=0x943E00 RawSize=0x6A00 chars=0x60000020
+[kerneldiag] section[15] name=INITKDBG VA=0x9FB000 VSize=0x195BA RawPtr=0x94A800 RawSize=0x19600 chars=0x68000020
+[kerneldiag] section[16] name=TRACESUP VA=0xA15000 VSize=0x175B RawPtr=0x963E00 RawSize=0x1800 chars=0x68000020
+[kerneldiag] section[17] name=KVASCODE VA=0xA17000 VSize=0x23D8 RawPtr=0x965600 RawSize=0x2400 chars=0x68000020
+[kerneldiag] section[18] name=RETPOL VA=0xA1A000 VSize=0x880 RawPtr=0x967A00 RawSize=0xA00 chars=0x68000020
+[kerneldiag] section[19] name=MINIEX VA=0xA1B000 VSize=0x25AE RawPtr=0x968400 RawSize=0x2600 chars=0x62000020
+[kerneldiag] dumped 0x4000 bytes of unidentified module (base=0xFFFFF80346400000) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\NewStallModule.bin
+[kerneldiag] IRQL 0xF (HIGH_LEVEL) does not permit DPCs -- deferring memory inspection, this alone may explain the stall
+[kerneldiag] candidate return address (caller) at [rsp+0x18] = 0xFFFFF803466AE633
+[kerneldiag] candidate address 0xFFFFF803466AE633 resolves to module base 0xFFFFF80346400000 (+0x2AE633 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] dumped 0x300 bytes around return address (starting 0xFFFFF803466AE533, retaddr at offset 0x100, module base 0xFFFFF80346400000, RVA of retaddr 0x2AE633) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\CallerContext.bin
+[kerneldiag] registration object pointer at caller+0xCA9008 (VA=0xFFFFF803470A9008) = 0x0
+[kerneldiag] dumped 0x2000 bytes of caller dispatcher code (starting caller+0x36D000, VA=0xFFFFF8034676D000) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\CallerWideDump.bin
+[kerneldiag] scanning stack from rsp=0xFFFFF8034C688D80 for candidate return addresses:
+  [rsp+0x000] = 0xFFFFF8034C688E58[kerneldiag] candidate address 0xFFFFF8034C688E58 resolves to module base 0xFFFFF8034C3F0000 (+0x298E58 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x000] module base 0xFFFFF8034C3F0000 RVA 0x298E58
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C688D58, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x0.bin
+  [rsp+0x008] = 0xFFFFF803466AA11E[kerneldiag] candidate address 0xFFFFF803466AA11E resolves to module base 0xFFFFF80346400000 (+0x2AA11E into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x008] module base 0xFFFFF80346400000 RVA 0x2AA11E
+    ^ dumped 0x180 bytes (starting 0xFFFFF803466AA01E, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x8.bin
+  [rsp+0x010] = 0xFFFFF8034C689330[kerneldiag] candidate address 0xFFFFF8034C689330 resolves to module base 0xFFFFF8034C3F0000 (+0x299330 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x010] module base 0xFFFFF8034C3F0000 RVA 0x299330
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689230, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x10.bin
+  [rsp+0x018] = 0xFFFFF803466AE633[kerneldiag] candidate address 0xFFFFF803466AE633 resolves to module base 0xFFFFF80346400000 (+0x2AE633 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x018] module base 0xFFFFF80346400000 RVA 0x2AE633
+    ^ dumped 0x180 bytes (starting 0xFFFFF803466AE533, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x18.bin
+  [rsp+0x020] = 0xFFFFF8034C688EC0[kerneldiag] candidate address 0xFFFFF8034C688EC0 resolves to module base 0xFFFFF8034C3F0000 (+0x298EC0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x020] module base 0xFFFFF8034C3F0000 RVA 0x298EC0
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C688DC0, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x20.bin
+  [rsp+0x030] = 0xFFFFF80343E52180[kerneldiag] candidate address 0xFFFFF80343E52180 resolves to module base 0xFFFFF80343DD6000 (+0x7C180 into it)
+[kerneldiag] no debug directory RVA in this module's PE header
+    ^ [rsp+0x030] module base 0xFFFFF80343DD6000 RVA 0x7C180
+    ^ dumped 0x180 bytes (starting 0xFFFFF80343E52080, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x30.bin
+  [rsp+0x038] = 0xFFFFF80346917D8A[kerneldiag] candidate address 0xFFFFF80346917D8A resolves to module base 0xFFFFF80346400000 (+0x517D8A into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x038] module base 0xFFFFF80346400000 RVA 0x517D8A
+    ^ dumped 0x180 bytes (starting 0xFFFFF80346917C8A, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x38.bin
+  [rsp+0x058] = 0xFFFFF8034C689D08[kerneldiag] candidate address 0xFFFFF8034C689D08 resolves to module base 0xFFFFF8034C3F0000 (+0x299D08 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x058] module base 0xFFFFF8034C3F0000 RVA 0x299D08
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689C08, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x58.bin
+  [rsp+0x060] = 0xFFFFF8034C688E30[kerneldiag] candidate address 0xFFFFF8034C688E30 resolves to module base 0xFFFFF8034C3F0000 (+0x298E30 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x060] module base 0xFFFFF8034C3F0000 RVA 0x298E30
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C688D30, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x60.bin
+  [rsp+0x068] = 0xFFFFF8034684D05A[kerneldiag] candidate address 0xFFFFF8034684D05A resolves to module base 0xFFFFF80346400000 (+0x44D05A into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x068] module base 0xFFFFF80346400000 RVA 0x44D05A
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034684CF5A, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x68.bin
+  [rsp+0x070] = 0xFFFFF8034C689330[kerneldiag] candidate address 0xFFFFF8034C689330 resolves to module base 0xFFFFF8034C3F0000 (+0x299330 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x070] module base 0xFFFFF8034C3F0000 RVA 0x299330
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689230, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x70.bin
+  [rsp+0x080] = 0xFFFFF8034C68A020[kerneldiag] candidate address 0xFFFFF8034C68A020 resolves to module base 0xFFFFF8034C3F0000 (+0x29A020 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x080] module base 0xFFFFF8034C3F0000 RVA 0x29A020
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689F20, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x80.bin
+  [rsp+0x098] = 0xFFFFF80347127A00[kerneldiag] candidate address 0xFFFFF80347127A00 resolves to module base 0xFFFFF80346400000 (+0xD27A00 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x098] module base 0xFFFFF80346400000 RVA 0xD27A00
+    ^ dumped 0x180 bytes (starting 0xFFFFF80347127900, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x98.bin
+  [rsp+0x0D0] = 0xFFFFF80343E52180[kerneldiag] candidate address 0xFFFFF80343E52180 resolves to module base 0xFFFFF80343DD6000 (+0x7C180 into it)
+[kerneldiag] no debug directory RVA in this module's PE header
+    ^ [rsp+0x0D0] module base 0xFFFFF80343DD6000 RVA 0x7C180
+    ^ dumped 0x180 bytes (starting 0xFFFFF80343E52080, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0xD0.bin
+  [rsp+0x0F0] = 0xFFFFFFFFFFFFFFFF[kerneldiag] no PE header found scanning VA back from 0xFFFFFFFFFFFFFFFF
+
+  [rsp+0x0F8] = 0xFFFF800000000000[kerneldiag] no PE header found scanning VA back from 0xFFFF800000000000
+
+  [rsp+0x100] = 0xFFFFF803469183B0[kerneldiag] candidate address 0xFFFFF803469183B0 resolves to module base 0xFFFFF80346400000 (+0x5183B0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x100] module base 0xFFFFF80346400000 RVA 0x5183B0
+    ^ dumped 0x180 bytes (starting 0xFFFFF803469182B0, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x100.bin
+  [rsp+0x238] = 0xFFFFF80343E52300[kerneldiag] candidate address 0xFFFFF80343E52300 resolves to module base 0xFFFFF80343DD6000 (+0x7C300 into it)
+[kerneldiag] no debug directory RVA in this module's PE header
+    ^ [rsp+0x238] module base 0xFFFFF80343DD6000 RVA 0x7C300
+    ^ dumped 0x180 bytes (starting 0xFFFFF80343E52200, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x238.bin
+  [rsp+0x248] = 0xFFFFFFFF80000003[kerneldiag] no PE header found scanning VA back from 0xFFFFFFFF80000003
+
+  [rsp+0x250] = 0xFFFFF8034C689D08[kerneldiag] candidate address 0xFFFFF8034C689D08 resolves to module base 0xFFFFF8034C3F0000 (+0x299D08 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x250] module base 0xFFFFF8034C3F0000 RVA 0x299D08
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689C08, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x250.bin
+  [rsp+0x258] = 0xFFFFF8034C689508[kerneldiag] candidate address 0xFFFFF8034C689508 resolves to module base 0xFFFFF8034C3F0000 (+0x299508 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x258] module base 0xFFFFF8034C3F0000 RVA 0x299508
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689408, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x258.bin
+  [rsp+0x260] = 0xFFFFF8034C689A40[kerneldiag] candidate address 0xFFFFF8034C689A40 resolves to module base 0xFFFFF8034C3F0000 (+0x299A40 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x260] module base 0xFFFFF8034C3F0000 RVA 0x299A40
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689940, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x260.bin
+  [rsp+0x268] = 0xFFFFF8034C689540[kerneldiag] candidate address 0xFFFFF8034C689540 resolves to module base 0xFFFFF8034C3F0000 (+0x299540 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x268] module base 0xFFFFF8034C3F0000 RVA 0x299540
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689440, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x268.bin
+  [rsp+0x270] = 0xFFFFF80343E52180[kerneldiag] candidate address 0xFFFFF80343E52180 resolves to module base 0xFFFFF80343DD6000 (+0x7C180 into it)
+[kerneldiag] no debug directory RVA in this module's PE header
+    ^ [rsp+0x270] module base 0xFFFFF80343DD6000 RVA 0x7C180
+    ^ dumped 0x180 bytes (starting 0xFFFFF80343E52080, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x270.bin
+  [rsp+0x278] = 0xFFFFF80346806E40[kerneldiag] candidate address 0xFFFFF80346806E40 resolves to module base 0xFFFFF80346400000 (+0x406E40 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x278] module base 0xFFFFF80346400000 RVA 0x406E40
+    ^ dumped 0x180 bytes (starting 0xFFFFF80346806D40, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x278.bin
+  [rsp+0x288] = 0xFFFFFFFFFFFFFFFD[kerneldiag] no PE header found scanning VA back from 0xFFFFFFFFFFFFFFFD
+
+  [rsp+0x290] = 0xFFFFF80347201940[kerneldiag] candidate address 0xFFFFF80347201940 resolves to module base 0xFFFFF80346400000 (+0xE01940 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x290] module base 0xFFFFF80346400000 RVA 0xE01940
+    ^ dumped 0x180 bytes (starting 0xFFFFF80347201840, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x290.bin
+  [rsp+0x2A8] = 0xFFFFF8034C689DB0[kerneldiag] candidate address 0xFFFFF8034C689DB0 resolves to module base 0xFFFFF8034C3F0000 (+0x299DB0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x2174
+[kerneldiag] module PDB name: volume.pdb guid=AAF65608-ADE9-794A-A208A2E6534FF85E age=1
+    ^ [rsp+0x2A8] module base 0xFFFFF8034C3F0000 RVA 0x299DB0
+    ^ dumped 0x180 bytes (starting 0xFFFFF8034C689CB0, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x2A8.bin
+  [rsp+0x2B8] = 0xFFFFF803467FD6F0[kerneldiag] candidate address 0xFFFFF803467FD6F0 resolves to module base 0xFFFFF80346400000 (+0x3FD6F0 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+    ^ [rsp+0x2B8] module base 0xFFFFF80346400000 RVA 0x3FD6F0
+    ^ dumped 0x180 bytes (starting 0xFFFFF803467FD5F0, candidate at offset 0x100) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\StackCand_0x2B8.bin
+[watchdog] STALL #3 (exitCount=1060164 unchanged for 6s): rip=0xFFFFF803468BE7F5 rsp=0xFFFFF8034C688D80 rax=0xFFFFF803468BE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002 cr8(irql)=0xF(HIGH_LEVEL)
+[kerneldiag] spin-wait target value at tick 3 = 0x8357DC058AFFE877
+[kerneldiag] stack dump from rsp=0xFFFFF8034C688D80 (cr3=0x1AD002):
+  [rsp+0x00] = 0xFFFFF8034C688E58
+  [rsp+0x08] = 0xFFFFF803466AA11E
+  [rsp+0x10] = 0xFFFFF8034C689330
+  [rsp+0x18] = 0xFFFFF803466AE633
+  [rsp+0x20] = 0xFFFFF8034C688EC0
+  [rsp+0x30] = 0xFFFFF80343E52180
+  [rsp+0x38] = 0xFFFFF80346917D8A
+  [rsp+0x58] = 0xFFFFF8034C689D08
+  [rsp+0x60] = 0xFFFFF8034C688E30
+  [rsp+0x68] = 0xFFFFF8034684D05A
+  [rsp+0x70] = 0xFFFFF8034C689330
+  [rsp+0x80] = 0xFFFFF8034C68A020
+  [rsp+0x98] = 0xFFFFF80347127A00
+  [rsp+0xD0] = 0xFFFFF80343E52180
+  [rsp+0xF0] = 0xFFFFFFFFFFFFFFFF
+  [rsp+0xF8] = 0xFFFF800000000000
+  [rsp+0x100] = 0xFFFFF803469183B0
+[kerneldiag] KiBugCheckData: code=0x139 params=[0x3, 0xFFFFF8034C674CB0, 0xFFFFF8034C674C08, 0x0]
+[u40] === RIP histogram pass 2 (at bugcheck): 13627 samples, base=0xFFFFF80346400000 ===
+[u40]     9178  page 0xBEA03000
+[u40]     1649  page 0x1DD9000
+[u40]     1070  page 0xBF14E000
+[u40]      595  page 0xBFC50000
+[u40]      391  page 0xBFD68000
+[u40]      181  page 0xBE422000
+[u40]      179  page 0xBF14F000
+[u40]      166  page 0xBF16B000
+[u40]      143  page 0xBF174000
+[u40]       27  page 0xFFFFF803467A5000  = base+0x3A5000
+[u40]       14  page 0x848000
+[u40]       11  page 0xBE41C000
+[u40]        5  page 0x83D000
+[u40]        2  page 0xBFF79000
+[u40]        1  page 0xBF115000
+[u40]        1  page 0xBFE5E000
+[u40]        1  page 0xFFFFF803467A7000  = base+0x3A7000
+[u40]        1  page 0xBEA2F000
+[u40]   most recent 256 samples (newest last):
+[u40]     1DD9EDB@1057611 1DD9EDB@1057621 1DD9EDB@1057631 1DD9EDB@1057641 1DD9EDB@1057651 1DD9EDB@1057661 1DD9EDB@1057671 1DD9EDB@1057681 1DD9EDB@1057691 1DD9EDB@1057701 1DD9EDB@1057711 1DD9EDB@1057721 1DD9EDB@1057731 1DD9EDB@1057741 1DD9EDB@1057751 1DD9EDB@1057761 1DD9EDB@1057771 1DD9EDB@1057781 1DD9EDB@1057791 1DD9EDB@1057801 1DD9EDB@1057811 1DD9EDB@1057821 1DD9EDB@1057831 1DD9EDB@1057841 1DD9EDB@1057851 1DD9EDB@1057861 1DD9EDB@1057871 1DD9EDB@1057881 1DD9EDB@1057891 1DD9EDB@1057901 1DD9EDB@1057911 1DD9EDB@1057921 1DD9EDB@1057931 1DD9EDB@1057941 1DD9EDB@1057951 1DD9EDB@1057961 1DD9EDB@1057971 1DD9EDB@1057981 1DD9EDB@1057991 1DD9EDB@1058001 1DD9EDB@1058011 1DD9EDB@1058021 1DD9EDB@1058031 1DD9EDB@1058041 1DD9EDB@1058051 1DD9EDB@1058061 1DD9EDB@1058071 1DD9EDB@1058081 1DD9EDB@1058091 1DD9EDB@1058101 1DD9EDB@1058111 1DD9EDB@1058121 1DD9EDB@1058131 1DD9EDB@1058141 1DD9EDB@1058151 1DD9EDB@1058161 1DD9EDB@1058171 1DD9EDB@1058181 1DD9EDB@1058191 1DD9EDB@1058201 1DD9EDB@1058211 1DD9EDB@1058221 1DD9EDB@1058231 1DD9EDB@1058241 1DD9EDB@1058251 1DD9EDB@1058261 1DD9EDB@1058271 1DD9EDB@1058281 1DD9EDB@1058291 1DD9EDB@1058301 1DD9EDB@1058311 1DD9EDB@1058321 1DD9EDB@1058331 1DD9EDB@1058341 1DD9EDB@1058351 1DD9EDB@1058361 1DD9EDB@1058371 1DD9EDB@1058381 1DD9EDB@1058391 1DD9EDB@1058401 1DD9EDB@1058411 1DD9EDB@1058421 1DD9EDB@1058431 1DD9EDB@1058441 1DD9EDB@1058451 1DD9EDB@1058461 1DD9EDB@1058471 1DD9EDB@1058481 1DD9EDB@1058491 1DD9EDB@1058501 1DD9EDB@1058511 1DD9EDB@1058521 1DD9EDB@1058531 1DD9EDB@1058541 1DD9EDB@1058551 1DD9EDB@1058561 1DD9EDB@1058571 1DD9EDB@1058581 1DD9EDB@1058591 1DD9EDB@1058601 1DD9EDB@1058611 1DD9EDB@1058621 1DD9EDB@1058631 1DD9EDB@1058641 1DD9EDB@1058651 1DD9EDB@1058661 1DD9EDB@1058671 1DD9EDB@1058681 1DD9EDB@1058691 1DD9EDB@1058701 1DD9EDB@1058711 1DD9EDB@1058721 1DD9EDB@1058731 1DD9EDB@1058741 1DD9EDB@1058751 1DD9EDB@1058761 1DD9EDB@1058771 1DD9EDB@1058781 1DD9EDB@1058791 1DD9EDB@1058801 1DD9EDB@1058811 1DD9EDB@1058821 1DD9EDB@1058831 1DD9EDB@1058841 1DD9EDB@1058851 1DD9EDB@1058861 1DD9EDB@1058871 1DD9EDB@1058881 1DD9EDB@1058891 1DD9EDB@1058901 1DD9EDB@1058911 1DD9EDB@1058921 1DD9EDB@1058931 1DD9EDB@1058941 1DD9EDB@1058951 1DD9EDB@1058961 1DD9EDB@1058971 1DD9EDB@1058981 1DD9EDB@1058991 1DD9EDB@1059001 1DD9EDB@1059011 1DD9EDB@1059021 1DD9EDB@1059031 1DD9EDB@1059041 1DD9EDB@1059051 1DD9EDB@1059061 1DD9EDB@1059071 1DD9EDB@1059081 1DD9EDB@1059091 1DD9EDB@1059101 1DD9EDB@1059111 1DD9EDB@1059121 1DD9EDB@1059131 1DD9EDB@1059141 1DD9EDB@1059151 1DD9EDB@1059161 1DD9EDB@1059171 1DD9EDB@1059181 1DD9EDB@1059191 1DD9EDB@1059201 1DD9EDB@1059211 1DD9EDB@1059221 1DD9EDB@1059231 1DD9EDB@1059241 1DD9EDB@1059251 1DD9EDB@1059261 1DD9EDB@1059271 1DD9EDB@1059281 1DD9EDB@1059291 1DD9EDB@1059301 1DD9EDB@1059311 1DD9EDB@1059321 1DD9EDB@1059331 1DD9EDB@1059341 1DD9EDB@1059351 1DD9EDB@1059361 1DD9EDB@1059371 1DD9EDB@1059381 1DD9EDB@1059391 1DD9EDB@1059401 1DD9EDB@1059411 1DD9EDB@1059421 1DD9EDB@1059431 1DD9EDB@1059441 1DD9EDB@1059451 1DD9EDB@1059461 1DD9EDB@1059471 1DD9EDB@1059481 1DD9EDB@1059491 1DD9EDB@1059501 1DD9EDB@1059511 1DD9EDB@1059521 1DD9EDB@1059531 1DD9EDB@1059541 1DD9EDB@1059551 1DD9EDB@1059561 1DD9EDB@1059571 1DD9EDB@1059581 1DD9EDB@1059591 1DD9EDB@1059601 1DD9EDB@1059611 1DD9EDB@1059621 1DD9EDB@1059631 1DD9EDB@1059641 1DD9EDB@1059651 1DD9EDB@1059661 1DD9EDB@1059671 1DD9EDB@1059681 1DD9EDB@1059691 1DD9EDB@1059701 1DD9EDB@1059711 1DD9EDB@1059721 1DD9EDB@1059731 1DD9EDB@1059741 1DD9EDB@1059751 1DD9EDB@1059761 1DD9EDB@1059771 1DD9EDB@1059781 1DD9EDB@1059791 1DD9EDB@1059801 1DD9EDB@1059811 1DD9EDB@1059821 1DD9EDB@1059831 1DD9EDB@1059841 1DD9EDB@1059851 1DD9EDB@1059861 1DD9EDB@1059871 1DD9EDB@1059881 FFFFF803467A57DD@1059891 FFFFF803467A5846@1059901 FFFFF803467A5883@1059911 FFFFF803467A5883@1059921 FFFFF803467A5883@1059931 FFFFF803467A5883@1059941 FFFFF803467A5883@1059951 FFFFF803467A5883@1059961 FFFFF803467A5883@1059971 FFFFF803467A5883@1059981 FFFFF803467A5883@1059991 FFFFF803467A5883@1060001 FFFFF803467A5883@1060011 FFFFF803467A5883@1060021 FFFFF803467A583B@1060031 FFFFF803467A5881@1060041 FFFFF803467A5881@1060051 FFFFF803467A5881@1060061 FFFFF803467A5881@1060071 FFFFF803467A5881@1060081 FFFFF803467A5881@1060091 FFFFF803467A5881@1060101 FFFFF803467A5881@1060111 FFFFF803467A5881@1060121 FFFFF803467A5881@1060131 FFFFF803467A5881@1060141 FFFFF803467A5881@1060151 FFFFF803467A7612@1060161
+[kerneldiag] EXCEPTION_RECORD @0xFFFFF8034C674C08: code=0xC0000409 address=0xFFFFF80346744214 numParams=1 info[0]=0x3 info[1]=0x0
+[kerneldiag] candidate address 0xFFFFF80346744214 resolves to module base 0xFFFFF80346400000 (+0x344214 into it)
+[kerneldiag] debug directory: type=2 codeViewRva=0x40970
+[kerneldiag] module PDB name: ntkrnlmp.pdb guid=D9424FC4-861E-47C1-0FAD1B35DEC6DCC8 age=1
+[kerneldiag] fast-fail site: module base 0xFFFFF80346400000, RVA 0x344214  <-- inside ntoskrnl.exe (real symbol resolvable offline)
+[kerneldiag] dumped 0x200 bytes around fail site (starting RVA 0x344114, module base 0xFFFFF80346400000) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\FailSite.bin
+[kerneldiag] trap frame @0xFFFFF8034C674CB0, ALL qwords:
+  +0x000 = 0x0000000000000000
+  +0x008 = 0x0000000000000000
+  +0x010 = 0x0000000000000000
+  +0x018 = 0x0000000000000000
+  +0x020 = 0x0000000000000000
+  +0x028 = 0x00001F8001000000
+  +0x030 = 0x0000000000000000
+  +0x038 = 0x0000000000000003
+  +0x040 = 0x0000000000000000
+  +0x048 = 0x0000000000000000
+  +0x050 = 0x0000000000000008
+  +0x058 = 0x0000000000000000
+  +0x060 = 0x0000000000000000
+  +0x068 = 0x0000000000000000
+  +0x070 = 0x0000000000000000
+  +0x078 = 0x0000000000000000
+  +0x080 = 0x0000000000000000
+  +0x088 = 0x0000000000000000
+  +0x090 = 0x0056004500440042
+  +0x098 = 0x003000300030005F
+  +0x0A0 = 0x0045005200260031
+  +0x0A8 = 0x00300030005F0056
+  +0x0B0 = 0x0055002600310030
+  +0x0B8 = 0x0030005F00440049
+  +0x0C0 = 0x0000000000000001
+  +0x0C8 = 0x0000000000000000
+  +0x0D0 = 0x0000000000000000
+  +0x0D8 = 0x0000000000000000
+  +0x0E0 = 0x0000000000000000
+  +0x0E8 = 0x0000000000000000
+  +0x0F0 = 0x0000000000000000
+  +0x0F8 = 0x0000000000000000
+  +0x100 = 0x0000000000000000
+  +0x108 = 0x0000000000000000
+  +0x110 = 0x0000000000000000
+  +0x118 = 0x0000000000000000
+  +0x120 = 0xFFFFF80347128050  <-- canonical kernel pointer
+      -> memory there: +0x00=0x0000000000000000 +0x08=0x0000000000000000
+  +0x128 = 0xFFFFF8034664545E  <-- canonical kernel pointer
+      -> memory there: +0x00=0x01000001E6838366 +0x08=0x000098C381481075
+  +0x130 = 0xFFFFF80347127A00  <-- canonical kernel pointer
+      -> memory there: +0x00=0x0000000000200006 +0x08=0xFFFFF80347127A08
+  +0x138 = 0x0000000000000010
+  +0x140 = 0x0000000000000000
+  +0x148 = 0x0000000000000000
+  +0x150 = 0x0000000000000000
+  +0x158 = 0x0000000000000000
+  +0x160 = 0x0000000000000000
+  +0x168 = 0xFFFFF80346744214  <-- canonical kernel pointer
+      -> memory there: +0x00=0xCCCCCCCCCCCC29CD +0x08=0x6C894808245C8948
+  +0x170 = 0x0000000000000010
+  +0x178 = 0x0000000000000286
+  +0x180 = 0xFFFFF8034C674E48  <-- canonical kernel pointer
+      -> memory there: +0x00=0xFFFFF80346743B64 +0x08=0x0000000000000018
+  +0x188 = 0x0000000000000000
+  +0x190 = 0x0000000000000000
+  +0x198 = 0xFFFFF80346743B64  <-- canonical kernel pointer
+      -> memory there: +0x00=0x481874ED85F88B4C +0x08=0x8BFFEEFA0DE8CE8B
+  +0x1A0 = 0x0000000000000018
+  +0x1A8 = 0x0000000000000000
+  +0x1B0 = 0xFFFFFFFFFFFFFFFF  <-- canonical kernel pointer
+  +0x1B8 = 0x0000000000000001
+  +0x1C0 = 0x0000000000000000
+  +0x1C8 = 0xFFFFF8034669F612  <-- canonical kernel pointer
+      -> memory there: +0x00=0xCCCCCCCCDFEBFFB0 +0x08=0x8944CCCCCCCCCCCC
+  +0x1D0 = 0x0000000000000000
+  +0x1D8 = 0x0000000000000010
+  +0x1E0 = 0x0000000000000001
+  +0x1E8 = 0x0000000000000000
+  +0x1F0 = 0xFFFFF8034C674FB0  <-- canonical kernel pointer
+      -> memory there: +0x00=0xFFFFF8034C675130 +0x08=0x0000000000000B80
+  +0x1F8 = 0xFFFFF803466382C6  <-- canonical kernel pointer
+      -> memory there: +0x00=0x1C75C08548F88B48 +0x08=0x48CD8B4970458B44
+[kerneldiag] memory at param2 (0xFFFFF8034C674CB0):
+  +0x00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x10: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x20: 00 00 00 00 00 00 00 00 00 00 00 01 80 1F 00 00  ................
+  +0x30: 00 00 00 00 00 00 00 00 03 00 00 00 00 00 00 00  ................
+  +0x40: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x50: 08 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x60: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x70: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x90: 42 00 44 00 45 00 56 00 5F 00 30 00 30 00 30 00  B.D.E.V._.0.0.0.
+  +0xA0: 31 00 26 00 52 00 45 00 56 00 5F 00 30 00 30 00  1.&.R.E.V._.0.0.
+  +0xB0: 30 00 31 00 26 00 55 00 49 00 44 00 5F 00 30 00  0.1.&.U.I.D._.0.
+  +0xC0: 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xD0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xE0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0xF0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x100: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  +0x110: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+[kerneldiag] descriptor+0xB8 = 0x49 -- bit2 (HalpTimerInitialize succeeded) is clear
+[kerneldiag] descriptor+0x120 (remap-info pointer) = 0x1D2B85000004D
+[kerneldiag] failed to read remap-info at 0x1D2B85000004D
+[kerneldiag] HalpWatchdogTimer = 0x0
+[kerneldiag] HalpTimerLastProblem=0x19 setter scan complete: 0 hit(s)
+[kerneldiag] dumped HalpInterruptSetLineState_ColdPath (1280 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineState_ColdPath.bin
+[kerneldiag] dumped HalpInterruptSetLineStateInternal (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineStateInternal.bin
+[kerneldiag] dumped HalpInterruptLookupController (768 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptLookupController.bin
+[kerneldiag] dumped HalpApicSetLineState_ColdPath (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpApicSetLineState_ColdPath.bin
+[kerneldiag] dumped HalpInterruptSetLineStateInternal_ColdPath (256 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpInterruptSetLineStateInternal_ColdPath.bin
+[kerneldiag] dumped HalpTimerInitializeClock_HotPath (1024 bytes) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\HalpTimerInitializeClock_HotPath.bin
+[kerneldiag] HalpInterruptControllerList head @0xFFFFF8034704B910: Flink=0xFFFFF7D780001340 Blink=0xFFFFF7D780001930 -- MORE THAN ONE controller registered, walking all entries
+[kerneldiag] controller[0] @0xFFFFF7D780001340: +0xE8(id)=0x1 +0xDC(flags)=0xFF +0x10(self)=0xFFFFF7D7800014A0 +0x70(callback)=0xFFFFF8034677D580
+[kerneldiag] controller[0] +0x100 (routing-candidate list) @0xFFFFF7D780001440: Flink=0xFFFFF7D780007540 Blink=0xFFFFF7D780007540 -- has entries
+[kerneldiag] controller[0] candidate[0] @0xFFFFF7D780007540: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x7
+[kerneldiag] controller[0] callback RVA = 0x37D580 (in-module)
+[kerneldiag] dumped controller[0] callback (1024 bytes from live pointer 0xFFFFF8034677D580) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\InterruptControllerCallback_0.bin
+[kerneldiag] controller[1] @0xFFFFF7D780001568: +0xE8(id)=0x2 +0xDC(flags)=0xFF +0x10(self)=0xFFFFF7D7800016C8 +0x70(callback)=0xFFFFF8034677D580
+[kerneldiag] controller[1] +0x100 (routing-candidate list) @0xFFFFF7D780001668: Flink=0xFFFFF7D78000A2A8 Blink=0xFFFFF7D78000A2A8 -- has entries
+[kerneldiag] controller[1] candidate[0] @0xFFFFF7D78000A2A8: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x7
+[kerneldiag] controller[1] callback RVA = 0x37D580 (in-module)
+[kerneldiag] controller[1] callback matches an already-dumped one, skipping
+[kerneldiag] controller[2] @0xFFFFF7D780001760: +0xE8(id)=0xB000 +0xDC(flags)=0x0 +0x10(self)=0xFFFFF7D7800018C0 +0x70(callback)=0xFFFFF803468DD370
+[kerneldiag] controller[2] +0x100 (routing-candidate list) @0xFFFFF7D780001860: Flink=0xFFFFF7D780001B00 Blink=0xFFFFF7D780001B00 -- has entries
+[kerneldiag] controller[2] candidate[0] @0xFFFFF7D780001B00: +0x10(dest)=0xFFFFFFFF +0x14(prioLo)=0x1 +0x18(prioHi)=0x2
+[kerneldiag] controller[2] callback RVA = 0x4DD370 (in-module)
+[kerneldiag] dumped controller[2] callback (1024 bytes from live pointer 0xFFFFF803468DD370) to C:\Users\DELL\AppData\Local\Temp\claude\c--Users-DELL-OneDrive-Desktop-LocalHost-py\5bed7398-339c-497a-9383-821cf9d2769e\scratchpad\InterruptControllerCallback_2.bin
+[kerneldiag] controller[3] @0xFFFFF7D780001930: +0xE8(id)=0xB001 +0xDC(flags)=0x0 +0x10(self)=0xFFFFF7D780001A90 +0x70(callback)=0xFFFFF803468DD370
+[kerneldiag] controller[3] +0x100 (routing-candidate list) @0xFFFFF7D780001A30: Flink=0xFFFFF7D780001E38 Blink=0xFFFFF7D780001E38 -- has entries
+[kerneldiag] controller[3] candidate[0] @0xFFFFF7D780001E38: +0x10(dest)=0xB000 +0x14(prioLo)=0x2 +0x18(prioHi)=0x3
+[kerneldiag] controller[3] callback RVA = 0x4DD370 (in-module)
+[kerneldiag] controller[3] callback matches an already-dumped one, skipping
+[watchdog] STALL #4 (exitCount=1060164 unchanged for 8s): rip=0xFFFFF803468BE7E2 rsp=0xFFFFF8034C688D80 rax=0xFFFFF803468BE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002 cr8(irql)=0xF(HIGH_LEVEL)
+[kerneldiag] spin-wait target value at tick 4 = 0x8357DC058AFFE877
+[watchdog] STALL #5 (exitCount=1060164 unchanged for 10s): rip=0xFFFFF803468BE7DC rsp=0xFFFFF8034C688D80 rax=0xFFFFF803468BE7D0 rcx=0xF rdx=0xF rbx=0x0 cr3=0x1AD002 cr8(irql)=0xF(HIGH_LEVEL)
+[kerneldiag] spin-wait target value at tick 5 = 0x8357DC058AFFE877
