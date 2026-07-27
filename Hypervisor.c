@@ -326,8 +326,58 @@ LARGE_INTEGER lastToggleTime;
 //                       reaches its +0x57A call, pushing the question into the
 //                       pre-discovery region that needs a different technique
 //                       (e.g. a data poll like U33, not a breakpoint).
-#define WP_RETURN_RVA 0xA56F60          /* MmInitSystem entry (U37) */
-#define U34_SITE_NAME "MmInitSystem"    /* label for the DR0 one-shot logging */
+// U38 (2026-07-28): bisecting inside InitBootProcessor. tools/findcalls.py
+// recovered its ordered direct-call map from the kernel dump (file offset == RVA,
+// since the dump is a memory image read from the module base):
+//     +0x312 -> HalInitSystem
+//     +0x348 -> CmInitSystem0
+//     +0x370 -> KeInitSystem
+//     +0x543 -> ExInitSystem
+//     +0x575 -> MmInitSystem        <-- U37 proved this never runs on pass 2
+//     +0x5C8 -> ExAllocatePoolWithTag  (first pool use, AFTER MM init)
+// The +0x575 call site independently confirms U37's captured return address
+// 0xA3D5CE (= +0x575 plus the 5-byte call), so the map is trustworthy.
+//
+// U18-U20 saw HAL-init activity on pass 2, which suggests InitBootProcessor runs
+// there and truncates somewhere in (+0x312, +0x575). That is still only an
+// inference, so probe it directly.
+//
+// CmInitSystem0 chosen because findcalls.py shows it has EXACTLY ONE caller in
+// the whole image (InitBootProcessor+0x348) -- unlike HalInitSystem/KeInitSystem/
+// ExInitSystem, which are also called from Phase1InitializationDiscard and would
+// need the stack walk to disambiguate. It also sits immediately after
+// HalInitSystem returns, so it cleanly answers "did InitBootProcessor get past
+// HAL init on pass 2?":
+//   fires on pass 2  -> yes; truncation is in (+0x348, +0x575)
+//   silent on pass 2 -> truncation is in (+0x312, +0x348), i.e. inside or right
+//                       after HAL init -- which would put the divergence in the
+//                       very HAL code U20 had dismissed as normal.
+// As always the pass-1 hit is the control; no pass-1 hit means no conclusion.
+// U38 RESULT: CmInitSystem0 fired on pass 1 at 133803 (caller 0xA3D3A1 =
+// InitBootProcessor+0x34D, exactly the +0x348 call's return address) and NEVER on
+// pass 2. So the truncation window collapses to (+0x312, +0x348): pass 2 does not
+// get past HalInitSystem, i.e. HalInitSystem never returns there.
+//
+// U39: confirm that InitBootProcessor actually REACHES HalInitSystem on pass 2,
+// which until now was only inferred from U15-U20 seeing HAL helper activity. That
+// inference is weak because findcalls.py shows HalpInitSystemHelper has seven
+// callers, so helper traffic does not imply HalInitSystem specifically.
+//
+// HalpInitSystemPhase0 is the right probe: exactly ONE caller in the image
+// (HalInitSystem+0x2D). HalInitSystem is just a phase dispatcher --
+//     +0x19 -> HalpInitSystemPhase1  (also called from KiInitializeKernel+0x5C9)
+//     +0x25 -> _security_init_cookie
+//     +0x2D -> HalpInitSystemPhase0  (unique)
+// so a hit here proves HalInitSystem ran, and combined with U38 proves it never
+// returned -- localizing the divergence INSIDE HAL phase-0 init. That would
+// vindicate U18/U19's "advancing but non-terminating loop" and overturn U20's
+// dismissal of that loop as normal activity.
+//
+// Control risk: this is called at InitBootProcessor+0x312, earlier than any site
+// probed so far, and may land before module discovery on pass 1. If pass 1 stays
+// silent this run is discarded like U36, not interpreted.
+#define WP_RETURN_RVA 0xA773D8                 /* HalpInitSystemPhase0 entry (U39) */
+#define U34_SITE_NAME "HalpInitSystemPhase0"   /* label for the DR0 one-shot logging */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
