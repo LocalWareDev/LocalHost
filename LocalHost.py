@@ -2,7 +2,7 @@
 LocalHost Workstation - Main GUI Skeleton
 VMware Workstation-style layout:
 - Left: Library tree (Home + My Computer > VM list), with a search box
-- Home page: 3 big buttons (Get Started, Create a New Virtual Machine, Connect to Server)
+- Home page: 3 big buttons (Get Started, Create a New Virtual Machine, Connect to VPS)
 - VM page: header + Power on/Edit links + Devices list + Preview pane
 - No Description box, no Virtual Machine Details box
 - Menu bar: File, Edit, View, VM, Manage Snapshots, Help
@@ -1222,15 +1222,15 @@ class SnapshotManagerDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Connect to Server Dialog
+# Connect to VPS Dialog
 # ---------------------------------------------------------------------------
-class ConnectToServerDialog(QDialog):
-    """Prompts for a remote LocalHost server's address, password, and
-    product key before establishing a connection."""
+class ConnectToVPSDialog(QDialog):
+    """Prompts for the VPS ID and the VPS account password before
+    establishing a connection. Both are required."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Connect to Server")
+        self.setWindowTitle("Connect to VPS")
         self.setMinimumWidth(420)
         self.result_data = None  # populated on accept
 
@@ -1239,18 +1239,14 @@ class ConnectToServerDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(10)
 
-        self.address_edit = QLineEdit()
-        self.address_edit.setPlaceholderText("e.g. 192.168.1.10 or myserver.local")
-        form.addRow("Server Address:", self.address_edit)
+        self.vps_id_edit = QLineEdit()
+        self.vps_id_edit.setPlaceholderText("e.g. vps-8f3a21c7")
+        form.addRow("VPS ID:", self.vps_id_edit)
 
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setPlaceholderText("Password")
-        form.addRow("Password:", self.password_edit)
-
-        self.product_key_edit = QLineEdit()
-        self.product_key_edit.setPlaceholderText("XXXXX-XXXXX-XXXXX-XXXXX")
-        form.addRow("Product Key:", self.product_key_edit)
+        self.password_edit.setPlaceholderText("VPS account password")
+        form.addRow("VPS Account Password:", self.password_edit)
 
         layout.addLayout(form)
 
@@ -1262,25 +1258,44 @@ class ConnectToServerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _flag_field(self, field, message):
+        """Mark a required field as missing. Also used with clear=True to undo
+        the marking, since the previous version left the red border and the
+        'is required!' placeholder stuck on screen even after the user fixed
+        the field and retried."""
+        field.setStyleSheet("border: 1px solid #e05555;")
+        field.setPlaceholderText(message)
+
+    def _clear_flag(self, field, placeholder):
+        field.setStyleSheet("")
+        field.setPlaceholderText(placeholder)
+
     def on_accept(self):
-        address = self.address_edit.text().strip()
+        vps_id = self.vps_id_edit.text().strip()
         password = self.password_edit.text()
-        product_key = self.product_key_edit.text().strip()
 
-        if not address:
-            self.address_edit.setStyleSheet("border: 1px solid #e05555;")
-            self.address_edit.setPlaceholderText("Server address is required!")
-            return
+        # Reset any previous error styling first, so fields that have since
+        # been filled in stop looking like errors.
+        self._clear_flag(self.vps_id_edit, "e.g. vps-8f3a21c7")
+        self._clear_flag(self.password_edit, "VPS account password")
 
-        if not product_key:
-            self.product_key_edit.setStyleSheet("border: 1px solid #e05555;")
-            self.product_key_edit.setPlaceholderText("Product key is required!")
+        # Validate both fields before returning, so the user sees every
+        # missing field at once rather than one per attempt.
+        missing = []
+        if not vps_id:
+            self._flag_field(self.vps_id_edit, "VPS ID is required!")
+            missing.append(self.vps_id_edit)
+        if not password:
+            self._flag_field(self.password_edit, "VPS account password is required!")
+            missing.append(self.password_edit)
+
+        if missing:
+            missing[0].setFocus()
             return
 
         self.result_data = {
-            "address": address,
+            "vps_id": vps_id,
             "password": password,
-            "product_key": product_key,
         }
         self.accept()
 
@@ -1636,7 +1651,7 @@ class LocalHostWindow(QMainWindow):
 
         self.get_started_btn.clicked.connect(self.on_get_started)
         self.create_vm_btn.clicked.connect(self.on_create_vm)
-        self.connect_server_btn.clicked.connect(self.on_connect_server)
+        self.connect_server_btn.clicked.connect(self.on_connect_vps)
 
         buttons_row.addWidget(self.get_started_btn)
         buttons_row.addWidget(self.create_vm_btn)
@@ -2091,7 +2106,7 @@ class LocalHostWindow(QMainWindow):
             # Right-clicked empty space, "Home", or "My Computer"
             new_vm_action = menu.addAction("New Virtual Machine...")
             new_folder_action = menu.addAction("New Folder...")
-            connect_action = menu.addAction("Connect to Server...")
+            connect_action = menu.addAction("Connect to VPS...")
 
             chosen = menu.exec(self.vm_tree.viewport().mapToGlobal(pos))
             if chosen == new_vm_action:
@@ -2099,7 +2114,7 @@ class LocalHostWindow(QMainWindow):
             elif chosen == new_folder_action:
                 self.on_new_folder()
             elif chosen == connect_action:
-                self.on_connect_server()
+                self.on_connect_vps()
 
     # ------------------------------------------------------------------
     # Folder / multi-select behavior
@@ -2801,15 +2816,16 @@ class LocalHostWindow(QMainWindow):
             self.statusBar().showMessage(f"Created VM: {new_vm.name}", 3000)
             self.save_library()
 
-    def on_connect_server(self):
-        dialog = ConnectToServerDialog(self)
+    def on_connect_vps(self):
+        dialog = ConnectToVPSDialog(self)
         if dialog.exec() == QDialog.Accepted and dialog.result_data:
             data = dialog.result_data
             self.statusBar().showMessage(
-                f"Connecting to {data['address']}...", 3000
+                f"Connecting to VPS {data['vps_id']}...", 3000
             )
-            # TODO: authenticate against your remote LocalHost server here,
-            # e.g. self.backend.connect(data['address'], data['password'], data['product_key'])
+            # TODO: authenticate against the VPS here, e.g.
+            # self.backend.connect_vps(data['vps_id'], data['password'])
+            # Note: data['password'] is deliberately not logged or shown.
 
     # ------------------------------------------------------------------
     # Styling
