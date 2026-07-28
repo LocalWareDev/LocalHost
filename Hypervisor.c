@@ -408,8 +408,17 @@ LARGE_INTEGER lastToggleTime;
 // reliable "one guaranteed frame per breakpoint" method (as U17/U29 used), not a
 // heuristic scan of a deep frame. The deeper walk is still printed but must be
 // treated as context only.
-#define WP_RETURN_RVA 0x9B7010                 /* ExAllocatePoolWithTag entry (U45) */
-#define U34_SITE_NAME "ExAllocatePoolWithTag"  /* label for the DR0 one-shot logging */
+// U46b (2026-07-28): decisive timing test. One-shot KiSwInterruptDispatch on BOTH
+// passes, logging exitCount vs discovery and whether pool exists yet (ExPoolState
+// pooldesc+0x10 populated). Separates the two live explanations:
+//   - the software interrupt fires pass-2-specifically early (pass 1 doesn't take
+//     it at that point), vs
+//   - it's normal early-boot code that runs before pool init in both passes, and
+//     pass 1 only survives because its pool init is reached while pass 2's isn't.
+// If pass 1 hits this with pooldesc+0x10 already populated, it is the latter; if
+// pass 1 never hits it (or hits it with pool absent yet survives), it is the former.
+#define WP_RETURN_RVA 0x3DC890                 /* KiSwInterruptDispatch entry (U46b) */
+#define U34_SITE_NAME "KiSwInterruptDispatch"  /* label for the DR0 one-shot logging */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
@@ -7591,6 +7600,21 @@ int main(int argc, char *argv[]) {
                                     if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, iCr3, q0, &cb0))
                                         printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb0, (unsigned long long)(q0 - cb0));
                                     printf("\n");
+                                }
+                            }
+                            // U46b: does pool exist yet at this hit? Read ExPoolState
+                            // pooldesc[0] +0x08/+0x10 (RVA 0xC57EC0). +0x10 populated
+                            // means pool-heap init has run and an allocation here would
+                            // succeed; NULL means it would fault as on pass 2.
+                            if (g_bpModuleBase) {
+                                unsigned char pd[0x18] = { 0 };
+                                UINT64 pdVA = g_bpModuleBase + 0xC57EC0ULL;
+                                if (kernelReadVA((unsigned char *)guestMemory, iCr3, pdVA, pd, sizeof(pd))) {
+                                    UINT64 f08 = *(UINT64 *)&pd[0x08], f10 = *(UINT64 *)&pd[0x10];
+                                    printf("[u46b]   pool state at hit: pooldesc+0x08=0x%llX +0x10=0x%llX -> pool %s\n",
+                                           (unsigned long long)f08, (unsigned long long)f10,
+                                           (f10 != 0) ? "EXISTS (alloc would succeed)" : "ABSENT (alloc would fault -- pass-2 crash condition)");
+                                    fflush(stdout);
                                 }
                             }
                             // 0x100 for U44: the allocating subsystem can sit many

@@ -370,6 +370,33 @@ that instant. Not pursued; the reset snapshot is the informative one.)
    measured with the U40/U42/U45/U46 instruments — well-motivated as "make the warm
    reset clear the interrupt controller the way real hardware does," independent of
    whether it fixes the 0x139.
+
+## U46b result: the software interrupt is pass-2-specific, and fires with pool absent
+
+One-shot `KiSwInterruptDispatch` (0x3DC890) on both passes:
+- **Pass 1: never hit.** No `pass=1` entry across the whole ~1M-exit window from
+  pass-1 discovery to the reset. `KiSwInterruptDispatch` does not execute on pass 1
+  in the observed window — so this is *not* normal early-boot code both passes run.
+- **Pass 2: hit at reset+165744, pool absent.** `pooldesc+0x10 = 0` at the hit, i.e.
+  the allocation this handler is about to make cannot succeed — the exact crash
+  condition. Guaranteed caller `KiSwInterrupt+0x362` (return after the `+0x35D`
+  call), consistent with U45.
+
+So pass 2 takes a software interrupt that pass 1 does not. Combined with U46: pass 2
+inherited an LVT timer programmed to **vector 0xFD, periodic** from pass 1, and a
+warm, software-enabled LAPIC. The leading mechanism is that this inherited APIC
+timer (or the warm LAPIC generally) drives an early interrupt into `KiSwInterrupt`
+on pass 2, whose handler allocates `NonPagedPool` before pool init has run.
+
+### Next
+
+- **U47 (fix test):** clear the LAPIC to cold-boot state in the port-0x64/0xFE
+  handler (read-modify-write via `WHvSetVirtualProcessorInterruptControllerState`:
+  TPR=0, SVR disabled/0xFF, all LVTs masked, timer counts and ISR/IRR/TMR zeroed).
+  Measure whether pass 2 gets past the `KiSwInterrupt` allocation and reaches
+  `MmInitSystem`/pool init. This is the direct test of the dirty-LAPIC hypothesis.
+- Diagnostic follow-up if needed: read the guest IDT to confirm which vector maps to
+  `KiSwInterrupt` (expected 0xFD, matching the inherited LVT timer).
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step
