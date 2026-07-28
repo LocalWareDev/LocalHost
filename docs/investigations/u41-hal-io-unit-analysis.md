@@ -435,10 +435,65 @@ caller walk, and U46/U46b's LAPIC snapshot walked it back up to the cause.
 - The fix is minimal (`u47ResetLapic` + one call). The heavy diagnostics
   (U33/U40/U42/U43/U46 logging, the DR0 one-shot) should be gated behind a debug
   flag for a clean build.
-- Confirm the install proceeds through its later reboots (pass 3+); `u47ResetLapic`
-  runs at every reset, so each pass gets a clean LAPIC.
 - Consider whether the reset should also fully cold-reset the LAPIC (disable via SVR)
   rather than only quiesce; the quiesce is sufficient for the 0x139 and lower-risk.
+
+## U48: fix is durable across 41 boots, but Setup still cannot install
+
+Long run (~9 minutes, 32M exits) to see how far Setup gets with the U47 fix in.
+
+**The U47 fix holds, durably:**
+
+| | |
+|---|---|
+| kernel boots (discovery) | 41 |
+| `0x139` bugchecks | **0** |
+| pool INIT edges (`MmInitSystem` ran) | 40 — every post-reset boot |
+
+Pool init running on *every* boot is the strongest confirmation yet: it never
+happened once across U32-U46b.
+
+**But the guest is in a clean reboot loop and installs nothing.** Every boot is the
+same cycle:
+
+```
+reset -> pool init (+~150k exits) -> bugcheck 0xA5 (+~213k) -> ~750k exits -> reset
+```
+
+- **40/40 boots bugcheck `0xA5` (ACPI_BIOS_ERROR, p1=0x11).**
+- **Zero AHCI write commands** across the whole run — the guest has never written a
+  sector, so nothing has ever been installed.
+
+### Correction to U21
+
+U21 recorded the pass-1 `0xA5` as benign, reasoning that Setup "keeps running" for
+~876k exits afterwards. This run shows those following exits are the
+bugcheck/restart sequence, not Setup working: the reset always follows the `0xA5` at
+a consistent ~750k-exit distance. The `0xA5` is what drives the reboot loop, and it
+fires on **every** boot including pass 1 — it was never pass-2-specific. Fixing the
+`0x139` did not reveal a working installer; it revealed the next blocker, which the
+crash had been hiding.
+
+### Next blocker: our DSDT has no AML namespace
+
+From `acpiBuildTables` in Hypervisor.c:
+
+```
+// DSDT at blob offset 272 (36 bytes -- header only, no AML namespace
+```
+
+We present a **36-byte DSDT: a bare header with no namespace at all** — no `\_SB_`,
+no `PCI0` device, no `_HID`/`_CID`/`_ADR`/`_CRS`/`_PRT`, no processor objects.
+Windows' `ACPI.sys` needs a real namespace to enumerate the platform, and
+`ACPI_BIOS_ERROR` is what it raises when it cannot. This matches the pre-existing
+note in the source about "absent a real AML `_PRT` since our DSDT has no namespace
+content", and is consistent with the `0x5C` HAL_INITIALIZATION_FAILED history that
+led to the second IOAPIC being added.
+
+**U49 (next project):** author a minimal valid DSDT — `\_SB_.PCI0` with
+`_HID`/`_CID`/`_ADR`/`_CRS` and a `_PRT` describing PCI interrupt routing, plus a
+processor object — compile to AML (`iasl`), and embed it in place of the header-only
+table. Bounded, well-understood work rather than an open investigation.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step
