@@ -393,8 +393,23 @@ LARGE_INTEGER lastToggleTime;
 // positive control. One-shot per pass -- an exec breakpoint left armed on an
 // executed entry re-faults on resume (U21), and on pass 1 this function is far too
 // hot to trace repeatedly (U23 ballooned exitCount to ~24M trying).
-#define WP_RETURN_RVA 0x2369F0                 /* ExAllocateHeapPool entry (U44) */
-#define U34_SITE_NAME "ExAllocateHeapPool"     /* label for the DR0 one-shot logging */
+// U45 (2026-07-28): U44's deep stack walk was unreliable. Static analysis
+// refuted its chain: HalpInterruptRegisterLine's only allocation path is
+// HalpMmAllocateMemoryInternal -> HalpAllocPhysicalMemory, which serves from the
+// loader memory-descriptor list and never touches pool (HalpAllocPhysicalMemoryInternal
+// is a leaf that only carves loader descriptors). The HalpAllocPhysicalMemory+0x4B
+// and HalpInterruptRegisterLine+0xFB frames U44 reported were stale -- +0xFB is a
+// memset return, not an allocation. Only U44's guaranteed [rsp+0x00] survives:
+// ExAllocateHeapPool was called by ExAllocatePoolWithTag (its +0x64 is verified to
+// sit right after `call ExAllocateHeapPool`).
+//
+// So walk ONE guaranteed frame higher: break ExAllocatePoolWithTag's ENTRY, where
+// [rsp+0x00] is a guaranteed return address naming its true caller. This is the
+// reliable "one guaranteed frame per breakpoint" method (as U17/U29 used), not a
+// heuristic scan of a deep frame. The deeper walk is still printed but must be
+// treated as context only.
+#define WP_RETURN_RVA 0x9B7010                 /* ExAllocatePoolWithTag entry (U45) */
+#define U34_SITE_NAME "ExAllocatePoolWithTag"  /* label for the DR0 one-shot logging */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
@@ -7504,10 +7519,29 @@ int main(int argc, char *argv[]) {
                                    g_sawReset ? "2" : "1", exitCount);
                             if (g_sawReset && g_resetExitCount)
                                 printf(" (reset+%ld)", exitCount - g_resetExitCount);
-                            printf("\n[u34]   args rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX\n",
+                            // U45: ExAllocatePoolWithTag(rcx=PoolType, rdx=NumberOfBytes,
+                            // r8=Tag). Printing these lets us correlate this hit with
+                            // the fatal allocation U44 saw at ExAllocateHeapPool
+                            // (size ~0xAF7, tag 0).
+                            printf("\n[u34]   args PoolType=0x%llX Size=0x%llX Tag=0x%llX r9=0x%llX rsp=0x%llX\n",
                                    (unsigned long long)poolRegVals[0].Reg64, (unsigned long long)poolRegVals[1].Reg64,
                                    (unsigned long long)poolRegVals[2].Reg64, (unsigned long long)poolRegVals[3].Reg64,
                                    (unsigned long long)iRsp);
+                            // U45: [rsp+0x00] is the ONLY guaranteed frame -- at a
+                            // function entry it is the real return address into the
+                            // caller. Read and resolve it explicitly and label it as
+                            // such, so it is never conflated with the heuristic scan
+                            // below (which is what misled U44).
+                            {
+                                unsigned char ret0[8] = { 0 };
+                                if (kernelReadVA((unsigned char *)guestMemory, iCr3, iRsp, ret0, sizeof(ret0))) {
+                                    UINT64 q0 = *(UINT64 *)ret0, cb0 = 0;
+                                    printf("[u34]   GUARANTEED caller [rsp+0x00]=0x%llX", (unsigned long long)q0);
+                                    if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, iCr3, q0, &cb0))
+                                        printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb0, (unsigned long long)(q0 - cb0));
+                                    printf("\n");
+                                }
+                            }
                             // 0x100 for U44: the allocating subsystem can sit many
                             // frames up from ExAllocateHeapPool (it is called through
                             // ExAllocatePoolWithTag and friends), and non-canonical or
@@ -7516,7 +7550,7 @@ int main(int argc, char *argv[]) {
                             unsigned char iStk[0x100] = { 0 };
                             if (kernelReadVA((unsigned char *)guestMemory, iCr3, iRsp, iStk, sizeof(iStk))) {
                                 int isk;
-                                printf("[u34]   caller chain (resolve RVAs with tools/pdbsym.py rva <rva>):\n");
+                                printf("[u34]   HEURISTIC deeper scan (context only -- stale frames possible, see U44/U45):\n");
                                 for (isk = 0; isk < (int)sizeof(iStk); isk += 8) {
                                     UINT64 qv = *(UINT64 *)&iStk[isk];
                                     if (qv >= 0xFFFF800000000000ULL) {

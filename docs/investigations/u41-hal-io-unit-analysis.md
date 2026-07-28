@@ -253,6 +253,90 @@ block / early pages while those are available and falls back to pool otherwise.
    branch, and identify the state that makes pass 2 take the pool arm.
 3. Establish whether pass 1 reaches `HalpInterruptRegisterLine` at all during its
    own HAL init, and if so what allocator it gets served by.
+
+## U45 result: U44 was wrong — the allocator is a software-interrupt handler, not the HAL
+
+**U44's pass-2 caller chain was stale-frame noise and is retracted.** Static
+analysis then a reliable re-run establish the real caller.
+
+Static refutation of U44:
+- `HalpAllocPhysicalMemoryInternal` is a leaf that only carves the loader
+  memory-descriptor list; it makes no calls and never touches pool. So
+  `HalpAllocPhysicalMemory+0x4B` (the return site of `call
+  HalpAllocPhysicalMemoryInternal`) cannot lead to `ExAllocatePoolWithTag`.
+- `HalpInterruptRegisterLine`'s only allocation path is
+  `HalpMmAllocateMemoryInternal -> HalpAllocPhysicalMemory` — also loader-descriptor,
+  not pool. And `+0xFB` (the U44 frame) is the return of a `call memset`, not an
+  allocation.
+- So every frame U44 reported above `[rsp+0x00]` was stale. Only the guaranteed
+  `[rsp+0x00] = ExAllocatePoolWithTag+0x64` survived, and it is verified to sit
+  right after `call ExAllocateHeapPool`.
+
+Reliable re-run: breakpoint `ExAllocatePoolWithTag`'s **entry** (RVA 0x9B7010),
+where `[rsp+0x00]` is a guaranteed return address naming its true caller.
+
+| | pass 1 (control) | pass 2 (fatal) |
+|---|---|---|
+| PoolType | 0x1 (paged) | 0x200 (NonPagedPoolNx) |
+| Size | 0x300 | 0xAF7 |
+| Tag | `'PsQt'` | 0 (obfuscated to 0 this run) |
+| guaranteed caller `[rsp+0]` | `PsInitializeQuotaSystem+0x8F` | `KiSwInterruptDispatch+0x8C` |
+
+The pass-2 caller is confirmed beyond doubt: `KiSwInterruptDispatch+0x85` is
+`add rdx, 0xaf7` immediately before the `call ExAllocatePoolWithTag` at `+0x8C`,
+and `0xAF7` is exactly the size captured at runtime. The static call site computes
+the observed argument.
+
+### What `KiSwInterruptDispatch` is doing
+
+Disassembly from its entry (0x3DC890):
+```
+push rbp/rbx/rsi/rdi/r12-r15 ; sub rsp,0x98      ; real function prologue
+test [rdi+0x994], 0x100000 ; call KeExitRetpoline  ; speculation-control gate
+rdtsc                                              ; timestamp entropy
+movabs rsi, 0x7010008004002001                     ; magic constant
+ror/xor/mul/xor/and 0xf                             ; hash the timestamp
+mov ecx, 0x200                                     ; PoolType = NonPagedPoolNx
+lea rax,[rip+0x836656] ; mov r8d,[rax+hash*4]      ; Tag = obfuscated table lookup
+mov rdx,[rdi+0xa90] ; add rdx,0xaf7                 ; Size = base + 0xAF7
+call ExAllocatePoolWithTag
+```
+It has exactly one caller, `KiSwInterrupt+0x35D`, and `KiSwInterrupt` has no direct
+callers — it is reached through the IDT as a **software-interrupt vector**.
+`KiSwInterrupt`'s body around `+0x35D` is self-referential `call` soup (calls to
+its own `+0x22E`, `+0x120`, …), i.e. deliberately obfuscated control flow.
+
+An `rdtsc`-seeded hash driving a `NonPagedPoolNx` allocation with an obfuscated,
+table-indexed tag, dispatched from an obfuscated software-interrupt handler, is the
+signature of **PatchGuard / Kernel Patch Protection**, not any HAL init routine.
+This is a hypothesis on the *identity*; the *mechanism* below is what is confirmed.
+
+### The reframe
+
+- Pass 1's first pool allocation is `PsInitializeQuotaSystem` (normal init
+  sequence), at discovery+4817 exits.
+- Pass 2's first pool allocation is this software-interrupt handler, at
+  discovery+272 exits — far earlier relative to discovery, and off the normal init
+  sequence entirely.
+
+So on pass 2 a **software interrupt fires very early and its handler allocates
+NonPagedPool before pool exists**. The 0x139 is the correct fastfail on that
+premature allocation. The open question is no longer "who allocates" but **why this
+software interrupt fires during pass-2 early boot when pass 1 does not take it
+then** — which points back at interrupt/APIC state our port-0x64/0xFE reset leaves
+behind (a pending software interrupt or IRR/ISR bit), consistent with this whole
+project's recurring interrupt-delivery theme.
+
+### Next
+
+1. Confirm the vector: at the `KiSwInterrupt` entry on pass 2, read the trap frame /
+   the vector being serviced, and check the LAPIC/IRR state our reset leaves.
+2. Determine whether this handler runs on pass 1 at all, and when relative to pool
+   init — one-shot breakpoint `KiSwInterruptDispatch` (0x3DC890) on both passes,
+   logging exitCount and whether `ExPoolState` pooldesc+0x10 is populated yet.
+3. If it is a pending-software-interrupt-at-reset artifact, test clearing the
+   relevant interrupt state in the port-0x64/0xFE handler — with the U40/U42/U45
+   instruments in place to measure, not the discredited earlier attempt's method.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step
