@@ -24,7 +24,10 @@ import fnmatch
 import os
 import sys
 
-PDB_PATH = r"C:\LocalHost-evidence\ntkrnlmp.pdb"
+# Default is the guest kernel. Override with the PDBSYM_PDB environment variable
+# to resolve a different module (e.g. acpi.pdb for driver RVAs from a bugcheck
+# stack, which is how U49 identified the ACPI failure site).
+PDB_PATH = os.environ.get("PDBSYM_PDB", r"C:\LocalHost-evidence\ntkrnlmp.pdb")
 BASE = 0x10000000  # arbitrary synthetic load base; RVA = addr - BASE
 
 # Known-good anchors, established independently by earlier units of the
