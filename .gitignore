@@ -24,3 +24,6 @@ dist/
 # OS / editor cruft
 Thumbs.db
 Desktop.ini
+
+# Intermediate AML from iasl; dsdt_aml.h is the committed generated artifact
+acpi/*.aml
