@@ -376,8 +376,25 @@ LARGE_INTEGER lastToggleTime;
 // Control risk: this is called at InitBootProcessor+0x312, earlier than any site
 // probed so far, and may land before module discovery on pass 1. If pass 1 stays
 // silent this run is discarded like U36, not interpreted.
-#define WP_RETURN_RVA 0xA773D8                 /* HalpInitSystemPhase0 entry (U39) */
-#define U34_SITE_NAME "HalpInitSystemPhase0"   /* label for the DR0 one-shot logging */
+// U44 (2026-07-28): the question U28-U31 never asked. They traced the fatal
+// allocation DOWNWARD (ExAllocateHeapPool -> RtlpHpLfhSlotAllocate ->
+// GetSubsegment(owner=0) -> MoveSubsegment -> fastfail) but never identified the
+// ORIGINATING caller -- the subsystem that asked for memory before any pool
+// existed. U42 and U43 exonerated IOAPIC state and interrupt routing, so "who
+// allocates" is now the live question.
+//
+// Breakpoint ExAllocateHeapPool's entry. At the entry, before the prologue,
+// [rsp+0x00] is still the true return address and the qwords above it are caller
+// frames, so the stack walk names the allocating subsystem.
+//
+// Timing is favourable, unlike the U36/U39 sites: on pass 2 the allocation happens
+// after module discovery and immediately before the bugcheck, so the site is
+// armable. Pass 1 hits it too (it is a hot function there), which is a free
+// positive control. One-shot per pass -- an exec breakpoint left armed on an
+// executed entry re-faults on resume (U21), and on pass 1 this function is far too
+// hot to trace repeatedly (U23 ballooned exitCount to ~24M trying).
+#define WP_RETURN_RVA 0x2369F0                 /* ExAllocateHeapPool entry (U44) */
+#define U34_SITE_NAME "ExAllocateHeapPool"     /* label for the DR0 one-shot logging */
 // 2026-07-18, U15: full disassembly of HalpInitSystemHelper (disasm_helper_full.py)
 // confirmed the loop structure precisely: ebx=ecx_arg (outer index), ebp=edx_arg
 // (outer limit), edi=inner index 0..0x15 over HalSubComponents. Every dispatch call
@@ -7491,11 +7508,12 @@ int main(int argc, char *argv[]) {
                                    (unsigned long long)poolRegVals[0].Reg64, (unsigned long long)poolRegVals[1].Reg64,
                                    (unsigned long long)poolRegVals[2].Reg64, (unsigned long long)poolRegVals[3].Reg64,
                                    (unsigned long long)iRsp);
-                            // 0x80 rather than 0x40: the caller chain we actually want
-                            // (KiSystemStartup -> KiInitializeKernel -> ... -> here)
-                            // can sit several frames up, and non-canonical/garbage
-                            // slots are filtered out anyway.
-                            unsigned char iStk[0x80] = { 0 };
+                            // 0x100 for U44: the allocating subsystem can sit many
+                            // frames up from ExAllocateHeapPool (it is called through
+                            // ExAllocatePoolWithTag and friends), and non-canonical or
+                            // garbage slots are filtered out anyway, so a deeper walk
+                            // costs only log lines.
+                            unsigned char iStk[0x100] = { 0 };
                             if (kernelReadVA((unsigned char *)guestMemory, iCr3, iRsp, iStk, sizeof(iStk))) {
                                 int isk;
                                 printf("[u34]   caller chain (resolve RVAs with tools/pdbsym.py rva <rva>):\n");

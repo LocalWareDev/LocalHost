@@ -184,10 +184,75 @@ Still solid:
 The sharp unanswered question is therefore **who allocates pool that early on
 pass 2, when pass 1 does not**. U28-U31 traced the allocation *downward*
 (`ExAllocateHeapPool` -> `RtlpHpLfhSlotAllocate` -> `GetSubsegment` -> fastfail) but
-never identified the *originating* caller. Next: breakpoint `ExAllocateHeapPool`
-(RVA 0x2369F0) gated to pass 2, one-shot, and walk the stack to name the allocating
-subsystem. The timing works — the allocation happens after module discovery and
-just before the crash, so the site is armable, unlike the U36/U39 sites.
+never identified the *originating* caller. Answered in U44 below.
+
+## U44 result: the HAL allocates pool during interrupt-line registration
+
+Breakpointed `ExAllocateHeapPool` (RVA 0x2369F0), one-shot per pass. Both passes
+hit it, and the callers are entirely different subsystems.
+
+**Pass 1 (control)** — `rdx=0x1000`, tag `r8=0x20206D4D` = `'Mm  '`:
+```
+ExAllocateHeapPool
+  <- ExpAllocatePoolWithTagFromNode+0x5F
+  <- MiAllocatePool+0x86
+  <- MiInitializePteInfo+0xB1
+  <- MiInitializeUltraSpace+0x33
+  <- MiCreateTopLevelUltraMappings+0x73
+```
+The memory manager allocating during its own initialization, i.e. after pool
+exists. Entirely normal, and it is pass 1's *first* pool allocation.
+
+**Pass 2** — `rdx=0xAF7` (2807 bytes), tag `r8=0x0` (untagged):
+```
+ExAllocateHeapPool
+  <- ExAllocatePoolWithTag+0x64
+  <- HalpAllocPhysicalMemory+0x4B
+  <- HalpInterruptRegisterLine+0xFB
+```
+The HAL, registering an interrupt line, during HAL init — which runs long before
+`MmInitSystem` creates the pool.
+
+Confidence: `[rsp+0x00]` is a guaranteed return address, and
+`HalpAllocPhysicalMemory+0x4B` sits at `[rsp+0x10]` consistent with a real frame.
+`HalpInterruptRegisterLine+0xFB` appears twice (`+0x80`, `+0xD0`), which is good
+corroboration. A `KiSwInterruptDispatch+0x91` slot also appeared once; treat that
+as unconfirmed — the walk scans the stack, so single hits can be stale values.
+
+### Why this path allocates from pool
+
+`HalpInterruptRegisterLine` has ten direct callers, and four of them are in
+**`HalpPicDiscover`** (`+0x1AA`, `+0x1D5`, `+0x216`, `+0x240`), with the rest in
+`HalpApicDescribeLines` / `HalpApicDescribeLocalLines`. U40 independently observed
+pass 2 executing `HalpPicInitializeIoUnit`, so the PIC branch of HAL init is active
+on pass 2.
+
+`HalpAllocPhysicalMemory` chooses its allocator on a two-global test:
+```
+mov eax, [HalpAllocationDescriptorArraySize]
+sub eax, [HalpUsedAllocDescriptors]
+cmp eax, 3
+jbe  <other path>                      ; few descriptors left
+call HalpAllocPhysicalMemoryInternal   ; else -- the path that reaches pool
+```
+Pass 2's captured return address is `+0x4B`, immediately after that `call`, so the
+`jbe` was **not** taken and it went through `HalpAllocPhysicalMemoryInternal`, which
+ends in `ExAllocatePoolWithTag`.
+
+Note both globals live in the freshly loaded pass-2 kernel image, so they are not
+stale carry-over in the way the IOAPIC state was. The divergence is more likely
+*inside* `HalpAllocPhysicalMemoryInternal`, which presumably prefers the loader
+block / early pages while those are available and falls back to pool otherwise.
+
+### Next
+
+1. Poll `HalpAllocationDescriptorArraySize` and `HalpUsedAllocDescriptors` on both
+   passes (arming-free, U33-style) and compare — this is cheap and directly tests
+   whether the branch condition differs.
+2. Disassemble `HalpAllocPhysicalMemoryInternal` to find its loader-block-vs-pool
+   branch, and identify the state that makes pass 2 take the pool arm.
+3. Establish whether pass 1 reaches `HalpInterruptRegisterLine` at all during its
+   own HAL init, and if so what allocator it gets served by.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step
