@@ -146,11 +146,48 @@ injection bug, independent of whether it is what causes the 0x139.
 
 1. ~~Log IOAPIC MMIO accesses per pass and diff pass 1 against pass 2~~ — done
    above; the IOAPIC is exonerated.
-1b. Test the inherited-unmasked-RTE hazard: log which vector is actually injected
-   for GSI 8 during pass 2 before HAL init re-masks it. If 0xD1 is being delivered
-   into firmware, restoring the redirection tables to power-on default at reset
-   becomes well-motivated — and worth retrying *with* the U40/U42 instruments,
-   since the earlier attempt's "made things worse" verdict is unsound (see above).
+1b. ~~Test the inherited-unmasked-RTE hazard~~ — done, see U43 below. Negative.
+
+## U43 result: the inherited RTE is latent, not causal
+
+Logged every non-legacy (IOAPIC-programmed) vector resolution, per pass:
+
+| | pass 1 | pass 2 |
+|---|---|---|
+| non-legacy vector resolutions | 63 (all GSI 8 -> 0xD1, `kernelFound=1`) | **0** |
+| RTC PIE bit (`cmosRegisters[0x0B] & 0x40`) at bugcheck | — | `0x00` |
+
+Pass 2 never resolves a programmed vector even once. `deliverRtcPeriodicIrq`
+returns immediately unless the RTC's PIE bit is set, and that bit reads `0x00`
+throughout pass 2, so the RTC periodic path never runs, `ioapicResolveVector(8, …)`
+is never called, and the inherited unmasked `0xD1` entry is never consulted.
+
+The wrong-vector bug identified in U42 is therefore **real in the code but never
+exercised on this path** — latent, not causal. It is still worth fixing defensively
+(a pass-2 guest that *did* enable PIE before HAL re-masked the entry would receive
+vector 0xD1 in firmware), but it does not explain the 0x139.
+
+Pass 1's 63 resolutions all carry `kernelFound=1`, i.e. they happen after the
+kernel is up and has legitimately programmed the clock interrupt. That is correct
+behaviour, and it is the mechanism the resolver was written for.
+
+Combined with U42, interrupt routing and IOAPIC state are both exonerated.
+
+## Where this leaves the investigation
+
+Still solid:
+- Pass 2 bugchecks 0x139 shortly after HAL's IOAPIC and 8259 init both complete.
+- `InitBootProcessor` is never reached, so MM init and pool init never run, and the
+  null pool descriptor is correct for that point in boot.
+- The crash is a genuine pool allocation made when no pool exists yet.
+
+The sharp unanswered question is therefore **who allocates pool that early on
+pass 2, when pass 1 does not**. U28-U31 traced the allocation *downward*
+(`ExAllocateHeapPool` -> `RtlpHpLfhSlotAllocate` -> `GetSubsegment` -> fastfail) but
+never identified the *originating* caller. Next: breakpoint `ExAllocateHeapPool`
+(RVA 0x2369F0) gated to pass 2, one-shot, and walk the stack to name the allocating
+subsystem. The timing works — the allocation happens after module discovery and
+just before the crash, so the site is armable, unlike the U36/U39 sites.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step

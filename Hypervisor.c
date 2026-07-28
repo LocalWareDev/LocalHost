@@ -3837,6 +3837,17 @@ void ioapicWriteRegister(IoApicState *ap, UINT32 reg, UINT32 value) {
 // programmed one never fired -- see docs/investigations/vppt-synic-blocker.md
 // part 9/10), honor the entry directly: skip injection if masked,
 // otherwise use its own vector field.
+// U43: per-pass log budget for non-legacy (IOAPIC-programmed) vector resolutions.
+// U42 found that pass 2 inherits ioapic1.redir[8] = 0x01000000000008D1 -- GSI 8
+// (RTC), vector 0xD1, UNMASKED -- because the port-0x64/0xFE reset restores CPU
+// registers only. The branch below then returns 0xD1 rather than the legacy
+// 8259-remapped vector, for the whole window between the reset and pass-2 HAL init
+// re-masking the entry (~130k exits of firmware/bootloader). Log it to establish
+// whether a wrong vector is actually being delivered, rather than assuming it.
+long g_resolveNonLegacyLogged[2] = { 0, 0 };
+long g_resolveNonLegacyCount[2] = { 0, 0 };
+#define U43_RESOLVE_LOG_PER_PASS 25
+
 int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outVector) {
     IoApicState *ap = (gsi < 24) ? &ioapic1 : &ioapic2;
     int entry = (gsi < 24) ? gsi : (gsi - IOAPIC2_GSI_BASE);
@@ -3849,6 +3860,17 @@ int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outV
         return 0; // masked -- guest doesn't want this GSI delivered
     }
     *outVector = (unsigned char)(rte & 0xFF);
+    { // U43: an IOAPIC-programmed vector is being used instead of the legacy one.
+        int p = g_sawReset ? 1 : 0;
+        g_resolveNonLegacyCount[p]++;
+        if (g_resolveNonLegacyLogged[p] < U43_RESOLVE_LOG_PER_PASS) {
+            g_resolveNonLegacyLogged[p]++;
+            printf("[u43] pass%d gsi=%d PROGRAMMED vector=0x%02X (legacy would be 0x%02X) rte=0x%016llX kernelFound=%d\n",
+                   p + 1, gsi, *outVector, legacyVector,
+                   (unsigned long long)rte, g_bpModuleBase ? 1 : 0);
+            fflush(stdout);
+        }
+    }
     return 1;
 }
 
@@ -5310,6 +5332,9 @@ DWORD WINAPI stallWatchdogThread(LPVOID param) {
                         u40Dump(g_sawReset ? 1 : 0, "at bugcheck");
                         printf("[u42] IOAPIC accesses at bugcheck: pass1=%ld pass2=%ld\n",
                                g_ioapicPassAccesses[0], g_ioapicPassAccesses[1]);
+                        printf("[u43] non-legacy vector resolutions: pass1=%ld pass2=%ld  (RTC PIE bit now 0x%02X, inherited across the reset)\n",
+                               g_resolveNonLegacyCount[0], g_resolveNonLegacyCount[1],
+                               cmosRegisters[0x0B] & 0x40);
                         fflush(stdout);
 
                         // Bugcheck 0x139 (KERNEL_SECURITY_CHECK_FAILURE)
