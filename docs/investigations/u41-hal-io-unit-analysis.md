@@ -99,11 +99,58 @@ re-masking entries: HAL rewrites them all anyway. Better candidates for stale
 per-pass state are `IoApicState.id` (writable by the guest via register 0, and
 never restored) and `IoApicState.selectedReg`.
 
+## U42 result: the IOAPIC is exonerated as the divergence
+
+Added a per-pass, post-decode IOAPIC register trace (the pre-existing log used one
+global counter, so pass 1 consumed its entire first-100 budget and pass 2 logged
+nothing; it also printed before decode, so it could not show register or value).
+
+Measured, one run:
+
+| | pass 1 | pass 2 |
+|---|---|---|
+| total IOAPIC accesses | 274 | 262 |
+| logged ops on ioapic1 | 131 | 131 |
+| logged ops on ioapic2 | 129 | 129 |
+| completes both controllers | yes | yes |
+| programs clock entry 8 -> vector 0xD1 | yes | never reached |
+
+Both passes issue the *same* sequence to the *same* registers with the *same*
+values: version register read twice (returning `0x00170011` both times, satisfying
+the cross-check at `+0x89..+0xA7`), ID read then written back, then every
+redirection entry set to `0x100FF` low / `0` high, across both controllers. The
+only difference is the value read *back* from entries — stale `0x000100FF` on
+pass 2 versus power-on `0x00010000` on pass 1 — and HAL overwrites every entry
+regardless, so that difference is behaviourally inert.
+
+**So the IOAPIC register conversation is not where the passes diverge.** The
+hypothesis that pass 2's APIC I/O unit init fails because of stale emulated IOAPIC
+state is disproved. The 12-access difference in the totals is simply pass 1
+continuing on to program the clock interrupt afterwards, which pass 2 never reaches
+because it bugchecks first.
+
+## A real stale-state bug found on the way
+
+Pass 2 inherits `ioapic1.redir[8] = 0x01000000000008D1` — GSI 8 (the RTC),
+**vector 0xD1, unmasked**, destination 0x01 — because the reset restores CPU
+registers only. That entry stays unmasked from the reset until pass-2 HAL init
+re-masks it, a window of roughly 130k exits spent in firmware and the bootloader.
+
+`ioapicResolveVector` deliberately returns the IOAPIC-programmed vector once an
+entry has been reprogrammed, so any RTC interrupt injected during that window is
+delivered as vector **0xD1** to firmware/bootloader code that has no handler for
+it, instead of the legacy 8259-remapped vector. That is a concrete wrong-vector
+injection bug, independent of whether it is what causes the 0x139.
+
 ## Next steps
 
-1. Log IOAPIC MMIO accesses per pass and diff pass 1 against pass 2 — the emulation
-   already has an access-log counter. This shows the register-level conversation
-   directly instead of inferring it.
+1. ~~Log IOAPIC MMIO accesses per pass and diff pass 1 against pass 2~~ — done
+   above; the IOAPIC is exonerated.
+1b. Test the inherited-unmasked-RTE hazard: log which vector is actually injected
+   for GSI 8 during pass 2 before HAL init re-masks it. If 0xD1 is being delivered
+   into firmware, restoring the redirection tables to power-on default at reset
+   becomes well-motivated — and worth retrying *with* the U40/U42 instruments,
+   since the earlier attempt's "made things worse" verdict is unsound (see above).
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step

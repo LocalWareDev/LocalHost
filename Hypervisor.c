@@ -3977,6 +3977,20 @@ int ioapicDecodeMmio(unsigned char *insn, int len, int *isWrite, int *isImm, int
 // caller can fall back to its generic unmapped-GPA handling.
 int ioapicAccessLogCount = 0;
 
+// U42: per-pass IOAPIC register-level trace. U41 showed HAL's IOAPIC conversation
+// is what decides whether APIC I/O unit init succeeds (version read twice and
+// cross-checked, ID written, then all 24 redirection entries rewritten), so the
+// question "what differs about pass 2" is answerable by diffing the two passes'
+// register traffic directly rather than inferring it from an exit-biased RIP
+// profile -- which is exactly how U40 went wrong.
+//
+// Logged per pass so pass 2 gets its own budget, and AFTER decode so the register
+// and value are known. Reads log the value we RETURN, which is the thing HAL
+// actually makes decisions on.
+#define U42_LOG_PER_PASS 260   /* ~enough for version+ID+24 entries x2 dwords */
+long g_ioapicPassAccesses[2] = { 0, 0 };
+long g_ioapicPassLogged[2] = { 0, 0 };
+
 int ioapicHandleMmioAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
     UINT64 gpa = exitContext->MemoryAccess.Gpa;
     IoApicState *ap;
@@ -3992,6 +4006,12 @@ int ioapicHandleMmioAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
     }
 
     ioapicAccessLogCount++;
+    // U42: the pre-existing log above is a single global counter, so pass 1
+    // consumes its whole first-100 budget and pass 2 -- the pass we care about --
+    // logs nothing. It also fires BEFORE the instruction is decoded, so it cannot
+    // show which register or value was involved. Count per pass instead, and do the
+    // informative logging after decode (below).
+    g_ioapicPassAccesses[g_sawReset ? 1 : 0]++;
     if (ioapicAccessLogCount <= 100 || ioapicAccessLogCount % 100000 == 0) {
         printf("[ioapic #%d] gpa=0x%llX pageOff=0x%llX rip=0x%llX write=%d insnLen=%d bytes=%d\n",
                ioapicAccessLogCount, (unsigned long long)gpa, (unsigned long long)pageOff,
@@ -4023,6 +4043,20 @@ int ioapicHandleMmioAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
             WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
             value = (UINT32)regVal.Reg64;
         }
+        // U42: log the write before it is applied, so selectedReg still shows which
+        // register this data write targets.
+        {
+            int u42p = g_sawReset ? 1 : 0;
+            if (g_ioapicPassLogged[u42p] < U42_LOG_PER_PASS) {
+                g_ioapicPassLogged[u42p]++;
+                if (pageOff == 0x00)
+                    printf("[u42] pass%d ioapic%u SELECT reg=0x%02X\n", u42p + 1, ap->id, value & 0xFF);
+                else
+                    printf("[u42] pass%d ioapic%u WRITE reg=0x%02X value=0x%08X\n",
+                           u42p + 1, ap->id, ap->selectedReg, value);
+                fflush(stdout);
+            }
+        }
         if (pageOff == 0x00) ap->selectedReg = value & 0xFF;
         else if (pageOff == 0x10) {
             ioapicWriteRegister(ap, ap->selectedReg, value);
@@ -4051,6 +4085,20 @@ int ioapicHandleMmioAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         UINT32 value = (pageOff == 0x00) ? ap->selectedReg
                       : (pageOff == 0x10) ? ioapicReadRegister(ap, ap->selectedReg)
                       : 0;
+        // U42: log the value we hand back -- this is what HAL branches on. The
+        // version-register path (+0x5D..+0xA7 in HalpApicInitializeIoUnit) reads
+        // twice and bails if the reads disagree or read 0/0xFFFFFFFF.
+        {
+            int u42p = g_sawReset ? 1 : 0;
+            if (g_ioapicPassLogged[u42p] < U42_LOG_PER_PASS) {
+                g_ioapicPassLogged[u42p]++;
+                printf("[u42] pass%d ioapic%u READ  reg=0x%02X -> 0x%08X%s\n",
+                       u42p + 1, ap->id,
+                       (pageOff == 0x00) ? 0 : ap->selectedReg, value,
+                       (pageOff == 0x00) ? "  (IOREGSEL readback)" : "");
+                fflush(stdout);
+            }
+        }
         WHV_REGISTER_VALUE regVal = { 0 };
         regVal.Reg64 = value;
         WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
@@ -5260,6 +5308,9 @@ DWORD WINAPI stallWatchdogThread(LPVOID param) {
                         // pass-2 execution picture that breakpoints cannot produce,
                         // since it includes the pre-discovery region.
                         u40Dump(g_sawReset ? 1 : 0, "at bugcheck");
+                        printf("[u42] IOAPIC accesses at bugcheck: pass1=%ld pass2=%ld\n",
+                               g_ioapicPassAccesses[0], g_ioapicPassAccesses[1]);
+                        fflush(stdout);
 
                         // Bugcheck 0x139 (KERNEL_SECURITY_CHECK_FAILURE)
                         // seen after the experimental port-0x64/0xFE reset
@@ -6991,6 +7042,31 @@ int main(int argc, char *argv[]) {
 
                         printf("[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=%ld)\n", exitCount);
                         u40Dump(0, "end of pass 1, at reset");  // U40: pass-1 profile baseline to compare pass 2 against
+                        // U42: pass-1 IOAPIC totals, plus the state pass 2 will
+                        // INHERIT -- this reset restores CPU registers only, so
+                        // whatever pass 1 left in ioapic1/ioapic2 carries over.
+                        printf("[u42] pass1 IOAPIC accesses total=%ld (logged %ld)\n",
+                               g_ioapicPassAccesses[0], g_ioapicPassLogged[0]);
+                        {
+                            int e;
+                            printf("[u42] state INHERITED by pass 2: ioapic1.id=%u selectedReg=0x%02X | ioapic2.id=%u selectedReg=0x%02X\n",
+                                   ioapic1.id, ioapic1.selectedReg, ioapic2.id, ioapic2.selectedReg);
+                            for (e = 0; e < 24; e++) {
+                                if (ioapic1.redirTable[e] != 0x10000ULL)
+                                    printf("[u42]   ioapic1.redir[%d]=0x%016llX (vec=0x%02X masked=%d) -- NOT at power-on default\n",
+                                           e, (unsigned long long)ioapic1.redirTable[e],
+                                           (unsigned char)(ioapic1.redirTable[e] & 0xFF),
+                                           (ioapic1.redirTable[e] & 0x10000ULL) ? 1 : 0);
+                            }
+                            for (e = 0; e < 24; e++) {
+                                if (ioapic2.redirTable[e] != 0x10000ULL)
+                                    printf("[u42]   ioapic2.redir[%d]=0x%016llX (vec=0x%02X masked=%d) -- NOT at power-on default\n",
+                                           e, (unsigned long long)ioapic2.redirTable[e],
+                                           (unsigned char)(ioapic2.redirTable[e] & 0xFF),
+                                           (ioapic2.redirTable[e] & 0x10000ULL) ? 1 : 0);
+                            }
+                        }
+                        fflush(stdout);
                         fflush(stdout);
                     }
 
