@@ -7789,6 +7789,32 @@ int main(int argc, char *argv[]) {
                                 printf("[BUGCHECK]   p4=0x%llX  caller(return)=0x%llX", (unsigned long long)p4, (unsigned long long)retAddr);
                                 if (kernelDiagIdentifyModuleAt((unsigned char *)guestMemory, bcCr3, retAddr, &cb))
                                     printf("  (base 0x%llX RVA 0x%llX)", (unsigned long long)cb, (unsigned long long)(retAddr - cb));
+                                // U50: dump the raising module's image, once. U49 disproved the
+                                // DSDT hypothesis, and two guesses at what 0xA5 p1=0x11 means have
+                                // now cost a cycle each. Stop guessing: capture acpi.sys (the
+                                // module that raises it, confirmed via acpi.pdb) so the code around
+                                // the bugcheck caller can be disassembled and the actual tested
+                                // condition read off. Same technique that worked for ntoskrnl (U27).
+                                if (cb && cb != g_bpModuleBase) {
+                                    static int g_raiserDumped = 0;
+                                    if (!g_raiserDumped) {
+                                        g_raiserDumped = 1;
+                                        CreateDirectoryA(KDUMP_DIR, NULL);
+                                        FILE *rf = fopen(KDUMP_DIR "\\bugcheck_raiser.bin", "wb");
+                                        if (rf) {
+                                            unsigned char pg[0x1000];
+                                            UINT64 o; int ok = 0;
+                                            for (o = 0; o < 0x200000ULL; o += 0x1000) {   /* 2MB is ample for acpi.sys */
+                                                if (kernelReadVA((unsigned char *)guestMemory, bcCr3, cb + o, pg, sizeof(pg))) ok++;
+                                                else memset(pg, 0, sizeof(pg));
+                                                fwrite(pg, 1, sizeof(pg), rf);
+                                            }
+                                            fclose(rf);
+                                            printf("\n[u50] dumped raising module (base 0x%llX) to bugcheck_raiser.bin (%d/512 pages readable)",
+                                                   (unsigned long long)cb, ok);
+                                        }
+                                    }
+                                }
                                 printf("\n[BUGCHECK]   stack (canonical kernel qwords):\n");
                                 int bsk;
                                 for (bsk = 0; bsk < (int)sizeof(bcStk); bsk += 8) {
