@@ -327,16 +327,49 @@ then** — which points back at interrupt/APIC state our port-0x64/0xFE reset le
 behind (a pending software interrupt or IRR/ISR bit), consistent with this whole
 project's recurring interrupt-delivery theme.
 
+## U46 result: the reset leaves a dirty LAPIC, but nothing is pending
+
+The LAPIC is WHP-emulated (`WHvX64LocalApicEmulationModeXApic`), so its state lives
+in the virtual processor. Our port-0x64/0xFE reset calls only
+`WHvSetVirtualProcessorRegisters` for CPU registers — it never touches the LAPIC.
+Read the xAPIC register page (`WHvGetVirtualProcessorInterruptControllerState`) at
+the reset, i.e. the state pass 2 inherits:
+
+```
+TPR=0xF0  PPR=0x0  SVR=0x1DF
+LVT Timer=0x300FD (vector 0xFD, PERIODIC, masked, InitCnt=0 CurCnt=0)
+IRR: no pending vectors
+```
+
+Two readings:
+- **Negative:** IRR is clean. No interrupt is pending at the reset, so the pass-2
+  software interrupt is *raised during pass 2*, not inherited-pending. The
+  "surviving pending interrupt" form of the hypothesis is disproved.
+- **Positive:** the LAPIC is nonetheless dirty. A real reset clears it to cold-boot
+  state — APIC disabled (`SVR` bit 8 clear), `TPR=0`, LVTs masked with vector 0.
+  Ours leaves pass 1's whole configuration: APIC **software-enabled**, `TPR=0xF0`
+  (HIGH_LEVEL, pass 1's post-bugcheck `HaliHaltSystem` priority), timer armed at
+  vector 0xFD periodic. Pass 2 begins with a warm LAPIC where a cold boot expects a
+  reset one.
+
+(The at-bugcheck LAPIC read returned `0x80370308` — the VP state is not readable at
+that instant. Not pursued; the reset snapshot is the informative one.)
+
 ### Next
 
-1. Confirm the vector: at the `KiSwInterrupt` entry on pass 2, read the trap frame /
-   the vector being serviced, and check the LAPIC/IRR state our reset leaves.
-2. Determine whether this handler runs on pass 1 at all, and when relative to pool
-   init — one-shot breakpoint `KiSwInterruptDispatch` (0x3DC890) on both passes,
-   logging exitCount and whether `ExPoolState` pooldesc+0x10 is populated yet.
-3. If it is a pending-software-interrupt-at-reset artifact, test clearing the
-   relevant interrupt state in the port-0x64/0xFE handler — with the U40/U42/U45
-   instruments in place to measure, not the discredited earlier attempt's method.
+1. **U46b — decisive timing test.** One-shot breakpoint `KiSwInterruptDispatch`
+   (0x3DC890) on *both* passes, logging exitCount relative to discovery and whether
+   `ExPoolState` pooldesc+0x10 is populated (pool exists) at that instant. This
+   separates the two live explanations:
+   - the software interrupt fires *pass-2-specifically early* (pass 1 does not take
+     it at that point), vs
+   - it is normal early-boot code that runs in both passes before pool init, and
+     pass 1 only survives because its pool init is reached and pass 2's is not.
+2. Given the dirty-LAPIC finding, test clearing the LAPIC to cold-boot state in the
+   port-0x64/0xFE handler (`WHvSetVirtualProcessorInterruptControllerState`),
+   measured with the U40/U42/U45/U46 instruments — well-motivated as "make the warm
+   reset clear the interrupt controller the way real hardware does," independent of
+   whether it fixes the 0x139.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step

@@ -724,6 +724,55 @@ static void u40Dump(int pass, const char *why) {
     fflush(stdout);
 }
 
+// U46: dump the WHP-emulated local APIC state. The LAPIC lives in WHP (we set
+// WHvX64LocalApicEmulationModeXApic), and our port-0x64/0xFE reset touches only
+// CPU registers via WHvSetVirtualProcessorRegisters -- it never clears the LAPIC.
+// So whatever pass 1 leaves pending (an IRR bit, an in-service vector, an armed
+// periodic timer) survives into pass 2. U45 showed pass 2 takes an early software
+// interrupt into KiSwInterrupt that allocates pool before pool exists; a surviving
+// pending interrupt or armed APIC timer is the prime suspect. This reads the raw
+// xAPIC register page and reports the vectors that are set plus the timer state.
+//
+// WHvGetVirtualProcessorInterruptControllerState returns the xAPIC register file
+// (register at MMIO offset X is at byte offset X): TPR@0x80, PPR@0xA0, SVR@0xF0,
+// ISR@0x100..0x170, IRR@0x200..0x270, LVT Timer@0x320, InitialCount@0x380,
+// CurrentCount@0x390, DivideConfig@0x3E0.
+static void u46DumpLapic(WHV_PARTITION_HANDLE partition, const char *why) {
+    unsigned char apic[4096] = { 0 };
+    UINT32 written = 0;
+    HRESULT hr = WHvGetVirtualProcessorInterruptControllerState(partition, 0, apic, sizeof(apic), &written);
+    if (FAILED(hr)) {
+        printf("[u46] LAPIC read failed (%s): HRESULT=0x%lx\n", why, hr);
+        fflush(stdout);
+        return;
+    }
+    UINT32 tpr = *(UINT32 *)&apic[0x80], ppr = *(UINT32 *)&apic[0xA0];
+    UINT32 svr = *(UINT32 *)&apic[0xF0];
+    UINT32 lvtTimer = *(UINT32 *)&apic[0x320];
+    UINT32 initCnt = *(UINT32 *)&apic[0x380], curCnt = *(UINT32 *)&apic[0x390];
+    UINT32 divCfg = *(UINT32 *)&apic[0x3E0];
+    printf("[u46] LAPIC state (%s, %u bytes): TPR=0x%X PPR=0x%X SVR=0x%X\n",
+           why, written, tpr, ppr, svr);
+    printf("[u46]   LVT Timer=0x%X (vector=0x%02X %s masked=%d) InitCnt=0x%X CurCnt=0x%X Div=0x%X\n",
+           lvtTimer, lvtTimer & 0xFF,
+           (lvtTimer & 0x20000) ? "PERIODIC" : "one-shot",
+           (lvtTimer & 0x10000) ? 1 : 0, initCnt, curCnt, divCfg);
+    // ISR/IRR: 8 dwords each, one bit per vector. Report set vectors.
+    int reg, bit, any;
+    for (reg = 0, any = 0; reg < 8; reg++) {
+        UINT32 w = *(UINT32 *)&apic[0x100 + reg * 0x10];
+        for (bit = 0; bit < 32; bit++) if (w & (1u << bit)) { printf("%s0x%02X", any++ ? "," : "[u46]   ISR set vectors: ", reg * 32 + bit); }
+    }
+    if (any) printf("\n");
+    for (reg = 0, any = 0; reg < 8; reg++) {
+        UINT32 w = *(UINT32 *)&apic[0x200 + reg * 0x10];
+        for (bit = 0; bit < 32; bit++) if (w & (1u << bit)) { printf("%s0x%02X", any++ ? "," : "[u46]   IRR set (pending) vectors: ", reg * 32 + bit); }
+    }
+    if (any) printf("\n");
+    if (!any) printf("[u46]   IRR: no pending vectors\n");
+    fflush(stdout);
+}
+
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
 
@@ -5362,6 +5411,7 @@ DWORD WINAPI stallWatchdogThread(LPVOID param) {
                         // pass-2 execution picture that breakpoints cannot produce,
                         // since it includes the pre-discovery region.
                         u40Dump(g_sawReset ? 1 : 0, "at bugcheck");
+                        u46DumpLapic(g_watchdogPartition, g_sawReset ? "at bugcheck (pass 2)" : "at bugcheck (pass 1)");
                         printf("[u42] IOAPIC accesses at bugcheck: pass1=%ld pass2=%ld\n",
                                g_ioapicPassAccesses[0], g_ioapicPassAccesses[1]);
                         printf("[u43] non-legacy vector resolutions: pass1=%ld pass2=%ld  (RTC PIE bit now 0x%02X, inherited across the reset)\n",
@@ -7099,6 +7149,7 @@ int main(int argc, char *argv[]) {
 
                         printf("[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=%ld)\n", exitCount);
                         u40Dump(0, "end of pass 1, at reset");  // U40: pass-1 profile baseline to compare pass 2 against
+                        u46DumpLapic(partition, "at reset -- state pass 2 will INHERIT");  // U46: LAPIC survives the CPU-only reset
                         // U42: pass-1 IOAPIC totals, plus the state pass 2 will
                         // INHERIT -- this reset restores CPU registers only, so
                         // whatever pass 1 left in ioapic1/ioapic2 carries over.
