@@ -388,15 +388,57 @@ warm, software-enabled LAPIC. The leading mechanism is that this inherited APIC
 timer (or the warm LAPIC generally) drives an early interrupt into `KiSwInterrupt`
 on pass 2, whose handler allocates `NonPagedPool` before pool init has run.
 
-### Next
+## U47 result: FIXED. Quiescing the LAPIC at reset resolves the pass-2 0x139
 
-- **U47 (fix test):** clear the LAPIC to cold-boot state in the port-0x64/0xFE
-  handler (read-modify-write via `WHvSetVirtualProcessorInterruptControllerState`:
-  TPR=0, SVR disabled/0xFF, all LVTs masked, timer counts and ISR/IRR/TMR zeroed).
-  Measure whether pass 2 gets past the `KiSwInterrupt` allocation and reaches
-  `MmInitSystem`/pool init. This is the direct test of the dirty-LAPIC hypothesis.
-- Diagnostic follow-up if needed: read the guest IDT to confirm which vector maps to
-  `KiSwInterrupt` (expected 0xFD, matching the inherited LVT timer).
+`u47ResetLapic` was added to the port-0x64/0xFE handler: read-modify-write the
+xAPIC page to mask every LVT, stop and zero the timer, clear ISR/TMR/IRR and ICR,
+and drop TPR to 0 — quiescing the local APIC the way a real hardware reset does.
+
+Result, reproduced **4/4 runs** (the RAM-clear attempt that this project previously
+tried was only 1/3, so reproducibility was checked deliberately):
+
+- **No `0x139`.** The KERNEL_SECURITY_CHECK_FAILURE that blocked pass 2 for the
+  entire U15→U46b investigation does not occur.
+- **`KiSwInterruptDispatch` never fires on pass 2.** With the inherited armed timer
+  gone, the early software interrupt is not raised, so its premature pool allocation
+  never happens.
+- **Pool init now runs on pass 2.** The U33 tracker shows `pooldesc+0x08` and
+  `+0x10` both go null→set (`INIT`) at ~reset+145k — `MmInitSystem` executes, which
+  it never did before.
+- **Pass 2 boots ~442k exits and triggers a second reset** (Setup's normal next
+  reboot), i.e. real forward progress into the next install phase.
+
+The only remaining bugcheck is the pre-existing pass-1 `0xA5` (ACPI_BIOS_ERROR),
+documented in U21 as benign — Setup continues past it, unchanged by this fix.
+
+### Root cause, end to end
+
+1. Our port-0x64/0xFE warm reset restored CPU registers only and left the
+   WHP-emulated LAPIC untouched (U46).
+2. So pass 2 inherited pass 1's LAPIC: software-enabled, `TPR=0xF0`, LVT timer armed
+   at vector 0xFD periodic.
+3. That inherited timer drove an early software interrupt into `KiSwInterrupt` →
+   `KiSwInterruptDispatch` on pass 2, which pass 1 never takes at that point (U46b).
+4. `KiSwInterruptDispatch` allocates `NonPagedPool` — but this fired before
+   `MmInitSystem`/pool-heap init had run, so the pool descriptor's `+0x10` (LFH
+   context root) was still null (U31–U33, U45).
+5. The null context yielded a null LFH owner → `subseg=0` → the LIST_ENTRY fastfail
+   in `RtlpHpLfhOwnerMoveSubsegment` → `KeBugCheckEx(0x139, 3)` (U22).
+
+The 0x139 / null-pool-descriptor chain was a *symptom*; the root cause was the warm
+reset failing to quiesce the interrupt controller. Every earlier "downward" trace
+(U15–U33) was following the symptom; U40's arming-free sampler, U44/U45's reliable
+caller walk, and U46/U46b's LAPIC snapshot walked it back up to the cause.
+
+### Follow-up (not blocking)
+
+- The fix is minimal (`u47ResetLapic` + one call). The heavy diagnostics
+  (U33/U40/U42/U43/U46 logging, the DR0 one-shot) should be gated behind a debug
+  flag for a clean build.
+- Confirm the install proceeds through its later reboots (pass 3+); `u47ResetLapic`
+  runs at every reset, so each pass gets a clean LAPIC.
+- Consider whether the reset should also fully cold-reset the LAPIC (disable via SVR)
+  rather than only quiesce; the quiesce is sufficient for the 0x139 and lower-risk.
 2. Check whether `[rcx+0x10]` (the cached IOAPIC window) is non-zero on pass 2 at
    `+0x3B`, i.e. whether `HalMapIoSpace` is being skipped.
 3. Get an exit-independent view of where pass 2 actually is. Options: single-step

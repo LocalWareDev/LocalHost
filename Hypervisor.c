@@ -782,6 +782,45 @@ static void u46DumpLapic(WHV_PARTITION_HANDLE partition, const char *why) {
     fflush(stdout);
 }
 
+// U47 (2026-07-28): FIX TEST. U46/U46b established that our port-0x64/0xFE reset
+// leaves the WHP LAPIC warm (TPR=0xF0, APIC enabled, LVT timer armed at vector
+// 0xFD periodic), and pass 2 then takes an early software interrupt into
+// KiSwInterrupt whose handler allocates NonPagedPool before pool init has run ->
+// 0x139. A real hardware reset quiesces the local APIC. Do the same here:
+// read-modify-write the xAPIC page to mask every LVT, stop and zero the timer,
+// clear all pending/in-service/trigger state, and drop TPR to 0. This removes the
+// inherited armed timer -- the identified trigger -- without fully disabling the
+// APIC (SVR left as-is), which is the conservative first cut. Gated so it is easy
+// to toggle for A/B comparison.
+#define U47_RESET_LAPIC 1
+static void u47ResetLapic(WHV_PARTITION_HANDLE partition) {
+    unsigned char apic[4096] = { 0 };
+    UINT32 written = 0;
+    HRESULT hr = WHvGetVirtualProcessorInterruptControllerState(partition, 0, apic, sizeof(apic), &written);
+    if (FAILED(hr)) { printf("[u47] LAPIC read failed: 0x%lx -- not resetting\n", hr); fflush(stdout); return; }
+    *(UINT32 *)&apic[0x80] = 0;          // TPR = 0
+    // Mask every LVT (bit 16 set, vector 0) = cold-boot 0x10000.
+    UINT32 lvtOffs[] = { 0x2F0, 0x320, 0x330, 0x340, 0x350, 0x360, 0x370 };
+    unsigned int li;
+    for (li = 0; li < sizeof(lvtOffs) / sizeof(lvtOffs[0]); li++)
+        *(UINT32 *)&apic[lvtOffs[li]] = 0x10000;
+    *(UINT32 *)&apic[0x380] = 0;          // Timer Initial Count = 0 (stops it)
+    *(UINT32 *)&apic[0x390] = 0;          // Timer Current Count = 0
+    *(UINT32 *)&apic[0x300] = 0;          // ICR low
+    *(UINT32 *)&apic[0x310] = 0;          // ICR high
+    // Clear ISR (0x100), TMR (0x180), IRR (0x200): 8 dwords each, 0x10 stride.
+    int r;
+    for (r = 0; r < 8; r++) {
+        *(UINT32 *)&apic[0x100 + r * 0x10] = 0;
+        *(UINT32 *)&apic[0x180 + r * 0x10] = 0;
+        *(UINT32 *)&apic[0x200 + r * 0x10] = 0;
+    }
+    hr = WHvSetVirtualProcessorInterruptControllerState(partition, 0, apic, sizeof(apic));
+    if (FAILED(hr)) { printf("[u47] LAPIC write failed: 0x%lx\n", hr); fflush(stdout); return; }
+    printf("[u47] LAPIC quiesced at reset (LVTs masked, timer stopped, pending/ISR/IRR cleared, TPR=0)\n");
+    fflush(stdout);
+}
+
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
 
@@ -7159,6 +7198,10 @@ int main(int argc, char *argv[]) {
                         printf("[reset] port 0x64/0xFE keyboard-controller reset pulse honored -- vCPU restarted at reset vector (exitCount=%ld)\n", exitCount);
                         u40Dump(0, "end of pass 1, at reset");  // U40: pass-1 profile baseline to compare pass 2 against
                         u46DumpLapic(partition, "at reset -- state pass 2 will INHERIT");  // U46: LAPIC survives the CPU-only reset
+#if U47_RESET_LAPIC
+                        u47ResetLapic(partition);  // U47 fix test: quiesce the LAPIC like a real reset
+                        u46DumpLapic(partition, "after U47 quiesce");
+#endif
                         // U42: pass-1 IOAPIC totals, plus the state pass 2 will
                         // INHERIT -- this reset restores CPU registers only, so
                         // whatever pass 1 left in ioapic1/ioapic2 carries over.
