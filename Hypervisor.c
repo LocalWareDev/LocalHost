@@ -3273,7 +3273,14 @@ int pciRegisterIsReadOnly(UINT32 offset) {
 // legacy ATA path's own idle status (DRDY|DSC, no error).
 void ahciInitAbarRegisters(unsigned char *abar) {
     memset(abar, 0, AHCI_BAR_SIZE);
-    *(UINT32 *)(abar + 0x00) = 0x00200001; // CAP: ISS=Gen2, NCS=0(1 slot), NP=0(1 port)
+    // U59: CAP was 0x00200001, which did not match the comment or PI. CAP.NP
+    // (bits 4:0) is 0-BASED, so the 1 in the low bits advertised TWO ports while
+    // PI declared only port 0 -- an inconsistency storahci can see. CAP.NCS
+    // (bits 12:8) is also 0-based and was 0, i.e. a single command slot, which is
+    // legal but unlike any real controller and leaves a driver no room to queue.
+    // Now: ISS=2 (Gen2, bits 23:20), NCS=31 (32 slots), NP=0 (1 port, matching PI).
+    // The command-issue path already scans all 32 PxCI bits, so 32 slots is safe.
+    *(UINT32 *)(abar + 0x00) = 0x00201F00;
     *(UINT32 *)(abar + 0x04) = 0x00000000; // GHC: AE/HR/IE all clear until guest sets them
     *(UINT32 *)(abar + 0x0C) = 0x00000001; // PI: port 0 implemented
     *(UINT32 *)(abar + 0x10) = 0x00010301; // VS: AHCI 1.3.1
@@ -3304,6 +3311,36 @@ void ahciInitAbarRegisters(unsigned char *abar) {
 //
 // Returns 1 if the access was inside the ABAR window and has been fully handled
 // (registers updated, RIP advanced); 0 to let the caller fall through.
+// U59: names for the registers storahci touches, so the trace reads as a protocol
+// conversation rather than raw offsets.
+#define U59_ABAR_LOG_MAX 400
+static int g_ahciMmioLogged = 0;
+static const char *ahciRegName(UINT32 off) {
+    switch (off) {
+        case 0x000: return "CAP";
+        case 0x004: return "GHC";
+        case 0x008: return "IS";
+        case 0x00C: return "PI";
+        case 0x010: return "VS";
+        case 0x024: return "CAP2";
+        case 0x100: return "PxCLB";
+        case 0x104: return "PxCLBU";
+        case 0x108: return "PxFB";
+        case 0x10C: return "PxFBU";
+        case 0x110: return "PxIS";
+        case 0x114: return "PxIE";
+        case 0x118: return "PxCMD";
+        case 0x120: return "PxTFD";
+        case 0x124: return "PxSIG";
+        case 0x128: return "PxSSTS";
+        case 0x12C: return "PxSCTL";
+        case 0x130: return "PxSERR";
+        case 0x134: return "PxSACT";
+        case 0x138: return "PxCI";
+        default:    return "?";
+    }
+}
+
 // Both defined further down with the I/O APIC MMIO emulation; reused here so the
 // two trapped-MMIO devices share one instruction decoder and GPR name table.
 extern WHV_REGISTER_NAME ioapicGprNames[16];
@@ -3338,6 +3375,14 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     unsigned char *ab = (unsigned char *)ahciAbarMemory;
     UINT32 *reg = (UINT32 *)(ab + (off & ~3u));
 
+    // U59: log the driver's register conversation. This is only possible now that
+    // the ABAR is trapped -- while it was passive RAM these accesses were entirely
+    // invisible, which is why the last few units had to infer state from polled
+    // snapshots and got it wrong twice. Gated on the kernel having been discovered
+    // so we see storahci's conversation rather than thousands of firmware accesses,
+    // and capped so it cannot flood.
+    int u59Log = (g_bpModuleBase != 0) && (g_ahciMmioLogged < U59_ABAR_LOG_MAX);
+
     if (isWrite) {
         UINT32 value = immVal;
         if (!isImm) {
@@ -3364,11 +3409,23 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
                 *reg = value;
                 break;
         }
+        if (u59Log) {
+            g_ahciMmioLogged++;
+            printf("[u59] WRITE %-10s (0x%03X) value=0x%08X -> now 0x%08X\n",
+                   ahciRegName(off & ~3u), off & ~3u, value, *reg);
+            fflush(stdout);
+        }
     } else {
         UINT32 value = *reg;
         WHV_REGISTER_VALUE regVal = { 0 };
         regVal.Reg64 = value;
         WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+        if (u59Log) {
+            g_ahciMmioLogged++;
+            printf("[u59] read  %-10s (0x%03X) -> 0x%08X\n",
+                   ahciRegName(off & ~3u), off & ~3u, value);
+            fflush(stdout);
+        }
     }
 
     // As with the IOAPIC path, InstructionLength is not populated for MMIO exits,
