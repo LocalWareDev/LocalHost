@@ -1044,6 +1044,35 @@ int a20RemapCount = 0;
 int memAccessFaultCount = 0;
 int ahciCmdLogCount = 0;
 int g_ahciReads = 0, g_ahciWrites = 0, g_ahciOther = 0; // U55: uncapped per-opcode tallies
+// U60: separate budget for commands issued after the kernel loaded, i.e. Windows'
+// own, which the firmware-dominated log above never had room for.
+#define U60_GUEST_CMD_LOG_MAX 120
+int g_ahciGuestCmdLogged = 0;
+static const char *ataCmdName(unsigned char c) {
+    switch (c) {
+        case 0xEC: return "IDENTIFY DEVICE";
+        case 0xEF: return "SET FEATURES";
+        case 0x20: return "READ SECTORS";
+        case 0x24: return "READ SECTORS EXT";
+        case 0xC8: return "READ DMA";
+        case 0x25: return "READ DMA EXT";
+        case 0x30: return "WRITE SECTORS";
+        case 0x34: return "WRITE SECTORS EXT";
+        case 0xCA: return "WRITE DMA";
+        case 0x35: return "WRITE DMA EXT";
+        case 0xE7: return "FLUSH CACHE";
+        case 0xEA: return "FLUSH CACHE EXT";
+        case 0x00: return "NOP/none";
+        case 0xA0: return "PACKET (ATAPI)";
+        case 0xA1: return "IDENTIFY PACKET DEVICE";
+        case 0x40: return "READ VERIFY SECTORS";
+        case 0x06: return "DATA SET MANAGEMENT (TRIM)";
+        case 0xB0: return "SMART";
+        case 0xE5: return "CHECK POWER MODE";
+        case 0x2F: return "READ LOG EXT";
+        default:   return "?";
+    }
+}
 
 // "etc/ramfb" state (see the fw_cfg section below for how these get
 // populated) -- declared up here, ahead of WndProc, so the paint handler
@@ -4086,6 +4115,18 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
                    ahciCmdLogCount, ataCmd, (unsigned long long)lba, sectorCount, prdtl);
             fflush(stdout);
         }
+        // U60: the log above is capped at 200 and firmware consumes every slot, so
+        // the commands WINDOWS issues have never been visible. Log those separately,
+        // gated on the kernel being loaded, with its own budget. This is the
+        // question U60 exists to answer: storahci issues commands now (U59), so
+        // which ones, and do they complete cleanly?
+        if (g_bpModuleBase && g_ahciGuestCmdLogged < U60_GUEST_CMD_LOG_MAX) {
+            g_ahciGuestCmdLogged++;
+            printf("[u60] guest cmd #%d: ataCmd=0x%02X (%s) lba=%llu count=%u prdtl=%u slot=%d\n",
+                   g_ahciGuestCmdLogged, ataCmd, ataCmdName(ataCmd),
+                   (unsigned long long)lba, sectorCount, prdtl, slot);
+            fflush(stdout);
+        }
     }
 
     if (ataCmd == 0xEC) { // IDENTIFY DEVICE
@@ -4131,6 +4172,16 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
     *(UINT32 *)(cmdHeader + 0x04) = bytesTransferred; // PRDBC: bytes actually transferred
     *(UINT32 *)(port + 0x38) &= ~(1u << slot);         // PxCI: clear -- command complete
     *(UINT32 *)(port + 0x20) = ok ? 0x00000050 : 0x00000451; // PxTFD: DRDY|DSC, or ERR|ABRT
+    // U60: pair each logged guest command with how it actually finished, including
+    // how many bytes we moved versus what the PRDT asked for. A command that
+    // "completes" while transferring the wrong length is exactly the kind of thing
+    // that makes a driver retry forever without ever reporting an error.
+    if (g_bpModuleBase && g_ahciGuestCmdLogged <= U60_GUEST_CMD_LOG_MAX && g_ahciGuestCmdLogged > 0) {
+        printf("[u60]   -> %s bytesTransferred=%u PxTFD=0x%08X PxIS=0x%08X\n",
+               ok ? "OK" : "ERROR(ABRT)", bytesTransferred,
+               *(UINT32 *)(port + 0x20), *(UINT32 *)(port + 0x10));
+        fflush(stdout);
+    }
     // PxIS: DHRS. Left set (not auto-cleared on the next poll) until the
     // next command starts, unlike the earlier "pulse" approach -- ABAR is
     // untrapped guest RAM polled once per host main-loop iteration, which
