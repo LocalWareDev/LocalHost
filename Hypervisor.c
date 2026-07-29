@@ -3716,9 +3716,48 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
         // resulting byte count mismatch, and retried forever.
         *(UINT32 *)(port + 0x10) = 0;
     }
-    if ((cmd & 0x10) && !(cmd & 0x4000)) newCmd |= 0x4000; // FRE -> FR
+    int freJustEnabled = 0;
+    if ((cmd & 0x10) && !(cmd & 0x4000)) { newCmd |= 0x4000; freJustEnabled = 1; } // FRE -> FR
     else if (!(cmd & 0x10) && (cmd & 0x4000)) newCmd &= ~0x4000u; // !FRE -> !FR
     if (newCmd != cmd) { *(UINT32 *)(port + 0x18) = newCmd; cmd = newCmd; }
+
+    // U57: deliver the initial Device-to-Host Register FIS when the driver turns
+    // on FIS reception.
+    //
+    // On real hardware the controller posts a D2H Register FIS into the port's FIS
+    // receive area as soon as FRE is set, carrying the attached device's signature.
+    // That is how a driver learns a device is actually there. We never wrote the
+    // receive area at all, so storahci enabled FRE, set ST, waited for a FIS that
+    // never arrived, timed out, stopped the port and retried -- observed as PxCMD
+    // cycling between 0xC013 (started) and 0x0002 (stopped) with PxCI never once
+    // set, i.e. it never got far enough to issue a single command. EDK2's driver
+    // was unaffected because it polls PxTFD/PxCI directly rather than waiting on
+    // the receive area, which is why firmware disk access always worked.
+    //
+    // Layout: the D2H Register FIS lives at offset 0x40 in the receive area, is 20
+    // bytes, and its sector-count/LBA fields ARE the signature -- count=1, LBA
+    // low=1, mid=0, high=0 gives the 0x00000101 of a non-ATAPI SATA disk, matching
+    // the PxSIG we already report.
+    if (freJustEnabled) {
+        UINT32 fb = *(UINT32 *)(port + 0x08); // PxFB (32-bit; CAP.S64A=0)
+        if (fb != 0 && fb + 0x60 < guestMemSize) {
+            unsigned char *rfis = (unsigned char *)guestMemory + fb + 0x40;
+            memset(rfis, 0, 20);
+            rfis[0] = 0x34;  // FIS type: Register Device to Host
+            rfis[1] = 0x40;  // I bit set -- this FIS raises an interrupt
+            rfis[2] = 0x50;  // Status: DRDY | DSC
+            rfis[3] = 0x00;  // Error: none
+            rfis[4] = 0x01;  // LBA low  -> signature byte
+            rfis[5] = 0x00;  // LBA mid
+            rfis[6] = 0x00;  // LBA high
+            rfis[7] = 0x00;  // Device
+            rfis[12] = 0x01; // Sector count low -> signature byte
+            *(UINT32 *)(port + 0x20) = 0x00000050; // PxTFD reflects the FIS status
+            *(UINT32 *)(port + 0x10) |= 0x1;       // PxIS.DHRS -- D2H FIS received
+            printf("[ahci] posted initial D2H Register FIS to PxFB=0x%X (signature 0x00000101)\n", fb);
+            fflush(stdout);
+        }
+    }
 
     if (!(cmd & 0x1)) return; // ST not set, port not started
     {
