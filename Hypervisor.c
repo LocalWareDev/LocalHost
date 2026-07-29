@@ -1002,6 +1002,7 @@ int a20Enabled = 0;        // matches real hardware's power-on default (off)
 int a20RemapCount = 0;
 int memAccessFaultCount = 0;
 int ahciCmdLogCount = 0;
+int g_ahciReads = 0, g_ahciWrites = 0, g_ahciOther = 0; // U55: uncapped per-opcode tallies
 
 // "etc/ramfb" state (see the fw_cfg section below for how these get
 // populated) -- declared up here, ahead of WndProc, so the paint handler
@@ -3682,7 +3683,16 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
     int ok = 1;
 
     {
+        // U55: per-opcode tallies. The log line below is capped at 200 entries,
+        // which made it look like the guest only ever issued 199 read commands --
+        // the real count is thousands. Count reads and writes separately and
+        // uncapped, because "has the installer written anything to the disk yet"
+        // is the actual question and a truncated log cannot answer it.
+        //   0x20/0x24/0xC8/0x25 = READ variants, 0x30/0x34/0xCA/0x35 = WRITE variants
         ahciCmdLogCount++;
+        if (ataCmd == 0x20 || ataCmd == 0x24 || ataCmd == 0xC8 || ataCmd == 0x25) g_ahciReads++;
+        else if (ataCmd == 0x30 || ataCmd == 0x34 || ataCmd == 0xCA || ataCmd == 0x35) g_ahciWrites++;
+        else g_ahciOther++;
         if (ahciCmdLogCount < 200) {
             printf("[ahci] cmd #%d: ataCmd=0x%02X lba=%llu count=%u prdtl=%u\n",
                    ahciCmdLogCount, ataCmd, (unsigned long long)lba, sectorCount, prdtl);
@@ -6783,6 +6793,15 @@ int main(int argc, char *argv[]) {
             if (g_bpModuleBase && hbRip > g_bpModuleBase && hbRip - g_bpModuleBase < 0x2000000ULL)
                 printf("[heartbeat]   ntoskrnl+0x%llX  (resolve: tools/pdbsym.py near <rva>)\n",
                        (unsigned long long)(hbRip - g_bpModuleBase));
+            // U55: real running totals, not log-capped counts. Three separate
+            // conclusions in this investigation were drawn from truncated logs and
+            // had to be retracted -- the IOAPIC "260 vs 560 ops" (U42_LOG_PER_PASS
+            // cap), "no PCI access after discovery" (pciConfigAccessLogCount <= 300)
+            // and "AHCI stops after 199 commands" (ahciCmdLogCount < 200). The
+            // counters themselves are uncapped, so print those instead of inferring
+            // activity from how many lines happened to be logged.
+            printf("[heartbeat]   totals: pciCfgAccesses=%d ahciCmds=%d (reads=%d writes=%d other=%d)\n",
+                   pciConfigAccessLogCount, ahciCmdLogCount, g_ahciReads, g_ahciWrites, g_ahciOther);
             fflush(stdout);
         }
 
