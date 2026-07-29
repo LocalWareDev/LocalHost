@@ -829,9 +829,18 @@ static void u47ResetLapic(WHV_PARTITION_HANDLE partition) {
 // really there: our DSDT carries OEM ID "LCLHST", so it is unambiguous.
 // One-shot, bounded, and only a host-side memory scan (ACPI tables live in guest
 // physical RAM, so no page-table walk is needed).
+// U53: OFF by default. This scan walks all 3GB of guest RAM once per signature
+// plus another full pass for the XSDT walk -- billions of iterations -- and it
+// runs on the main loop, so the vCPU is not executing while it works. Measured
+// cost: a ~26 second freeze at module discovery, which the watchdog then reported
+// as a guest STALL (RIP and exitCount both frozen at 126854) and which I very
+// nearly mistook for a guest hang. Same lesson as the DR3 breakpoint in U40: an
+// instrument that perturbs the thing it measures. Set to 1 only when the ACPI
+// table layout in guest memory is actually in question.
+#define U53_SCAN_ACPI_TABLES 0
 static void u49VerifyAcpiTables(unsigned char *mem, SIZE_T memSize) {
     static int done = 0;
-    if (done || !mem) return;
+    if (done || !mem || !U53_SCAN_ACPI_TABLES) return;
     done = 1;
     const char *sigs[] = { "DSDT", "FACP", "APIC", "XSDT", "DBG2" };
     int si;
@@ -897,6 +906,40 @@ static void u49VerifyAcpiTables(unsigned char *mem, SIZE_T memSize) {
 
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
+int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outVector);
+
+// U53: route a device interrupt through the guest's own I/O APIC programming.
+//
+// Every device IRQ in this file used to be injected as a HARDCODED legacy PIC
+// vector -- AHCI/ATA 0x76, NIC 0x73, keyboard 0x09, mouse 0x74 -- straight into
+// the vCPU, ignoring the redirection tables entirely. Only the RTC ever consulted
+// ioapicResolveVector. Measured consequence: once Windows switches to APIC mode it
+// programs its own vectors into the I/O APIC (observed live: entry 8 -> 0xD1,
+// entry 9 -> 0xB0, both unmasked) and registers its ISRs for those vectors, so an
+// AHCI completion injected as 0x76 lands on a vector nothing is listening to. The
+// storage driver never sees its completion, the guest goes idle waiting, and no
+// disk write ever happens -- matching the observed ~64 exits/sec idle that tracks
+// the RTC tick rate exactly.
+//
+// ioapicResolveVector keeps this backward compatible: while an entry is still at
+// its power-on default it returns the legacy vector (so firmware/bootloader keeps
+// working exactly as before), and once the guest programs the entry we deliver the
+// vector the guest actually asked for. A masked entry means the guest does not
+// want the interrupt, so it is dropped rather than forced through.
+static int injectDeviceIrq(WHV_PARTITION_HANDLE partition, int gsi, unsigned char legacyVector) {
+    unsigned char vec;
+    if (!ioapicResolveVector(gsi, legacyVector, &vec)) return 0; // masked by the guest
+    injectInterrupt(partition, vec);
+    return 1;
+}
+
+// GSIs for the devices we emulate. The PCI ones match the _PRT in acpi/dsdt.asl
+// (device 2 = AHCI -> GSI 16, device 3 = NIC -> GSI 17); the ISA ones are their
+// classic IRQ numbers.
+#define GSI_KEYBOARD 1
+#define GSI_MOUSE    12
+#define GSI_AHCI     16
+#define GSI_NIC      17
 
 // WHV rejects injecting a pending interruption while the guest has
 // interrupts masked (EFLAGS.IF=0) -- that produces an
@@ -908,7 +951,7 @@ int pendingAtaIrq = 0;
 
 void ataMaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
     if (guestInterruptsEnabled(partition)) {
-        injectInterrupt(partition, 0x76);
+        injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: was hardcoded 0x76
     } else {
         pendingAtaIrq = 1;
     }
@@ -916,7 +959,7 @@ void ataMaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
 
 void deliverPendingAtaIrq(WHV_PARTITION_HANDLE partition) {
     if (pendingAtaIrq && guestInterruptsEnabled(partition)) {
-        injectInterrupt(partition, 0x76);
+        injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: routed, was hardcoded 0x76
         pendingAtaIrq = 0;
     }
 }
@@ -2339,7 +2382,7 @@ void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
     UINT16 imr = *(UINT16 *)&rtl8139Regs[0x3C];
     if ((isr & imr) == 0) return; // nothing enabled is actually pending
     if (guestInterruptsEnabled(partition)) {
-        injectInterrupt(partition, 0x73);
+        injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: routed, was hardcoded 0x73
     } else {
         pendingRtl8139Irq = 1;
     }
@@ -2347,7 +2390,7 @@ void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
 
 void deliverPendingRtl8139Irq(WHV_PARTITION_HANDLE partition) {
     if (pendingRtl8139Irq && guestInterruptsEnabled(partition)) {
-        injectInterrupt(partition, 0x73);
+        injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: routed, was hardcoded 0x73
         pendingRtl8139Irq = 0;
     }
 }
@@ -6661,7 +6704,7 @@ int main(int argc, char *argv[]) {
             int injected = 0;
 
             if (pendingAtaIrq) {
-                injectInterrupt(partition, 0x76); // IRQ14 - primary ATA
+                injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: IRQ14/AHCI, routed
                 pendingAtaIrq = 0;
                 injected = 1;
             } else if (deliverRtcPeriodicIrq(partition)) {
@@ -6670,7 +6713,7 @@ int main(int argc, char *argv[]) {
                 // test actually waits for.
                 injected = 1;
             } else if (kbHasData()) {
-                injectInterrupt(partition, 0x09); // IRQ1 - keyboard
+                injectDeviceIrq(partition, GSI_KEYBOARD, 0x09); // U53: IRQ1 keyboard, routed
                 injected = 1;
             } else if (auxHasData()) {
                 // IRQ12 - PS/2 mouse (slave PIC IRQ4 -> legacy remap vector
@@ -6678,7 +6721,7 @@ int main(int argc, char *argv[]) {
                 // sources above, so a multi-byte mouse packet naturally gets
                 // one interrupt per byte, matching real i8042 hardware,
                 // without any extra packet-boundary bookkeeping here.
-                injectInterrupt(partition, 0x74);
+                injectDeviceIrq(partition, GSI_MOUSE, 0x74); // U53: IRQ12 mouse, routed
                 injected = 1;
             } else if (pendingRtl8139Irq) {
                 // IRQ11 - RTL8139 NIC. Needed here (not just the outer
@@ -6687,7 +6730,7 @@ int main(int argc, char *argv[]) {
                 // whole point of interrupt-driven RX -- actually wakes it,
                 // the same reason kbHasData/auxHasData are checked here
                 // rather than only after the loop exits.
-                injectInterrupt(partition, 0x73);
+                injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: NIC, routed
                 pendingRtl8139Irq = 0;
                 injected = 1;
             } else {
