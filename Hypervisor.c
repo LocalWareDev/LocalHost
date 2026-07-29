@@ -1,4 +1,4 @@
-// Known limitations and the backend roadmap are tracked in docs/
+﻿// Known limitations and the backend roadmap are tracked in docs/
 // (docs/known-limitations.md, docs/roadmap.md). In particular, real Windows
 // guests currently bugcheck 0x5C during HAL timer init -- see
 // docs/investigations/vppt-synic-blocker.md for the full investigation
@@ -4495,7 +4495,17 @@ void acpiBuildTables(void) {
     // inconsistent pair: it has none of the X_* 64-bit extended address fields a
     // 64-bit OS expects to find. Now revision 3 / 244 bytes with those fields.
     acpiPutHeader(acpiTables, FADT_BLOB_OFFSET, "FACP", FADT_LENGTH, 3);
+    // U52: bisect switch. Timeline from the evidence logs -- U49 (real DSDT) and
+    // U51 (ACPI 2.0 FADT) both sailed past exitCount 126854 and bugchecked 0xA5
+    // later (at 179759 and 163879); U51b, which only added the FACS, stalls AT
+    // 126854 in HalpApicInitializeIoUnit. That points at the FACS, so make it
+    // switchable to confirm rather than assume.
+#define U52_PUBLISH_FACS 1
+#if U52_PUBLISH_FACS
     acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 36, FACS_BLOB_OFFSET); // FIRMWARE_CTRL -> FACS (patched to absolute)
+#else
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 36, 0);                // FIRMWARE_CTRL absent (bisect)
+#endif
     acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 40, DSDT_BLOB_OFFSET); // DSDT (32-bit, patched to absolute)
     acpiTables[FADT_BLOB_OFFSET + 45] = 0;              // Preferred_PM_Profile (0 = unspecified)
     acpiPutU16(acpiTables, FADT_BLOB_OFFSET + 46, 9);   // SCI_INT
@@ -4535,7 +4545,7 @@ void acpiBuildTables(void) {
     // DSDT offset and patched to an absolute 64-bit address by the table loader,
     // exactly like the 32-bit DSDT field above.
     {
-        UINT64 xfacs = FACS_BLOB_OFFSET, xdsdt = DSDT_BLOB_OFFSET;
+        UINT64 xfacs = U52_PUBLISH_FACS ? FACS_BLOB_OFFSET : 0, xdsdt = DSDT_BLOB_OFFSET;
         memcpy(acpiTables + FADT_BLOB_OFFSET + 132, &xfacs, 8);    // X_FIRMWARE_CTRL -> FACS
         memcpy(acpiTables + FADT_BLOB_OFFSET + 140, &xdsdt, 8);    // X_DSDT
     }
@@ -4759,8 +4769,13 @@ void acpiBuildLoaderScript(void) {
     // U51b: FADT.FIRMWARE_CTRL (32-bit) and FADT.X_FIRMWARE_CTRL (64-bit), both
     // pointing at the new FACS and both needing the same blob-relative-to-absolute
     // patch as the DSDT pointers above.
+    // Gated with the FACS itself: ADD_POINTER adds the blob's base address to the
+    // field, so patching a deliberately-zero FIRMWARE_CTRL would turn it into a
+    // bogus non-null pointer rather than leaving it absent.
+#if U52_PUBLISH_FACS
     acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 36, 4); c += ACPI_LOADER_CMD_SIZE;
     acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 132, 8); c += ACPI_LOADER_CMD_SIZE;
+#endif
 
     acpiLoaderAddChecksum(c, "etc/acpi/tables", 9, 0, 60); c += ACPI_LOADER_CMD_SIZE;           // XSDT
     acpiLoaderAddChecksum(c, "etc/acpi/tables", FADT_BLOB_OFFSET + 9, FADT_BLOB_OFFSET, FADT_LENGTH); c += ACPI_LOADER_CMD_SIZE;    // FADT (U51: ACPI 2.0+, moved past the DSDT)
