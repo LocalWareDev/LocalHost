@@ -965,6 +965,12 @@ int pendingAtaIrq = 0;
 // its ISR is not flooded. Also maintains the global IS port bit, which the driver
 // reads to find which port raised the interrupt.
 extern void *ahciAbarMemory; // defined with the rest of the AHCI BAR5 state below
+// U61: interrupt-handshake tracing -- injections we make vs acknowledgements the
+// driver writes back. Declared here because ahciServiceLevelInterrupt below is the
+// first user; ahciHandleAbarMmio (further down) logs the acknowledgement side.
+#define U61_IRQ_LOG_MAX 40
+int g_ahciIrqLogged = 0, g_ahciAckLogged = 0;
+long g_ahciIrqCount = 0; // U61: uncapped injection count, reported in the heartbeat
 static long g_ahciLastIrqExit = 0;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
     if (!ahciAbarMemory) return;
@@ -987,6 +993,17 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     if (exitCount - g_ahciLastIrqExit < 500) return; // throttle re-assertion
     if (!guestInterruptsEnabled(partition)) return;
     g_ahciLastIrqExit = exitCount;
+    // U61: Windows issues exactly 12 commands and stops, leaving PxIS=0x1 set with
+    // PxCI=0 -- a completion interrupt that looks unacknowledged. Log the handshake
+    // so we can tell whether we are failing to deliver, or delivering and the
+    // driver is declining to acknowledge. Bounded; only after the kernel loads.
+    g_ahciIrqCount++; // uncapped -- the log below is capped and has misled me before
+    if (g_bpModuleBase && g_ahciIrqLogged < U61_IRQ_LOG_MAX) {
+        g_ahciIrqLogged++;
+        printf("[u61] inject #%d: PxIS=0x%08X PxIE=0x%08X IS=0x%08X GHC=0x%08X exit=%ld\n",
+               g_ahciIrqLogged, pxis, pxie, *(UINT32 *)(ab + 0x08), ghc, exitCount);
+        fflush(stdout);
+    }
     injectDeviceIrq(partition, GSI_AHCI, 0x76);
 }
 
@@ -3522,8 +3539,35 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
             case 0x08:                                             /* global IS */
             case 0x110:                                            /* PxIS */
             case 0x130:                                            /* PxSERR */
+                // U61: the driver acknowledging an interrupt. Visible only because
+                // U58 trapped the ABAR -- as passive RAM these writes could not be
+                // seen at all, which is what made the U56/U57 handshake guesswork.
+                if (g_bpModuleBase && g_ahciAckLogged < U61_IRQ_LOG_MAX &&
+                    (aligned == 0x110 || aligned == 0x08)) {
+                    g_ahciAckLogged++;
+                    printf("[u61] ACK  #%d: %s write=0x%08X  0x%08X -> 0x%08X\n",
+                           g_ahciAckLogged, ahciRegName(aligned), value, *reg, *reg & ~value);
+                    fflush(stdout);
+                }
                 *reg &= ~value;
                 break;
+            // U61: PxCMD mixes driver-writable control bits with device-owned
+            // read-only status. CR (bit 15, command list running), FR (bit 14, FIS
+            // receive running) and CCS (bits 12:8, current command slot) are status
+            // the device sets -- a driver write must not disturb them.
+            //
+            // Missing this in U58 caused a self-sustaining interrupt loop: the
+            // driver would write PxCMD (with FR reading back as 0 in its copy), we
+            // stored that verbatim and cleared FR, the engine then saw "FRE set but
+            // FR clear", treated it as a fresh FRE enable, re-posted the U57 initial
+            // D2H FIS and re-set PxIS.DHRS. The driver acknowledged correctly every
+            // time (visible in the trace) and we immediately re-raised it, ~500
+            // exits apart, forever. Preserve the read-only bits instead.
+            case 0x118: {                                          /* PxCMD */
+                const UINT32 roMask = 0x0000DF00u;                 /* CR | FR | CCS */
+                *reg = (*reg & roMask) | (value & ~roMask);
+                break;
+            }
             default:
                 *reg = value;
                 break;
@@ -7257,6 +7301,7 @@ int main(int argc, char *argv[]) {
                 unsigned char *ab = (unsigned char *)ahciAbarMemory;
                 UINT32 ghc = *(UINT32 *)(ab + 0x04), pi = *(UINT32 *)(ab + 0x0C);
                 unsigned char *pt = ab + 0x100;
+                printf("[heartbeat]   ahci irq injections (uncapped)=%ld\n", g_ahciIrqCount);
                 printf("[heartbeat]   ahci: GHC=0x%08X (AE=%u IE=%u) PI=0x%X | PxCMD=0x%08X (ST=%u FRE=%u) PxIE=0x%08X PxIS=0x%08X PxCI=0x%08X PxTFD=0x%08X PxSSTS=0x%08X\n",
                        ghc, (ghc >> 31) & 1, (ghc >> 1) & 1, pi,
                        *(UINT32 *)(pt + 0x18), *(UINT32 *)(pt + 0x18) & 1, (*(UINT32 *)(pt + 0x18) >> 4) & 1,
