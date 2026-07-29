@@ -2089,6 +2089,13 @@ void auxHandleCommand(unsigned char val) {
 // separately from auxHandleCommand's protocol/command-response state above.
 int auxLastCursorX = 0, auxLastCursorY = 0;
 int auxCursorPosKnown = 0;
+// Whether TrackMouseEvent is currently armed for WM_MOUSELEAVE. Windows disarms
+// tracking automatically once it fires, so this is re-armed on the next move.
+int auxMouseTracking = 0;
+// Set once RegisterRawInputDevices succeeds. When it does, WM_INPUT owns movement
+// (raw, unaccelerated deltas); if registration ever fails we fall back to deriving
+// deltas from WM_MOUSEMOVE's cooked coordinates rather than losing the mouse.
+int g_rawMouseAvailable = 0;
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
 // Builds and enqueues one standard 3-byte PS/2 packet (status, dx, dy) if
@@ -2207,10 +2214,65 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (sc != 0) kbEnqueue(sc | 0x80);
             return 0;
         }
+        // Raw device motion, used INSTEAD of WM_MOUSEMOVE deltas for movement.
+        //
+        // WM_MOUSEMOVE reports cooked coordinates: Windows has already applied the
+        // host's pointer acceleration ("Enhance pointer precision"), the pointer
+        // speed slider and DPI scaling before we see them. Feeding those to the
+        // guest means the guest's own acceleration is applied on top of the host's,
+        // so the pointer inherits the host mouse's feel instead of behaving like a
+        // real device attached to the guest. Raw Input gives the unfiltered
+        // per-device deltas the hardware actually reported, which is what a real
+        // PS/2 mouse would deliver.
+        //
+        // Still gated on the pointer being over the window (auxCursorPosKnown,
+        // maintained by WM_MOUSEMOVE/WM_MOUSELEAVE below) so hover semantics are
+        // preserved -- raw input is registered with RIDEV_INPUTSINK, which would
+        // otherwise deliver motion even while the window is unfocused.
+        case WM_INPUT: {
+            UINT size = 0;
+            if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER)) == 0 &&
+                size > 0 && size <= sizeof(RAWINPUT)) {
+                RAWINPUT ri;
+                if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) == size &&
+                    ri.header.dwType == RIM_TYPEMOUSE) {
+                    // MOUSE_MOVE_ABSOLUTE means a tablet/remote-desktop style
+                    // device reporting screen coordinates; only relative motion is
+                    // meaningful for a PS/2 mouse.
+                    if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && auxCursorPosKnown) {
+                        int dx = ri.data.mouse.lLastX;
+                        int dy = ri.data.mouse.lLastY;
+                        if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
+                    }
+                }
+            }
+            return DefWindowProc(hwnd, msg, wParam, lParam); // required for WM_INPUT cleanup
+        }
         case WM_MOUSEMOVE: {
             int x = (int)(short)LOWORD(lParam);
             int y = (int)(short)HIWORD(lParam);
-            if (auxCursorPosKnown) {
+            // Ask for WM_MOUSELEAVE once per hover. Windows does not send it
+            // unless tracking is armed, and it disarms itself after firing, so
+            // this is re-armed on each re-entry.
+            if (!auxMouseTracking) {
+                TRACKMOUSEEVENT tme;
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                tme.dwHoverTime = 0;
+                if (TrackMouseEvent(&tme)) auxMouseTracking = 1;
+            }
+            // Movement itself is NOT emitted here any more -- WM_INPUT above owns
+            // that, using raw unaccelerated deltas. This handler now exists only to
+            // know whether the pointer is over the window (which gates raw input)
+            // and to arm leave-tracking. Emitting from both would double-count
+            // every motion.
+            //
+            // The out-and-back jump this originally fixed is still handled: leaving
+            // clears auxCursorPosKnown, so raw motion is ignored until the pointer
+            // is back over the window. PS/2 is a relative device -- it can only say
+            // "moved by this much", never "the pointer is now here".
+            if (!g_rawMouseAvailable && auxCursorPosKnown) { // fallback only
                 int dx = x - auxLastCursorX;
                 int dy = y - auxLastCursorY;
                 if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
@@ -2218,6 +2280,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             auxLastCursorX = x;
             auxLastCursorY = y;
             auxCursorPosKnown = 1;
+            return 0;
+        }
+        case WM_MOUSELEAVE: {
+            // Pointer left the window. Drop the reference point so the next entry
+            // re-seeds instead of synthesising a jump, and re-arm tracking.
+            auxCursorPosKnown = 0;
+            auxMouseTracking = 0;
             return 0;
         }
         case WM_LBUTTONDOWN: { auxButtonMask |= 0x01; auxSendPacket(0, 0); return 0; }
@@ -2299,6 +2368,27 @@ static DWORD WINAPI windowThreadProc(LPVOID param) {
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                             740, 480, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(g_hwnd, SW_SHOW);
+
+    // Raw Input for the mouse, so the guest receives unaccelerated device deltas
+    // rather than host-cooked coordinates (see the WM_INPUT handler for why).
+    // Usage page 0x01 / usage 0x02 is the generic-desktop mouse. RIDEV_INPUTSINK
+    // delivers even when unfocused, which is what makes plain hover work; the
+    // handler itself gates on the pointer actually being over the window.
+    {
+        RAWINPUTDEVICE rid;
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x02;
+        rid.dwFlags = RIDEV_INPUTSINK;
+        rid.hwndTarget = g_hwnd;
+        if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+            printf("[window] RegisterRawInputDevices failed (%lu) -- mouse will fall back to cooked coordinates\n",
+                   (unsigned long)GetLastError());
+            fflush(stdout);
+            g_rawMouseAvailable = 0;
+        } else {
+            g_rawMouseAvailable = 1;
+        }
+    }
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -7141,6 +7231,19 @@ int main(int argc, char *argv[]) {
 
         deliverPendingAtaIrq(partition);
         deliverPendingRtl8139Irq(partition);
+        // REVERTED: delivering PS/2 keyboard/mouse bytes from here (in addition to
+        // the halted-CPU wait branch) looked like the fix for hover feeling
+        // stuttery while the guest is busy, but it re-injects on EVERY loop
+        // iteration for as long as the queue is non-empty, with none of the
+        // natural throttling the halted branch gets. Measured: boot wedged in
+        // firmware at exitCount ~25000 (against 20905 PCI config accesses and 4014
+        // AHCI commands on the same build without it) -- the firmware was being
+        // flooded with interrupts it could not drain.
+        //
+        // If the stutter is worth fixing later it needs a rate limit and an
+        // acknowledgement model (inject, then wait for the guest to actually read
+        // port 0x60 before injecting again), not an unconditional per-iteration
+        // injection.
         // RTC/PIT periodic-interrupt delivery deliberately NOT called here
         // unconditionally (2026-07-17, post-reboot #GP investigation --
         // see docs/investigations/post-vppt-boot-stall.md). Calling these
