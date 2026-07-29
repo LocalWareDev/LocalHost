@@ -3284,6 +3284,102 @@ void ahciInitAbarRegisters(unsigned char *abar) {
     *(UINT32 *)(port + 0x28) = 0x00000123; // PxSSTS: DET=3(present), SPD=2(3Gbps), IPM=1(active)
 }
 
+// U58: trap the ABAR as real MMIO instead of leaving it as plain guest RAM.
+//
+// WHY. Several AHCI registers are write-1-to-clear (RW1C): the global IS, the
+// per-port PxIS, and PxSERR. With the ABAR mapped as ordinary RAM a guest write
+// of 1 simply STORES 1, so an acknowledged interrupt status bit never clears.
+// EDK2 tolerated that because it polls PxCI/PxTFD and issues commands, and the
+// engine cleared stale bits at each command boundary. storahci is interrupt
+// driven: its ISR reads PxIS, writes the same value back to acknowledge, and
+// expects the bit to drop. It never did, so with the U56 level-triggered
+// injection the controller kept re-asserting an interrupt the driver had already
+// acknowledged, and the port never advanced to issuing a command -- exactly the
+// observed PxIS stuck at 1 with PxCI never set.
+//
+// Trapping lets the register file behave like hardware: RW1C bits clear on write,
+// read-only bits ignore writes, and everything else stores normally. The command
+// list and FIS receive areas live in ordinary guest RAM, not here, so only
+// register accesses trap -- a small, bounded volume.
+//
+// Returns 1 if the access was inside the ABAR window and has been fully handled
+// (registers updated, RIP advanced); 0 to let the caller fall through.
+// Both defined further down with the I/O APIC MMIO emulation; reused here so the
+// two trapped-MMIO devices share one instruction decoder and GPR name table.
+extern WHV_REGISTER_NAME ioapicGprNames[16];
+int ioapicDecodeMmio(unsigned char *insn, int len, int *isWrite, int *isImm,
+                     int *regNum, UINT32 *immVal, int *totalLen);
+
+int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    UINT64 gpa = exitContext->MemoryAccess.Gpa;
+    if (!ahciAbarMapped || !ahciAbarMemory) return 0;
+    if (gpa < ahciAbarBase || gpa >= (UINT64)ahciAbarBase + AHCI_BAR_SIZE) return 0;
+    UINT32 off = (UINT32)(gpa - ahciAbarBase);
+
+    int isWrite = 0, isImm = 0, regNum = 0, insnTotalLen = 0;
+    UINT32 immVal = 0;
+    if (!ioapicDecodeMmio(exitContext->MemoryAccess.InstructionBytes,
+                          exitContext->MemoryAccess.InstructionByteCount,
+                          &isWrite, &isImm, &regNum, &immVal, &insnTotalLen)) {
+        static int failLog = 0;
+        if (failLog++ < 20) {
+            printf("[ahci-mmio] undecodable instruction at rip=0x%llX off=0x%X (%d bytes):",
+                   (unsigned long long)exitContext->VpContext.Rip, off,
+                   exitContext->MemoryAccess.InstructionByteCount);
+            int bi;
+            for (bi = 0; bi < exitContext->MemoryAccess.InstructionByteCount; bi++)
+                printf(" %02X", exitContext->MemoryAccess.InstructionBytes[bi]);
+            printf("\n");
+            fflush(stdout);
+        }
+        return 0; // let the generic handler deal with it rather than corrupting state
+    }
+
+    unsigned char *ab = (unsigned char *)ahciAbarMemory;
+    UINT32 *reg = (UINT32 *)(ab + (off & ~3u));
+
+    if (isWrite) {
+        UINT32 value = immVal;
+        if (!isImm) {
+            WHV_REGISTER_VALUE regVal = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+            value = (UINT32)regVal.Reg64;
+        }
+        UINT32 aligned = off & ~3u;
+        switch (aligned) {
+            // Read-only: capabilities, version, ports-implemented, and the port
+            // status registers the device owns. Writes are silently dropped, as
+            // hardware does.
+            case 0x00: case 0x0C: case 0x10: case 0x24:            /* CAP, PI, VS, CAP2 */
+            case 0x120: case 0x124: case 0x128: case 0x12C:        /* PxTFD, PxSIG, PxSSTS, PxSCTL(partially) */
+                break;
+            // Write-1-to-clear. This is the whole point of trapping: a written 1
+            // CLEARS the corresponding bit rather than setting it.
+            case 0x08:                                             /* global IS */
+            case 0x110:                                            /* PxIS */
+            case 0x130:                                            /* PxSERR */
+                *reg &= ~value;
+                break;
+            default:
+                *reg = value;
+                break;
+        }
+    } else {
+        UINT32 value = *reg;
+        WHV_REGISTER_VALUE regVal = { 0 };
+        regVal.Reg64 = value;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+    }
+
+    // As with the IOAPIC path, InstructionLength is not populated for MMIO exits,
+    // so advance RIP by the length our own decode determined.
+    WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+    WHV_REGISTER_VALUE ripVal = { 0 };
+    ripVal.Reg64 = exitContext->VpContext.Rip + (UINT64)insnTotalLen;
+    WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &ripVal);
+    return 1;
+}
+
 // Implements the real PCI BAR-sizing protocol for BAR5 (offset 0x24) --
 // write 0xFFFFFFFF to probe the size (read back a size mask), write a real
 // aligned address to program it. On the first real address write, lazily
@@ -3315,6 +3411,21 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
                         // this map silently fails at that GPA. Log the result to
                         // confirm/deny. No behavioral change (still sets the flag
                         // and prints as before) -- purely adds the HRESULT to the log.
+                        // U58: deliberately NOT mapped into the guest any more.
+                        // Leaving the GPA unmapped makes every register access
+                        // fault out to ahciHandleAbarMmio, which is what lets
+                        // write-1-to-clear and read-only semantics behave like
+                        // hardware. Mapping it as RAM is what left PxIS stuck set
+                        // after storahci acknowledged an interrupt. The buffer
+                        // stays as our backing store; only the guest mapping goes.
+                        // Set U58_TRAP_ABAR to 0 to restore the old RAM mapping.
+#define U58_TRAP_ABAR 1
+#if U58_TRAP_ABAR
+                        ahciAbarMapped = 1;
+                        printf("[ahci] ABAR at 0x%X -- trapped MMIO (unmapped, decoded per access)\n",
+                               ahciAbarBase);
+                        fflush(stdout);
+#else
                         HRESULT abarMapHr = WHvMapGpaRange(partition, ahciAbarMemory, ahciAbarBase, AHCI_BAR_SIZE,
                                        WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite);
                         ahciAbarMapped = 1;
@@ -3322,6 +3433,7 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
                                ahciAbarBase, (unsigned long)abarMapHr,
                                SUCCEEDED(abarMapHr) ? "OK" : "FAILED");
                         fflush(stdout);
+#endif
                     }
                 }
             }
@@ -7957,6 +8069,9 @@ int main(int argc, char *argv[]) {
                     logBpEvent("memaccess gpa=0x%llX", (unsigned long long)exitContext.MemoryAccess.Gpa);
                 }
                 if (ioapicHandleMmioAccess(partition, &exitContext)) {
+                    break;
+                }
+                if (ahciHandleAbarMmio(partition, &exitContext)) { // U58: trapped ABAR
                     break;
                 }
                 UINT64 faultAddr = exitContext.MemoryAccess.Gpa;
