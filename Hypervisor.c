@@ -6765,8 +6765,24 @@ int main(int argc, char *argv[]) {
             QueryPerformanceCounter(&nowTick);
             if (startTick.QuadPart == 0) startTick = nowTick;
             double elapsedSec = (double)(nowTick.QuadPart - startTick.QuadPart) / perfFrequency.QuadPart;
-            printf("[heartbeat: exitCount=%ld elapsedSec=%.1f lastPort=0x%X write=%d val=0x%X]\n",
-                   exitCount, elapsedSec, debugLastPort, debugLastWrite, debugLastVal);
+            // U54: carry RIP (and its module-relative RVA) plus the exit reason.
+            // The guest now idles at ~64 exits/sec without ever stalling long
+            // enough for the watchdog, and the U40 sampler only sees exit-causing
+            // instructions -- so neither instrument answers "where is it?". The
+            // heartbeat fires rarely enough that a register read here is free.
+            WHV_REGISTER_NAME hbNames[2] = { WHvX64RegisterRip, WHvX64RegisterCr8 };
+            WHV_REGISTER_VALUE hbVals[2] = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, hbNames, 2, hbVals);
+            UINT64 hbRip = hbVals[0].Reg64;
+            printf("[heartbeat: exitCount=%ld elapsedSec=%.1f lastPort=0x%X write=%d val=0x%X rip=0x%llX%s irql=%llu]\n",
+                   exitCount, elapsedSec, debugLastPort, debugLastWrite, debugLastVal,
+                   (unsigned long long)hbRip,
+                   (g_bpModuleBase && hbRip > g_bpModuleBase && hbRip - g_bpModuleBase < 0x2000000ULL)
+                       ? "" : " (not in ntoskrnl)",
+                   (unsigned long long)hbVals[1].Reg64);
+            if (g_bpModuleBase && hbRip > g_bpModuleBase && hbRip - g_bpModuleBase < 0x2000000ULL)
+                printf("[heartbeat]   ntoskrnl+0x%llX  (resolve: tools/pdbsym.py near <rva>)\n",
+                       (unsigned long long)(hbRip - g_bpModuleBase));
             fflush(stdout);
         }
 
