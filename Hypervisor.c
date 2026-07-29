@@ -1061,6 +1061,7 @@ int a20RemapCount = 0;
 int memAccessFaultCount = 0;
 int ahciCmdLogCount = 0;
 int g_ahciReads = 0, g_ahciWrites = 0, g_ahciOther = 0; // U55: uncapped per-opcode tallies
+long g_ahciFwSectors = 0, g_ahciGuestSectors = 0; // U62: sectors moved, firmware vs guest
 // U60: separate budget for commands issued after the kernel loaded, i.e. Windows'
 // own, which the firmware-dominated log above never had room for.
 #define U60_GUEST_CMD_LOG_MAX 120
@@ -4151,6 +4152,13 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
         // is the actual question and a truncated log cannot answer it.
         //   0x20/0x24/0xC8/0x25 = READ variants, 0x30/0x34/0xCA/0x35 = WRITE variants
         ahciCmdLogCount++;
+        // U62: total sectors moved, split by who issued the command. Windows only
+        // issues ~21 commands before going idle, which is suspiciously small -- the
+        // installer's boot.wim alone is hundreds of MB -- so knowing whether the
+        // guest has read 2MB or 400MB says whether it finished loading and stopped,
+        // or never got the bulk of its image at all.
+        if (g_bpModuleBase) g_ahciGuestSectors += sectorCount;
+        else                g_ahciFwSectors += sectorCount;
         if (ataCmd == 0x20 || ataCmd == 0x24 || ataCmd == 0xC8 || ataCmd == 0x25) g_ahciReads++;
         else if (ataCmd == 0x30 || ataCmd == 0x34 || ataCmd == 0xCA || ataCmd == 0x35) g_ahciWrites++;
         else g_ahciOther++;
@@ -7301,7 +7309,36 @@ int main(int argc, char *argv[]) {
                 unsigned char *ab = (unsigned char *)ahciAbarMemory;
                 UINT32 ghc = *(UINT32 *)(ab + 0x04), pi = *(UINT32 *)(ab + 0x0C);
                 unsigned char *pt = ab + 0x100;
-                printf("[heartbeat]   ahci irq injections (uncapped)=%ld\n", g_ahciIrqCount);
+            // U62: is the guest actually PAINTING? WinPE runs from a RAM disk (the
+            // firmware loaded 437MB of boot.wim), so little disk I/O afterwards is
+            // normal and the absence of writes proves nothing. What matters is
+            // whether Setup is drawing. Checksum a sample of the framebuffer and
+            // report whether it changes between heartbeats: changing means the guest
+            // is rendering and our display path is the problem; static means it is
+            // genuinely stuck before Setup's UI.
+            if (ramfbConfigWritten && ramfbAddress && guestMemory &&
+                ramfbAddress + (UINT64)ramfbStride * ramfbHeight <= guestMemSize) {
+                static UINT32 lastFbSum = 0;
+                static int fbSumSeen = 0;
+                const unsigned char *fb = (const unsigned char *)guestMemory + ramfbAddress;
+                UINT64 total = (UINT64)ramfbStride * ramfbHeight;
+                UINT32 sum = 0, nonZero = 0;
+                UINT64 k;
+                for (k = 0; k < total; k += 997) { // prime stride: cheap, spreads the sample
+                    sum = sum * 31u + fb[k];
+                    if (fb[k]) nonZero++;
+                }
+                printf("[heartbeat]   framebuffer: sum=0x%08X %s nonZeroSamples=%u/%llu\n",
+                       sum,
+                       !fbSumSeen ? "(first sample)" : (sum != lastFbSum ? "CHANGED -- guest is painting" : "unchanged"),
+                       nonZero, (unsigned long long)(total / 997));
+                lastFbSum = sum;
+                fbSumSeen = 1;
+            }
+                printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)\n",
+                       g_ahciIrqCount,
+                       g_ahciFwSectors, (g_ahciFwSectors * 512) / (1024 * 1024),
+                       g_ahciGuestSectors, (g_ahciGuestSectors * 512) / (1024 * 1024));
                 printf("[heartbeat]   ahci: GHC=0x%08X (AE=%u IE=%u) PI=0x%X | PxCMD=0x%08X (ST=%u FRE=%u) PxIE=0x%08X PxIS=0x%08X PxCI=0x%08X PxTFD=0x%08X PxSSTS=0x%08X\n",
                        ghc, (ghc >> 31) & 1, (ghc >> 1) & 1, pi,
                        *(UINT32 *)(pt + 0x18), *(UINT32 *)(pt + 0x18) & 1, (*(UINT32 *)(pt + 0x18) >> 4) & 1,
