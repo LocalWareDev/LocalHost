@@ -949,6 +949,47 @@ static int injectDeviceIrq(WHV_PARTITION_HANDLE partition, int gsi, unsigned cha
 // deliverPendingAtaIrq, called every iteration).
 int pendingAtaIrq = 0;
 
+// U56b: AHCI interrupts are LEVEL-triggered. Per the AHCI spec the controller
+// asserts its interrupt while GHC.IE is set and (PxIS & PxIE) is non-zero, and
+// keeps asserting until the driver clears the status bits. We only ever injected
+// edge-style from the command-completion path, so any condition that was already
+// pending when the driver armed PxIE produced no injection at all.
+//
+// Measured: storahci does start the controller (GHC=0x80000002 AE=1 IE=1,
+// PxCMD=0x0000C013 ST=1 FRE=1, PxIE=0x7D40004F) and then sits with
+// PxIS=0x00000001 -- a D2H Register FIS interrupt pending, never cleared, because
+// the guest was never actually interrupted. That is why it idles in
+// HalProcessorIdle with the port started and no commands in flight.
+//
+// Re-assert while the condition holds, throttled so a guest that is slow to run
+// its ISR is not flooded. Also maintains the global IS port bit, which the driver
+// reads to find which port raised the interrupt.
+extern void *ahciAbarMemory; // defined with the rest of the AHCI BAR5 state below
+static long g_ahciLastIrqExit = 0;
+static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
+    if (!ahciAbarMemory) return;
+    unsigned char *ab = (unsigned char *)ahciAbarMemory;
+    // U56c REVERTED: mirroring PxCMD.CR/FR onto ST/FRE from here was a regression.
+    // Measured: PCI config accesses collapsed 20901 -> 4472, AHCI commands 3991 ->
+    // 1, PxCI stuck at 1, and the kernel never loaded at all -- the firmware could
+    // no longer read the disk. Writing PxCMD from the main loop races the existing
+    // AHCI command path, which also owns that register. The underlying observation
+    // still stands (nothing ever sets CR/FR, so storahci's start attempts time out
+    // and it resets in a loop), but the fix has to live inside the AHCI engine that
+    // already owns these registers, not in a concurrent poller. See U57.
+    UINT32 ghc = *(UINT32 *)(ab + 0x04);
+    if (!(ghc & 0x2)) return;                       // GHC.IE clear -- interrupts globally off
+    unsigned char *pt = ab + 0x100;
+    UINT32 pxis = *(UINT32 *)(pt + 0x10);
+    UINT32 pxie = *(UINT32 *)(pt + 0x14);
+    if ((pxis & pxie) == 0) return;                 // nothing the driver wants to hear about
+    *(UINT32 *)(ab + 0x08) |= 0x1;                  // global IS: port 0 is asserting
+    if (exitCount - g_ahciLastIrqExit < 500) return; // throttle re-assertion
+    if (!guestInterruptsEnabled(partition)) return;
+    g_ahciLastIrqExit = exitCount;
+    injectDeviceIrq(partition, GSI_AHCI, 0x76);
+}
+
 void ataMaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
     if (guestInterruptsEnabled(partition)) {
         injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: was hardcoded 0x76
@@ -6818,6 +6859,11 @@ int main(int argc, char *argv[]) {
             Sleep(0); // yield periodically -- avoid starving the host scheduler
         }
 
+        // U56b: keep the level-triggered AHCI interrupt asserted while the driver
+        // has an unserviced status bit. Cheap -- reads two dwords from our own
+        // buffer and returns immediately in the common case.
+        ahciServiceLevelInterrupt(partition, exitCount);
+
         if (exitCount % 5000 == 0) {
             static LARGE_INTEGER startTick = { 0 };
             LARGE_INTEGER nowTick;
@@ -6851,6 +6897,23 @@ int main(int argc, char *argv[]) {
             // activity from how many lines happened to be logged.
             printf("[heartbeat]   totals: pciCfgAccesses=%d ahciCmds=%d (reads=%d writes=%d other=%d)\n",
                    pciConfigAccessLogCount, ahciCmdLogCount, g_ahciReads, g_ahciWrites, g_ahciOther);
+            // U56b: has storahci actually taken ownership of the controller?
+            // The ABAR is mapped as plain guest RAM, so driver accesses never trap
+            // and cannot be logged -- but the buffer is ours, so poll it directly.
+            // GHC.AE(bit31)/IE(bit1) and PxCMD.ST(bit0)/FRE(bit4) tell us whether a
+            // driver has enabled the HBA and started the port; PxIE tells us whether
+            // it armed interrupts (which is what the U55b pin fix was meant to
+            // unblock). If these stay at their reset values, no driver ever bound.
+            if (ahciAbarMemory) {
+                unsigned char *ab = (unsigned char *)ahciAbarMemory;
+                UINT32 ghc = *(UINT32 *)(ab + 0x04), pi = *(UINT32 *)(ab + 0x0C);
+                unsigned char *pt = ab + 0x100;
+                printf("[heartbeat]   ahci: GHC=0x%08X (AE=%u IE=%u) PI=0x%X | PxCMD=0x%08X (ST=%u FRE=%u) PxIE=0x%08X PxIS=0x%08X PxCI=0x%08X PxTFD=0x%08X PxSSTS=0x%08X\n",
+                       ghc, (ghc >> 31) & 1, (ghc >> 1) & 1, pi,
+                       *(UINT32 *)(pt + 0x18), *(UINT32 *)(pt + 0x18) & 1, (*(UINT32 *)(pt + 0x18) >> 4) & 1,
+                       *(UINT32 *)(pt + 0x14), *(UINT32 *)(pt + 0x10),
+                       *(UINT32 *)(pt + 0x38), *(UINT32 *)(pt + 0x20), *(UINT32 *)(pt + 0x28));
+            }
             fflush(stdout);
         }
 
