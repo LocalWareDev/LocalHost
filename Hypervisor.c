@@ -2229,7 +2229,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-void createWindowThread() {
+// U56 (user-reported bug): the window intermittently went "not responding" and
+// then recovered.
+//
+// Cause: despite its name this function never created a thread -- it built the
+// window on the CALLING (main) thread. A window's messages are delivered to the
+// queue of the thread that created it, so the pump only ran when the main loop
+// reached its PeekMessage calls. Whenever the guest executed a long stretch
+// without exiting -- exactly what an idle or halted guest does, and this guest now
+// idles in HalProcessorIdle -- WHvRunVirtualProcessor did not return, no messages
+// were pumped, and Windows flagged the window unresponsive. It recovered as soon
+// as the guest exited again, which is why the symptom came and went.
+//
+// Fix: give the window its own thread that both creates it and runs a blocking
+// GetMessage loop, so responsiveness no longer depends on guest exit frequency.
+// The main loop's InvalidateRect calls still work cross-thread (they post
+// WM_PAINT to this thread's queue) and now repaint promptly.
+static DWORD WINAPI windowThreadProc(LPVOID param) {
+    (void)param;
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(NULL);
@@ -2241,6 +2258,29 @@ void createWindowThread() {
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                             740, 480, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(g_hwnd, SW_SHOW);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return 0;
+}
+
+void createWindowThread() {
+    HANDLE h = CreateThread(NULL, 0, windowThreadProc, NULL, 0, NULL);
+    if (!h) {
+        printf("[window] CreateThread failed (%lu) -- falling back to main-thread window\n",
+               (unsigned long)GetLastError());
+        fflush(stdout);
+        windowThreadProc(NULL); // degraded, but better than no window at all
+        return;
+    }
+    CloseHandle(h);
+    // Callers (and the main loop's InvalidateRect) expect g_hwnd to be valid on
+    // return, so wait for the thread to publish it rather than racing it.
+    int spins = 0;
+    while (!g_hwnd && spins++ < 5000) Sleep(1);
 }
 
 // Returns non-zero if the guest currently has interrupts enabled (EFLAGS.IF).
