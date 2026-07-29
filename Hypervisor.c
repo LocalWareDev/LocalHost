@@ -3127,6 +3127,15 @@ void pciInitConfigSpaces(void) {
     pciAhciConfig[0x0A] = 0x06; // subclass: SATA controller
     pciAhciConfig[0x0B] = 0x01; // base class: mass storage controller
     pciAhciConfig[0x0E] = 0x00; // header type 0, single-function
+    // U55: interrupt pin. This was never set, so the device reported pin 0 --
+    // "generates no interrupt at all" -- and Windows' storahci miniport requires
+    // an interrupt to start. PnP had nothing to route through the _PRT, the
+    // miniport never started, the boot volume never came online, and the guest sat
+    // at the Windows boot spinner forever: heavy reads while the firmware loaded
+    // (3988 of them, firmware polls rather than using interrupts, so it was
+    // unaffected), then zero writes and an idle CPU in HalProcessorIdle.
+    // INTA# matches the _PRT entry for device 2 in acpi/dsdt.asl (-> GSI 16).
+    pciAhciConfig[0x3D] = 0x01; // interrupt pin: INTA#
 
     // Real Realtek RTL8139 IDs -- same reasoning as AHCI above, matches a
     // real chip so nothing keyed off vendor/device ID gets confused.
