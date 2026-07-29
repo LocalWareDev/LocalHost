@@ -854,6 +854,44 @@ static void u49VerifyAcpiTables(unsigned char *mem, SIZE_T memSize) {
         }
         if (!found) printf("[u49]   %s: NOT FOUND in guest RAM\n", sigs[si]);
     }
+    // U51: acpi.sys returns STATUS_ACPI_INVALID_TABLE (0xC0140019) from
+    // ACPILoadProcessRSDT specifically because it enumerated the root table and
+    // never found a FADT ('FACP'). So print what each XSDT actually POINTS AT --
+    // finding a valid FADT lying in RAM proves nothing if the XSDT the OS follows
+    // does not reference it.
+    {
+        SIZE_T off;
+        for (off = 0; off + 36 < memSize; off += 4) {
+            if (memcmp(mem + off, "XSDT", 4) != 0) continue;
+            UINT32 len = *(UINT32 *)(mem + off + 4);
+            if (len < 36 || len > 0x1000) continue;
+            UINT32 n = (len - 36) / 8, e;
+            printf("[u51] XSDT at GPA 0x%llX: %u entries\n", (unsigned long long)off, n);
+            for (e = 0; e < n; e++) {
+                UINT64 ptr = *(UINT64 *)(mem + off + 36 + e * 8);
+                if (ptr < memSize && ptr + 36 < memSize) {
+                    char s[5] = { 0 };
+                    memcpy(s, mem + ptr, 4);
+                    UINT32 tlen = *(UINT32 *)(mem + ptr + 4);
+                    unsigned char trev = mem[ptr + 8], tsum = 0; UINT32 q;
+                    for (q = 0; q < tlen && ptr + q < memSize; q++) tsum = (unsigned char)(tsum + mem[ptr + q]);
+                    printf("[u51]     [%u] -> GPA 0x%llX  '%s' len=%u rev=%u checksum=%s%s\n",
+                           e, (unsigned long long)ptr, s, tlen, trev, (tsum == 0) ? "OK" : "BAD",
+                           (memcmp(s, "FACP", 4) == 0) ? "   <== the FADT acpi.sys needs" : "");
+                    // ACPI 2.0+ (XSDT-based) systems expect FADT revision >= 3 and
+                    // length >= 244, which is where the X_* 64-bit address fields
+                    // live. A revision-1 / 116-byte FADT is ACPI 1.0 shaped and has
+                    // none of them -- flag that explicitly, since it is the current
+                    // suspect for STATUS_ACPI_INVALID_TABLE.
+                    if (memcmp(s, "FACP", 4) == 0 && (trev < 3 || tlen < 244))
+                        printf("[u51]         ^ ACPI 1.0 shaped (rev<3 / len<244): no X_* extended address fields\n");
+                } else {
+                    printf("[u51]     [%u] -> GPA 0x%llX  (outside guest RAM -- UNREADABLE)\n",
+                           e, (unsigned long long)ptr);
+                }
+            }
+        }
+    }
     fflush(stdout);
 }
 
@@ -4318,7 +4356,21 @@ unsigned char acpiRsdp[36];
 // commands/checksums for no functional gain.
 #include "acpi/dsdt_aml.h"
 #define DSDT_BLOB_OFFSET 392                            /* right after DBG2 (308 + 84) */
-#define ACPI_TABLES_SIZE (DSDT_BLOB_OFFSET + DSDT_AML_SIZE)
+// U51: the FADT is upgraded from ACPI 1.0 (revision 1, 116 bytes) to ACPI 2.0+
+// (revision 3, 244 bytes) so it carries the X_* 64-bit extended address fields.
+// 244 bytes will not fit its old home at offset 60, which is bounded by the MADT
+// at 176, so it moves past the DSDT. Offsets 60..175 are now dead space, left
+// rather than repacking every table and re-deriving all loader commands.
+#define FADT_BLOB_OFFSET (DSDT_BLOB_OFFSET + DSDT_AML_SIZE)
+#define FADT_LENGTH 244
+// U51b: the FACS. We published none (FIRMWARE_CTRL and X_FIRMWARE_CTRL both 0),
+// which violates the ACPI spec -- a FACS is mandatory unless HW_REDUCED_ACPI is
+// set in the FADT flags, and we do not set it. 64 bytes, and note it is NOT a
+// normal SDT: it has no revision/checksum/OEM header, so acpiPutHeader must not
+// be used on it and it gets no ADD_CHECKSUM loader command.
+#define FACS_BLOB_OFFSET (FADT_BLOB_OFFSET + FADT_LENGTH)
+#define FACS_LENGTH 64
+#define ACPI_TABLES_SIZE (FACS_BLOB_OFFSET + FACS_LENGTH)
 unsigned char acpiTables[ACPI_TABLES_SIZE]; // XSDT(0)+FADT(60)+MADT(176,96)+DBG2(308)+DSDT(392), see acpiBuildTables
 int acpiTablesBuilt = 0;
 
@@ -4345,7 +4397,13 @@ unsigned char ramfbConfig[28];
 // found/scanned correctly but our RSDP/tables/loader fw_cfg keys never
 // getting selected at all.
 #define ACPI_LOADER_CMD_SIZE 128
-unsigned char acpiLoader[16 * ACPI_LOADER_CMD_SIZE];
+// U51b: was 16 slots. Adding the X_DSDT, FIRMWARE_CTRL and X_FIRMWARE_CTRL
+// pointer commands pushed the count to 17, which overran this array into the
+// globals that follow it -- the guest then failed to boot far enough to even
+// discover the kernel. Sized with headroom, and the builder asserts the count
+// below so the next addition fails loudly instead of corrupting memory.
+#define ACPI_LOADER_MAX_CMDS 32
+unsigned char acpiLoader[ACPI_LOADER_MAX_CMDS * ACPI_LOADER_CMD_SIZE];
 
 unsigned char fwCfgFileDir[4 + 4 * (4 + 2 + 2 + 56)];
 int fwCfgFileDirBuilt = 0;
@@ -4367,6 +4425,21 @@ void fwCfgPutU32BE(unsigned char *buf, UINT32 off, UINT32 val) {
 // computes and patches real checksums after it copies these bytes into
 // guest memory (see acpiBuildLoaderScript's ADD_CHECKSUM commands), so we
 // never need to compute one ourselves.
+// U51: write a Generic Address Structure (12 bytes) -- the ACPI 2.0+ way of
+// describing a register. All-zero means "not present", which is what the unused
+// PM1b/PM2/GPE blocks get.
+//   spaceId: 0 = system memory, 1 = system I/O
+//   accessSize: 0 = undefined, 1 = byte, 2 = word, 3 = dword, 4 = qword
+void acpiPutGas(unsigned char *buf, UINT32 off, unsigned char spaceId,
+                unsigned char bitWidth, unsigned char bitOffset,
+                unsigned char accessSize, UINT64 address) {
+    buf[off + 0] = spaceId;
+    buf[off + 1] = bitWidth;
+    buf[off + 2] = bitOffset;
+    buf[off + 3] = accessSize;
+    memcpy(buf + off + 4, &address, 8);
+}
+
 void acpiPutHeader(unsigned char *buf, UINT32 off, const char *sig, UINT32 length, unsigned char revision) {
     memcpy(buf + off, sig, 4);
     acpiPutU32(buf, off + 4, length);
@@ -4407,27 +4480,38 @@ void acpiBuildTables(void) {
 
     // XSDT at blob offset 0 (60 bytes: 36-byte header + 3 8-byte entries)
     acpiPutHeader(acpiTables, 0, "XSDT", 60, 1);
-    acpiPutU32(acpiTables, 36, 60);  // entry0: FADT's blob-relative offset (patched to an absolute address by OVMF)
+    acpiPutU32(acpiTables, 36, FADT_BLOB_OFFSET);  // entry0: FADT's blob-relative offset (patched to an absolute address by OVMF) -- U51 moved it past the DSDT
     acpiPutU32(acpiTables, 44, 176); // entry1: MADT's blob-relative offset (ditto)
     acpiPutU32(acpiTables, 52, 308); // entry2: DBG2's blob-relative offset (ditto)
 
-    // FADT ("FACP") at blob offset 60 (116 bytes -- the original ACPI 1.0
-    // layout; every field we need fits within it, and it keeps this to a
-    // single 32-bit DSDT pointer instead of also needing the newer 64-bit
-    // X_DSDT field).
-    acpiPutHeader(acpiTables, 60, "FACP", 116, 1);
-    acpiPutU32(acpiTables, 60 + 36, 0);   // FIRMWARE_CTRL -- no FACS in this pass
-    acpiPutU32(acpiTables, 60 + 40, DSDT_BLOB_OFFSET); // DSDT: blob-relative offset (patched to absolute) -- U49 moved it past DBG2
-    acpiTables[60 + 45] = 0;              // Preferred_PM_Profile
-    acpiPutU16(acpiTables, 60 + 46, 9);   // SCI_INT
-    acpiPutU32(acpiTables, 60 + 48, 0);   // SMI_CMD = 0 -- tells the OS ACPI mode is already enabled, no SMM handshake needed (we don't emulate SMM at all)
-    acpiPutU32(acpiTables, 60 + 56, pmBase + 0); // PM1a_EVT_BLK
-    acpiPutU32(acpiTables, 60 + 64, pmBase + 4); // PM1a_CNT_BLK
-    acpiPutU32(acpiTables, 60 + 76, pmBase + 8); // PM_TMR_BLK -- matches the existing ACPI PM Timer emulation at PM_BASE+8
-    acpiTables[60 + 88] = 4; // PM1_EVT_LEN
-    acpiTables[60 + 89] = 2; // PM1_CNT_LEN
-    acpiTables[60 + 91] = 4; // PM_TMR_LEN
-    acpiPutU16(acpiTables, 60 + 109, 0x0002); // IAPC_BOOT_ARCH: bit1 = 8042 present (we emulate one)
+    // FADT ("FACP") at FADT_BLOB_OFFSET.
+    //
+    // U51: was ACPI 1.0 (revision 1, 116 bytes). Measured consequence: acpi.sys's
+    // ACPILoadProcessRSDT enumerated the root table, never accepted a FADT, and
+    // returned STATUS_ACPI_INVALID_TABLE (0xC0140019), which ACPIInitialize turns
+    // into KeBugCheckEx(0xA5, 0x11, ...) -- the reboot loop from U48. Everything
+    // else we publish is ACPI 2.0+ (RSDP revision 2, XSDT-only with RsdtAddress=0,
+    // MADT revision 3), so a revision-1 FADT reached through an XSDT is an
+    // inconsistent pair: it has none of the X_* 64-bit extended address fields a
+    // 64-bit OS expects to find. Now revision 3 / 244 bytes with those fields.
+    acpiPutHeader(acpiTables, FADT_BLOB_OFFSET, "FACP", FADT_LENGTH, 3);
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 36, FACS_BLOB_OFFSET); // FIRMWARE_CTRL -> FACS (patched to absolute)
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 40, DSDT_BLOB_OFFSET); // DSDT (32-bit, patched to absolute)
+    acpiTables[FADT_BLOB_OFFSET + 45] = 0;              // Preferred_PM_Profile (0 = unspecified)
+    acpiPutU16(acpiTables, FADT_BLOB_OFFSET + 46, 9);   // SCI_INT
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 48, 0);   // SMI_CMD = 0 -- ACPI mode already enabled, no SMM handshake (we emulate no SMM)
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 56, pmBase + 0); // PM1a_EVT_BLK
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 64, pmBase + 4); // PM1a_CNT_BLK
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 76, pmBase + 8); // PM_TMR_BLK -- matches the PM Timer emulation at PM_BASE+8
+    acpiTables[FADT_BLOB_OFFSET + 88] = 4; // PM1_EVT_LEN
+    acpiTables[FADT_BLOB_OFFSET + 89] = 2; // PM1_CNT_LEN
+    acpiTables[FADT_BLOB_OFFSET + 91] = 4; // PM_TMR_LEN
+    // C2/C3 latencies above their "unsupported" thresholds (>100us / >1000us), so
+    // the OS does not try to use idle states we do not emulate.
+    acpiPutU16(acpiTables, FADT_BLOB_OFFSET + 96, 0x0FFF); // P_LVL2_LAT
+    acpiPutU16(acpiTables, FADT_BLOB_OFFSET + 98, 0x0FFF); // P_LVL3_LAT
+    acpiTables[FADT_BLOB_OFFSET + 108] = 0x32; // CENTURY: CMOS century register index
+    acpiPutU16(acpiTables, FADT_BLOB_OFFSET + 109, 0x0002); // IAPC_BOOT_ARCH: bit1 = 8042 present (we emulate one)
     // Flags: WBINVD supported (bit0) | TMR_VAL_EXT (bit8) -- our PM_TMR_BLK
     // emulation (see the ACPI PM Timer read handler) returns a genuine free-
     // running 32-bit counter, never masked to 24 bits. Leaving TMR_VAL_EXT
@@ -4438,7 +4522,48 @@ void acpiBuildTables(void) {
     // convergence, manifesting as an indefinite stall (guest spinning
     // inside a single WHvRunVirtualProcessor call, no further port traps)
     // immediately after a PM Timer read.
-    acpiPutU32(acpiTables, 60 + 112, 0x00000101);
+    acpiPutU32(acpiTables, FADT_BLOB_OFFSET + 112, 0x00000101);
+
+    // U51: the ACPI 2.0+ tail (offsets 116..243). RESET_REG is left all-zero and
+    // the RESET_REG_SUP flag (bit 10) is deliberately NOT set, because we do not
+    // emulate a 0xCF9-style reset register -- advertising one we do not implement
+    // is how the DSDT/IOAPIC mistakes earlier in this investigation happened.
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 116, 0, 0, 0, 0, 0); // RESET_REG (absent)
+    acpiTables[FADT_BLOB_OFFSET + 128] = 0;                        // RESET_VALUE
+    acpiTables[FADT_BLOB_OFFSET + 131] = 0;                        // FADT Minor Version
+    // X_FIRMWARE_CTRL stays 0 (no FACS). X_DSDT is filled with the blob-relative
+    // DSDT offset and patched to an absolute 64-bit address by the table loader,
+    // exactly like the 32-bit DSDT field above.
+    {
+        UINT64 xfacs = FACS_BLOB_OFFSET, xdsdt = DSDT_BLOB_OFFSET;
+        memcpy(acpiTables + FADT_BLOB_OFFSET + 132, &xfacs, 8);    // X_FIRMWARE_CTRL -> FACS
+        memcpy(acpiTables + FADT_BLOB_OFFSET + 140, &xdsdt, 8);    // X_DSDT
+    }
+    // Extended register blocks. Widths mirror the *_LEN fields above; the blocks
+    // we do not implement (PM1b, PM2, GPE0/GPE1) stay all-zero = not present.
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 148, 1, 32, 0, 2, pmBase + 0); // X_PM1a_EVT_BLK
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 160, 0, 0, 0, 0, 0);           // X_PM1b_EVT_BLK (absent)
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 172, 1, 16, 0, 2, pmBase + 4); // X_PM1a_CNT_BLK
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 184, 0, 0, 0, 0, 0);           // X_PM1b_CNT_BLK (absent)
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 196, 0, 0, 0, 0, 0);           // X_PM2_CNT_BLK (absent)
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 208, 1, 32, 0, 3, pmBase + 8); // X_PM_TMR_BLK
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 220, 0, 0, 0, 0, 0);           // X_GPE0_BLK (absent)
+    acpiPutGas(acpiTables, FADT_BLOB_OFFSET + 232, 0, 0, 0, 0, 0);           // X_GPE1_BLK (absent)
+
+    // U51b: FACS at FACS_BLOB_OFFSET. Mandatory whenever HW_REDUCED_ACPI is clear
+    // (we do not set it), and we previously published none at all. Deliberately
+    // NOT built with acpiPutHeader: the FACS is not a standard SDT -- it has no
+    // revision, checksum, OEM ID or creator fields, so those bytes mean other
+    // things here. Layout: signature(0), length(4), hardware signature(8),
+    // firmware waking vector(12), global lock(16), flags(20), X firmware waking
+    // vector(24), version(32), the rest reserved.
+    memcpy(acpiTables + FACS_BLOB_OFFSET, "FACS", 4);
+    acpiPutU32(acpiTables, FACS_BLOB_OFFSET + 4, FACS_LENGTH);
+    acpiPutU32(acpiTables, FACS_BLOB_OFFSET + 8, 0);   // Hardware Signature -- 0, we never S4-resume
+    acpiPutU32(acpiTables, FACS_BLOB_OFFSET + 12, 0);  // Firmware Waking Vector
+    acpiPutU32(acpiTables, FACS_BLOB_OFFSET + 16, 0);  // Global Lock -- unowned, uncontended
+    acpiPutU32(acpiTables, FACS_BLOB_OFFSET + 20, 0);  // Flags (bit0 S4BIOS_F = 0, we support no S4BIOS transition)
+    acpiTables[FACS_BLOB_OFFSET + 32] = 2;             // Version 2 (matches the ACPI 2.0+ FADT above)
 
     // MADT ("APIC") at blob offset 176 (64 bytes: 36-byte header + 4+4
     // fixed fields + one 8-byte Processor Local APIC entry for vCPU 0 + one
@@ -4626,15 +4751,41 @@ void acpiBuildLoaderScript(void) {
     acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 44, 8); c += ACPI_LOADER_CMD_SIZE;
     acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 52, 8); c += ACPI_LOADER_CMD_SIZE;
     // FADT.DSDT (32-bit field, unlike the 64-bit XSDT entries above)
-    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", 60 + 40, 4); c += ACPI_LOADER_CMD_SIZE;
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 40, 4); c += ACPI_LOADER_CMD_SIZE;
+    // U51: FADT.X_DSDT, the 64-bit companion added with the ACPI 2.0+ upgrade.
+    // Both must be patched -- an OS that prefers X_DSDT would otherwise follow a
+    // raw blob-relative offset as if it were a physical address.
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 140, 8); c += ACPI_LOADER_CMD_SIZE;
+    // U51b: FADT.FIRMWARE_CTRL (32-bit) and FADT.X_FIRMWARE_CTRL (64-bit), both
+    // pointing at the new FACS and both needing the same blob-relative-to-absolute
+    // patch as the DSDT pointers above.
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 36, 4); c += ACPI_LOADER_CMD_SIZE;
+    acpiLoaderAddPointer(c, "etc/acpi/tables", "etc/acpi/tables", FADT_BLOB_OFFSET + 132, 8); c += ACPI_LOADER_CMD_SIZE;
 
     acpiLoaderAddChecksum(c, "etc/acpi/tables", 9, 0, 60); c += ACPI_LOADER_CMD_SIZE;           // XSDT
-    acpiLoaderAddChecksum(c, "etc/acpi/tables", 60 + 9, 60, 116); c += ACPI_LOADER_CMD_SIZE;    // FADT
+    acpiLoaderAddChecksum(c, "etc/acpi/tables", FADT_BLOB_OFFSET + 9, FADT_BLOB_OFFSET, FADT_LENGTH); c += ACPI_LOADER_CMD_SIZE;    // FADT (U51: ACPI 2.0+, moved past the DSDT)
     acpiLoaderAddChecksum(c, "etc/acpi/tables", 176 + 9, 176, 96); c += ACPI_LOADER_CMD_SIZE;   // MADT
     acpiLoaderAddChecksum(c, "etc/acpi/tables", DSDT_BLOB_OFFSET + 9, DSDT_BLOB_OFFSET, DSDT_AML_SIZE); c += ACPI_LOADER_CMD_SIZE;   // DSDT (U49: real AML table, moved past DBG2)
     acpiLoaderAddChecksum(c, "etc/acpi/tables", 308 + 9, 308, 84); c += ACPI_LOADER_CMD_SIZE;   // DBG2
     acpiLoaderAddChecksum(c, "etc/acpi/rsdp", 8, 0, 20); c += ACPI_LOADER_CMD_SIZE;             // RSDP (ACPI 1.0 checksum)
     acpiLoaderAddChecksum(c, "etc/acpi/rsdp", 32, 0, 36); c += ACPI_LOADER_CMD_SIZE;            // RSDP (extended checksum)
+
+    // U51b: fail loudly rather than silently corrupting the globals that follow
+    // acpiLoader. Overrunning this array by a single command was enough to stop
+    // the guest booting far enough to even load a kernel, with no obvious clue.
+    {
+        SIZE_T used = (SIZE_T)(c - acpiLoader);
+        if (used > sizeof(acpiLoader)) {
+            printf("[acpi] FATAL: %llu loader command bytes exceed the %llu-byte buffer (raise ACPI_LOADER_MAX_CMDS)\n",
+                   (unsigned long long)used, (unsigned long long)sizeof(acpiLoader));
+            fflush(stdout);
+            abort();
+        }
+        printf("[acpi] table-loader: %llu commands, %llu/%llu bytes used\n",
+               (unsigned long long)(used / ACPI_LOADER_CMD_SIZE),
+               (unsigned long long)used, (unsigned long long)sizeof(acpiLoader));
+        fflush(stdout);
+    }
 }
 
 void fwCfgBuildFileDir(void) {
