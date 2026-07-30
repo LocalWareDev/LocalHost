@@ -1152,6 +1152,7 @@ unsigned char uart2Ier = 0, uart2Lcr = 0, uart2Mcr = 0, uart2Scr = 0;
 unsigned char uart2FifoEnabled = 0;
 unsigned char uart2DivisorLow = 0, uart2DivisorHigh = 0;
 HANDLE kdPipe = INVALID_HANDLE_VALUE;
+long g_uart2TxTotal = 0, g_uart2Tx30 = 0, g_uart2Tx69 = 0, g_uart2Tx62 = 0; // U63: uncapped COM2 TX tallies
 CRITICAL_SECTION kdRxLock;
 unsigned char kdRxBuf[4096];
 volatile int kdRxHead = 0, kdRxTail = 0; // ring buffer: pipe reader thread -> guest RBR reads
@@ -4400,6 +4401,20 @@ void uart2HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     static int uart2AccessCount = 0;
     static int uart2PostConnectCount = 0;
     int logPostConnect = 0;
+    // U63: count DATA-PORT WRITES separately and uncapped, plus tally the KD
+    // packet leaders. The 40-entry cap below made "0 KD bytes on COM2" look like a
+    // finding twice, when it only meant the log had stopped -- the fifth time a cap
+    // has produced a false conclusion in this investigation (after the IOAPIC op
+    // counts, PCI accesses after discovery, AHCI command totals and the IRQ
+    // injection storm). KD framing: data packets lead with 0x30 ('0' x4), control
+    // packets with 0x69 ('i' x4), and a breakin byte is 0x62 ('b').
+    if (port == 0x2F8 && io->AccessInfo.IsWrite && !dlab) {
+        unsigned char b = (unsigned char)io->Rax;
+        g_uart2TxTotal++;
+        if (b == 0x30) g_uart2Tx30++;
+        else if (b == 0x69) g_uart2Tx69++;
+        else if (b == 0x62) g_uart2Tx62++;
+    }
     if (uart2AccessCount < 40) {
         uart2AccessCount++;
         printf("[uart2] #%d port=0x%X write=%d val=0x%llX\n", uart2AccessCount, port,
@@ -7335,6 +7350,8 @@ int main(int argc, char *argv[]) {
                 lastFbSum = sum;
                 fbSumSeen = 1;
             }
+                printf("[heartbeat]   COM2 TX (uncapped): total=%ld  KD leaders: 0x30='0'=%ld 0x69='i'=%ld 0x62='b'=%ld\n",
+                       g_uart2TxTotal, g_uart2Tx30, g_uart2Tx69, g_uart2Tx62);
                 printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)\n",
                        g_ahciIrqCount,
                        g_ahciFwSectors, (g_ahciFwSectors * 512) / (1024 * 1024),
