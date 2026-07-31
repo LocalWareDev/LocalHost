@@ -7220,7 +7220,26 @@ int main(int argc, char *argv[]) {
             }
             if (!running) break;
 
-            if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+            // U66: throttle to ~60Hz. This used to invalidate on EVERY pass of the
+            // halted loop, which with the Sleep(1) below is roughly 1000 times a
+            // second -- each one a full 800x600 StretchDIBits blit on the UI thread.
+            // The main run loop already throttles its own repaint (exitCount % 5000)
+            // but this path did not, and it is the path the guest spends nearly all
+            // its time in now that Windows boots and idles in HalProcessorIdle
+            // (HLT). So the better the guest behaved, the harder we hammered the
+            // host -- which is what made the machine lag badly enough to need two
+            // force shutdowns.
+            if (g_hwnd) {
+                static LARGE_INTEGER lastPaint = { 0 };
+                LARGE_INTEGER nowPaint;
+                QueryPerformanceCounter(&nowPaint);
+                double sincePaintMs = (lastPaint.QuadPart == 0) ? 1e9 :
+                    (double)(nowPaint.QuadPart - lastPaint.QuadPart) * 1000.0 / perfFrequency.QuadPart;
+                if (sincePaintMs >= 16.0) {
+                    lastPaint = nowPaint;
+                    InvalidateRect(g_hwnd, NULL, FALSE);
+                }
+            }
 
             if (!guestInterruptsEnabled(partition)) {
                 // Guest disabled interrupts while halted (unusual, but be safe) --
