@@ -1182,6 +1182,16 @@ DWORD g_kdTxLastErr = 0;   // GetLastError() from the most recent failed WriteFi
 long g_kdRxFromPipe = 0;   // bytes read off the pipe (debugger -> us)
 long g_kdRxToGuest = 0;    // bytes the guest actually consumed via RBR reads
 long g_kdRxDropped = 0;    // pipe bytes dropped because kdRxBuf was full
+
+// U69: deferred break-in. A debugger asks a running target to stop by sending a
+// single 0x62 ('b') byte, which the kernel notices in KdPollBreakIn -- that is
+// all Ctrl+Break in WinDbg actually does. We cannot press Ctrl+Break on a kd
+// launched with redirected stdio, but we own the wire, so we can put the byte on
+// it ourselves once the guest has booted far enough to be worth interrupting.
+// That turns "break in at an arbitrary later moment and run !process 0 0" into
+// something scriptable. Seconds since VM start; 0 disables.
+long g_kdBreakinAtSec = 0;
+int  g_kdBreakinSent = 0;
 CRITICAL_SECTION kdRxLock;
 unsigned char kdRxBuf[4096];
 volatile int kdRxHead = 0, kdRxTail = 0; // ring buffer: pipe reader thread -> guest RBR reads
@@ -7240,6 +7250,12 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            const char *breakinEnv = getenv("LOCALHOST_KD_BREAKIN_SEC");
+            if (breakinEnv) {
+                g_kdBreakinAtSec = atol(breakinEnv);
+                if (g_kdBreakinAtSec > 0)
+                    printf("[kd] will inject a break-in %ld seconds in\n", g_kdBreakinAtSec);
+            }
             HANDLE kdThread = CreateThread(NULL, 0, kdPipeReaderThread, NULL, 0, NULL);
             if (kdThread) CloseHandle(kdThread);
             HANDLE kdWriterThread = CreateThread(NULL, 0, kdPipeWriterThread, NULL, 0, NULL);
@@ -7441,6 +7457,18 @@ int main(int argc, char *argv[]) {
             if (g_bpModuleBase && hbRip > g_bpModuleBase && hbRip - g_bpModuleBase < 0x2000000ULL)
                 printf("[heartbeat]   ntoskrnl+0x%llX  (resolve: tools/pdbsym.py near <rva>)\n",
                        (unsigned long long)(hbRip - g_bpModuleBase));
+            // U69: fire the scripted break-in once the guest has had time to boot.
+            if (g_kdBreakinAtSec > 0 && !g_kdBreakinSent && kdClientConnected &&
+                elapsedSec >= (double)g_kdBreakinAtSec) {
+                EnterCriticalSection(&kdRxLock);
+                int biNext = (kdRxHead + 1) % (int)sizeof(kdRxBuf);
+                if (biNext != kdRxTail) { kdRxBuf[kdRxHead] = 0x62; kdRxHead = biNext; }
+                LeaveCriticalSection(&kdRxLock);
+                g_kdBreakinSent = 1;
+                printf("[kd] injected break-in byte 0x62 at %.1fs (LOCALHOST_KD_BREAKIN_SEC=%ld)\n",
+                       elapsedSec, g_kdBreakinAtSec);
+                fflush(stdout);
+            }
             // U55: real running totals, not log-capped counts. Three separate
             // conclusions in this investigation were drawn from truncated logs and
             // had to be retracted -- the IOAPIC "260 vs 560 ops" (U42_LOG_PER_PASS
