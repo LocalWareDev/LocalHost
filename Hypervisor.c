@@ -6820,7 +6820,32 @@ int main(int argc, char *argv[]) {
     if (biosPathLen >= 3 && _stricmp(biosPath + biosPathLen - 3, ".fd") == 0) {
         uefiMode = 1;
     }
+    // U67: guest RAM is now settable from argv[4] (in MB).
+    //
+    // The hardcoded 3GB is committed memory, and on an 8GB host that is already
+    // ~11GB committed before the VM starts, it pushes Windows into heavy paging --
+    // measured at 0.5GB physical free with the VM NOT running. Add a debugger on
+    // top and the machine thrashes until it has to be hard-powered-off, which is
+    // what happened three times. Being able to run a smaller guest is the
+    // difference between being able to debug this at all on this hardware.
+    //
+    // Careful with small values: WinPE runs from a 437MB RAM disk (the firmware
+    // loads boot.wim into it), so it needs real headroom on top of that. 2048 is
+    // the sensible first step down; below ~1536 expect the boot we are debugging to
+    // break for reasons that have nothing to do with the bug.
     guestMemSize = uefiMode ? (SIZE_T)UEFI_GUEST_RAM_SIZE : 0x100000;
+    if (uefiMode && argc > 4) {
+        long mb = atol(argv[4]);
+        if (mb >= 256 && mb <= 8192) {
+            guestMemSize = (SIZE_T)mb * 1024 * 1024;
+            printf("[mem] guest RAM overridden to %ld MB (argv[4])\n", mb);
+        } else {
+            printf("[mem] ignoring argv[4]='%s' -- expected 256..8192 MB\n", argv[4]);
+        }
+        fflush(stdout);
+    }
+    printf("[mem] guest RAM = %llu MB\n", (unsigned long long)(guestMemSize / (1024 * 1024)));
+    fflush(stdout);
 
     if (diskPath) {
         // Open .iso images read-only: installer/boot media should never
