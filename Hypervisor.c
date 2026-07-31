@@ -968,6 +968,18 @@ extern void *ahciAbarMemory; // defined with the rest of the AHCI BAR5 state bel
 // U61: interrupt-handshake tracing -- injections we make vs acknowledgements the
 // driver writes back. Declared here because ahciServiceLevelInterrupt below is the
 // first user; ahciHandleAbarMmio (further down) logs the acknowledgement side.
+// U65: one switch for the heavy per-event diagnostics accumulated across U59-U62.
+// They were each written to answer a specific question and have all now answered it,
+// but together they made the VM slow enough to bog the host down while WinDbg was
+// also attached (a force shutdown was needed during U64). Turning them off leaves
+// the CHEAP uncapped counters in place -- those cost a couple of increments per
+// event and are precisely what has repeatedly saved this investigation from
+// drawing false conclusions out of capped logs.
+//
+// Set to 1 to get the ABAR register conversation, per-command ATA tracing, the
+// interrupt-handshake trace and the framebuffer checksum back.
+#define LOCALHOST_VERBOSE_DIAG 0
+
 #define U61_IRQ_LOG_MAX 40
 int g_ahciIrqLogged = 0, g_ahciAckLogged = 0;
 long g_ahciIrqCount = 0; // U61: uncapped injection count, reported in the heartbeat
@@ -998,7 +1010,7 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     // so we can tell whether we are failing to deliver, or delivering and the
     // driver is declining to acknowledge. Bounded; only after the kernel loads.
     g_ahciIrqCount++; // uncapped -- the log below is capped and has misled me before
-    if (g_bpModuleBase && g_ahciIrqLogged < U61_IRQ_LOG_MAX) {
+    if (LOCALHOST_VERBOSE_DIAG && g_bpModuleBase && g_ahciIrqLogged < U61_IRQ_LOG_MAX) {
         g_ahciIrqLogged++;
         printf("[u61] inject #%d: PxIS=0x%08X PxIE=0x%08X IS=0x%08X GHC=0x%08X exit=%ld\n",
                g_ahciIrqLogged, pxis, pxie, *(UINT32 *)(ab + 0x08), ghc, exitCount);
@@ -3519,7 +3531,7 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     // snapshots and got it wrong twice. Gated on the kernel having been discovered
     // so we see storahci's conversation rather than thousands of firmware accesses,
     // and capped so it cannot flood.
-    int u59Log = (g_bpModuleBase != 0) && (g_ahciMmioLogged < U59_ABAR_LOG_MAX);
+    int u59Log = LOCALHOST_VERBOSE_DIAG && (g_bpModuleBase != 0) && (g_ahciMmioLogged < U59_ABAR_LOG_MAX);
 
     if (isWrite) {
         UINT32 value = immVal;
@@ -3544,7 +3556,7 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
                 // U61: the driver acknowledging an interrupt. Visible only because
                 // U58 trapped the ABAR -- as passive RAM these writes could not be
                 // seen at all, which is what made the U56/U57 handshake guesswork.
-                if (g_bpModuleBase && g_ahciAckLogged < U61_IRQ_LOG_MAX &&
+                if (LOCALHOST_VERBOSE_DIAG && g_bpModuleBase && g_ahciAckLogged < U61_IRQ_LOG_MAX &&
                     (aligned == 0x110 || aligned == 0x08)) {
                     g_ahciAckLogged++;
                     printf("[u61] ACK  #%d: %s write=0x%08X  0x%08X -> 0x%08X\n",
@@ -4173,7 +4185,7 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
         // gated on the kernel being loaded, with its own budget. This is the
         // question U60 exists to answer: storahci issues commands now (U59), so
         // which ones, and do they complete cleanly?
-        if (g_bpModuleBase && g_ahciGuestCmdLogged < U60_GUEST_CMD_LOG_MAX) {
+        if (LOCALHOST_VERBOSE_DIAG && g_bpModuleBase && g_ahciGuestCmdLogged < U60_GUEST_CMD_LOG_MAX) {
             g_ahciGuestCmdLogged++;
             printf("[u60] guest cmd #%d: ataCmd=0x%02X (%s) lba=%llu count=%u prdtl=%u slot=%d\n",
                    g_ahciGuestCmdLogged, ataCmd, ataCmdName(ataCmd),
@@ -4229,7 +4241,7 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
     // how many bytes we moved versus what the PRDT asked for. A command that
     // "completes" while transferring the wrong length is exactly the kind of thing
     // that makes a driver retry forever without ever reporting an error.
-    if (g_bpModuleBase && g_ahciGuestCmdLogged <= U60_GUEST_CMD_LOG_MAX && g_ahciGuestCmdLogged > 0) {
+    if (LOCALHOST_VERBOSE_DIAG && g_bpModuleBase && g_ahciGuestCmdLogged <= U60_GUEST_CMD_LOG_MAX && g_ahciGuestCmdLogged > 0) {
         printf("[u60]   -> %s bytesTransferred=%u PxTFD=0x%08X PxIS=0x%08X\n",
                ok ? "OK" : "ERROR(ABRT)", bytesTransferred,
                *(UINT32 *)(port + 0x20), *(UINT32 *)(port + 0x10));
@@ -7331,7 +7343,7 @@ int main(int argc, char *argv[]) {
             // report whether it changes between heartbeats: changing means the guest
             // is rendering and our display path is the problem; static means it is
             // genuinely stuck before Setup's UI.
-            if (ramfbConfigWritten && ramfbAddress && guestMemory &&
+            if (LOCALHOST_VERBOSE_DIAG && ramfbConfigWritten && ramfbAddress && guestMemory &&
                 ramfbAddress + (UINT64)ramfbStride * ramfbHeight <= guestMemSize) {
                 static UINT32 lastFbSum = 0;
                 static int fbSumSeen = 0;
@@ -7533,7 +7545,15 @@ int main(int argc, char *argv[]) {
                         // HalpIommuInitSystem+0x1DF in the first U40 run. That tail was
                         // our own instrument, not guest behaviour. L0 (U34 site) and
                         // L1 (KeBugCheckEx) only.
-                        wpVals[4].Reg64 = 0x1ULL | 0x4ULL | (1ULL << 10);
+                        // U65: L0 (DR0) no longer armed. It still points at
+                        // KiSwInterruptDispatch from U46b, whose question was
+                        // answered long ago (U47 fixed the pass-2 0x139 by
+                        // quiescing the LAPIC). An armed exec breakpoint on a
+                        // function the guest actually executes costs an exit per
+                        // hit and, per the U21 note, re-faults on resume. L1
+                        // (KeBugCheckEx) stays -- it is one-shot, never hit on a
+                        // healthy boot, and is how we still detect bugchecks.
+                        wpVals[4].Reg64 = 0x4ULL | (1ULL << 10);
                         if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, wpNames, 5, wpVals))) {
                             g_wpArmed = 1;
                             g_wp0Fired = 0;
@@ -7541,7 +7561,7 @@ int main(int argc, char *argv[]) {
                             g_wp2Fired = 0;
                             g_haliDispatchArmed = 1;
                             g_haliDispatchHitCount = 0;
-                            g_poolCallerArmed = 1;
+                            g_poolCallerArmed = 0; // U65: DR0 site retired (see the DR7 comment above)
                             g_poolCallerHitCount = 0;
                             g_helperEntryArmed = 1;
                             g_helperEntryHitCount = 0;
