@@ -1165,6 +1165,23 @@ unsigned char uart2FifoEnabled = 0;
 unsigned char uart2DivisorLow = 0, uart2DivisorHigh = 0;
 HANDLE kdPipe = INVALID_HANDLE_VALUE;
 long g_uart2TxTotal = 0, g_uart2Tx30 = 0, g_uart2Tx69 = 0, g_uart2Tx62 = 0; // U63: uncapped COM2 TX tallies
+
+// U68: uncapped tallies for the pipe bridge itself. The guest transmits KD
+// packets and kd reports [no_debuggee], but "guest wrote N bytes to COM2" says
+// nothing about whether those bytes ever reached the debugger -- the ring
+// buffer, the writer thread and WriteFile all sit in between, and any of them
+// can silently swallow them (WriteFile on a pipe with no client fails with
+// ERROR_PIPE_LISTENING, and its return value was being ignored). Every existing
+// KD log in this file is capped, which is exactly how five earlier "finding"s in
+// this investigation turned out to be nothing but a log that had stopped.
+// These are never capped and are printed from the heartbeat.
+long g_kdTxToPipe = 0;     // bytes WriteFile actually accepted
+long g_kdTxWriteFail = 0;  // WriteFile calls that failed
+long g_kdTxDropped = 0;    // guest THR writes dropped because kdTxBuf was full
+DWORD g_kdTxLastErr = 0;   // GetLastError() from the most recent failed WriteFile
+long g_kdRxFromPipe = 0;   // bytes read off the pipe (debugger -> us)
+long g_kdRxToGuest = 0;    // bytes the guest actually consumed via RBR reads
+long g_kdRxDropped = 0;    // pipe bytes dropped because kdRxBuf was full
 CRITICAL_SECTION kdRxLock;
 unsigned char kdRxBuf[4096];
 volatile int kdRxHead = 0, kdRxTail = 0; // ring buffer: pipe reader thread -> guest RBR reads
@@ -4317,14 +4334,29 @@ DWORD WINAPI kdPipeReaderThread(LPVOID param) {
     (void)param;
     unsigned char buf[256];
     static int outerLoopCount = 0;
+    // U68: kdPipe is now an OVERLAPPED handle, so ConnectNamedPipe and ReadFile
+    // return immediately with ERROR_IO_PENDING and we wait on the event
+    // ourselves. Each call needs its OVERLAPPED zeroed apart from hEvent.
+    OVERLAPPED ov;
+    HANDLE ovEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ovEvent) return 1;
     for (;;) {
         outerLoopCount++;
         if (outerLoopCount <= 20) {
             printf("[kd-reader] outer loop #%d: calling ConnectNamedPipe\n", outerLoopCount);
             fflush(stdout);
         }
-        BOOL connected = ConnectNamedPipe(kdPipe, NULL);
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = ovEvent;
+        ResetEvent(ovEvent);
+        BOOL connected = ConnectNamedPipe(kdPipe, &ov);
         DWORD connectErr = connected ? 0 : GetLastError();
+        if (!connected && connectErr == ERROR_IO_PENDING) {
+            WaitForSingleObject(ovEvent, INFINITE);
+            DWORD dummy = 0;
+            connected = GetOverlappedResult(kdPipe, &ov, &dummy, FALSE);
+            connectErr = connected ? 0 : GetLastError();
+        }
         if (!connected && connectErr != ERROR_PIPE_CONNECTED) {
             if (outerLoopCount <= 20) {
                 printf("[kd-reader] ConnectNamedPipe failed, err=%lu -- sleeping\n", connectErr);
@@ -4343,7 +4375,14 @@ DWORD WINAPI kdPipeReaderThread(LPVOID param) {
         int innerReadCount = 0;
         for (;;) {
             DWORD bytesRead = 0;
-            BOOL ok = ReadFile(kdPipe, buf, sizeof(buf), &bytesRead, NULL);
+            ZeroMemory(&ov, sizeof(ov));
+            ov.hEvent = ovEvent;
+            ResetEvent(ovEvent);
+            BOOL ok = ReadFile(kdPipe, buf, sizeof(buf), &bytesRead, &ov);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                WaitForSingleObject(ovEvent, INFINITE);
+                ok = GetOverlappedResult(kdPipe, &ov, &bytesRead, FALSE);
+            }
             DWORD readErr = ok ? 0 : GetLastError();
             innerReadCount++;
             if (outerLoopCount <= 20 && innerReadCount <= 60) {
@@ -4357,7 +4396,8 @@ DWORD WINAPI kdPipeReaderThread(LPVOID param) {
             EnterCriticalSection(&kdRxLock);
             for (DWORD i = 0; i < bytesRead; i++) {
                 int next = (kdRxHead + 1) % (int)sizeof(kdRxBuf);
-                if (next != kdRxTail) { kdRxBuf[kdRxHead] = buf[i]; kdRxHead = next; }
+                if (next != kdRxTail) { kdRxBuf[kdRxHead] = buf[i]; kdRxHead = next; g_kdRxFromPipe++; }
+                else g_kdRxDropped++;
             }
             LeaveCriticalSection(&kdRxLock);
         }
@@ -4379,6 +4419,9 @@ DWORD WINAPI kdPipeReaderThread(LPVOID param) {
 DWORD WINAPI kdPipeWriterThread(LPVOID param) {
     (void)param;
     unsigned char buf[256];
+    OVERLAPPED ov;
+    HANDLE ovEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ovEvent) return 1;
     for (;;) {
         WaitForSingleObject(kdTxEvent, INFINITE);
         for (;;) {
@@ -4390,8 +4433,35 @@ DWORD WINAPI kdPipeWriterThread(LPVOID param) {
             }
             LeaveCriticalSection(&kdTxLock);
             if (count == 0) break;
+
+            // Nothing here may block indefinitely. A debugger that has stopped
+            // reading (kd after [no_debuggee]) leaves the pipe permanently full;
+            // the previous synchronous WriteFile parked this thread inside it
+            // forever and silently binned 32231 guest bytes. Bounded wait, then
+            // cancel and treat the bytes as a transmit overrun -- which is what
+            // a real 16550 does when the far end never asserts CTS.
             DWORD written = 0;
-            WriteFile(kdPipe, buf, count, &written, NULL);
+            ZeroMemory(&ov, sizeof(ov));
+            ov.hEvent = ovEvent;
+            ResetEvent(ovEvent);
+            BOOL ok = WriteFile(kdPipe, buf, count, &written, &ov);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(ovEvent, 250) == WAIT_OBJECT_0) {
+                    ok = GetOverlappedResult(kdPipe, &ov, &written, FALSE);
+                } else {
+                    CancelIoEx(kdPipe, &ov);
+                    // Reap the cancelled request so the OVERLAPPED can be reused.
+                    GetOverlappedResult(kdPipe, &ov, &written, TRUE);
+                    ok = FALSE;
+                    SetLastError(WAIT_TIMEOUT);
+                }
+            }
+            if (ok) {
+                g_kdTxToPipe += (long)written;
+            } else {
+                g_kdTxWriteFail++;
+                g_kdTxLastErr = GetLastError();
+            }
         }
     }
     return 0;
@@ -4446,6 +4516,7 @@ void uart2HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
                     EnterCriticalSection(&kdTxLock);
                     int next = (kdTxHead + 1) % (int)sizeof(kdTxBuf);
                     if (next != kdTxTail) { kdTxBuf[kdTxHead] = val; kdTxHead = next; }
+                    else g_kdTxDropped++;
                     LeaveCriticalSection(&kdTxLock);
                     SetEvent(kdTxEvent);
                 }
@@ -4474,6 +4545,7 @@ void uart2HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
                     if (kdRxTail != kdRxHead) {
                         rax = kdRxBuf[kdRxTail];
                         kdRxTail = (kdRxTail + 1) % (int)sizeof(kdRxBuf);
+                        g_kdRxToGuest++;
                     }
                     LeaveCriticalSection(&kdRxLock);
                 }
@@ -7151,8 +7223,17 @@ int main(int argc, char *argv[]) {
         InitializeCriticalSection(&kdRxLock);
         InitializeCriticalSection(&kdTxLock);
         kdTxEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        // FILE_FLAG_OVERLAPPED (U68) is load-bearing, not a style choice. With a
+        // synchronous handle, WriteFile blocks until the reader drains the pipe --
+        // and a debugger that has given up (kd prints [no_debuggee] after ~7s and
+        // stops reading) never drains it. The 4KB buffer fills, the writer thread
+        // wedges inside WriteFile forever, and every subsequent guest byte is
+        // dropped: measured at 32231 bytes lost and written=0, which is exactly
+        // why kd never saw a single KD packet. Real serial hardware cannot
+        // deadlock the CPU this way -- it shifts bytes out and overruns if nobody
+        // is listening -- so the emulation must not either. See kdPipeWriterThread.
         kdPipe = CreateNamedPipeA("\\\\.\\pipe\\LocalHostKD",
-                                   PIPE_ACCESS_DUPLEX,
+                                   PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                    1, 4096, 4096, 0, NULL);
         if (kdPipe != INVALID_HANDLE_VALUE) {
@@ -7408,6 +7489,12 @@ int main(int argc, char *argv[]) {
             }
                 printf("[heartbeat]   COM2 TX (uncapped): total=%ld  KD leaders: 0x30='0'=%ld 0x69='i'=%ld 0x62='b'=%ld\n",
                        g_uart2TxTotal, g_uart2Tx30, g_uart2Tx69, g_uart2Tx62);
+                // U68: the two halves of the pipe bridge, so "the guest is
+                // transmitting" can be told apart from "the debugger is hearing it".
+                printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
+                       " | pipe->guest: fromPipe=%ld toGuest=%ld ringDrop=%ld\n",
+                       kdClientConnected, g_kdTxToPipe, g_kdTxWriteFail, (unsigned long)g_kdTxLastErr,
+                       g_kdTxDropped, g_kdRxFromPipe, g_kdRxToGuest, g_kdRxDropped);
                 printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)\n",
                        g_ahciIrqCount,
                        g_ahciFwSectors, (g_ahciFwSectors * 512) / (1024 * 1024),
