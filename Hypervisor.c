@@ -979,6 +979,66 @@ static void queueInterrupt(unsigned char vector, int prio) {
     g_irqQueued++;
 }
 
+// Dumps the guest's IDT gate for a few vectors, to answer -- without a debugger --
+// whether Windows has actually CONNECTED an interrupt service routine to them.
+//
+// This is the question left after the interrupt queue: delivery is provably
+// correct (keystrokes queued, IRQs fired on the guest's own unmasked vector 0xA0,
+// none masked, none dropped) and the guest still never reads the byte. Either it
+// has no handler for 0xA0, or it has one and is ignoring us.
+//
+// Vector 0xD1 is the control: the RTC uses it and is serviced tens of thousands of
+// times per run, so whatever a WORKING gate looks like, 0xD1 looks like it. kd
+// could answer this too, but its ~75MB/s memory drain kills a session on this host
+// before a command completes -- twice now.
+extern void *guestMemory;   // defined further down with the rest of the VM state
+extern SIZE_T guestMemSize;
+static void dumpIdtGate(WHV_PARTITION_HANDLE partition, unsigned char vector, const char *what) {
+    WHV_REGISTER_NAME idtrName = WHvX64RegisterIdtr;
+    WHV_REGISTER_VALUE idtr = { 0 };
+    if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &idtrName, 1, &idtr))) return;
+    UINT64 base = idtr.Table.Base;
+    UINT16 limit = idtr.Table.Limit;
+    UINT32 off = (UINT32)vector * 16;
+    if (off + 16 > (UINT32)limit + 1) { printf("[idt] vector 0x%02X beyond IDT limit\n", vector); return; }
+
+    // IDTR.Base is a VIRTUAL address -- a kernel VA like 0xFFFFF802`47068000, not
+    // a GPA. Indexing guest RAM with it directly (as this first did) is simply
+    // wrong and reports "not in mapped guest RAM" for a perfectly valid IDT.
+    // WHvTranslateGva walks the guest's own page tables for us.
+    WHV_GUEST_PHYSICAL_ADDRESS gpa = 0;
+    WHV_TRANSLATE_GVA_RESULT tr = { 0 };
+    HRESULT thr = WHvTranslateGva(partition, 0, base + off,
+                                  WHvTranslateGvaFlagValidateRead, &tr, &gpa);
+    if (FAILED(thr) || tr.ResultCode != WHvTranslateGvaResultSuccess) {
+        printf("[idt] %-8s vector=0x%02X -- GVA 0x%llX untranslatable (hr=0x%lX result=%d)\n",
+               what, vector, (unsigned long long)(base + off),
+               (unsigned long)thr, (int)tr.ResultCode);
+        fflush(stdout);
+        return;
+    }
+    if (!guestMemory || (UINT64)gpa + 16 > (UINT64)guestMemSize) {
+        printf("[idt] %-8s vector=0x%02X -- GPA 0x%llX outside mapped RAM\n",
+               what, vector, (unsigned long long)gpa);
+        fflush(stdout);
+        return;
+    }
+    const unsigned char *g = (const unsigned char *)guestMemory + gpa;
+    UINT16 offLow  = (UINT16)(g[0] | (g[1] << 8));
+    UINT16 sel     = (UINT16)(g[2] | (g[3] << 8));
+    unsigned char ist = g[4];
+    unsigned char type = g[5];
+    UINT16 offMid  = (UINT16)(g[6] | (g[7] << 8));
+    UINT32 offHigh = (UINT32)(g[8] | (g[9] << 8) | (g[10] << 16) | ((UINT32)g[11] << 24));
+    UINT64 handler = (UINT64)offLow | ((UINT64)offMid << 16) | ((UINT64)offHigh << 32);
+    printf("[idt] %-8s vector=0x%02X handler=0x%016llX sel=0x%04X ist=%u type=0x%02X present=%d",
+           what, vector, (unsigned long long)handler, sel, ist & 7, type, (type & 0x80) ? 1 : 0);
+    if (g_bpModuleBase && handler > g_bpModuleBase && handler - g_bpModuleBase < 0x2000000ULL)
+        printf(" (ntoskrnl+0x%llX)", (unsigned long long)(handler - g_bpModuleBase));
+    printf("\n");
+    fflush(stdout);
+}
+
 // Hands the guest one queued interrupt if its pending slot is free. Called every
 // run-loop pass, so a backlog drains as fast as the guest will accept.
 void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
@@ -4741,6 +4801,22 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
             // fired, fired into a masked line, or fired and were ignored.
             g_kbIrqSent++;
             if (!injectDeviceIrq(partition, GSI_KEYBOARD, 0x09)) g_kbIrqMasked++;
+            // On the very first keystroke, show whether the guest has an ISR
+            // connected for the keyboard vector at all -- with the RTC's vector
+            // alongside it as a known-working control.
+            {
+                static int idtDumped = 0;
+                if (!idtDumped) {
+                    idtDumped = 1;
+                    unsigned char kbVec = 0, msVec = 0;
+                    ioapicResolveVector(GSI_KEYBOARD, 0x09, &kbVec);
+                    ioapicResolveVector(GSI_MOUSE, 0x74, &msVec);
+                    printf("[idt] --- first keystroke: is anything listening? ---\n");
+                    dumpIdtGate(partition, kbVec, "keyboard");
+                    dumpIdtGate(partition, msVec, "mouse");
+                    dumpIdtGate(partition, 0xD1,  "RTC/ctrl");
+                }
+            }
         } else if (g_auxUserBytes != lastAuxUser && auxHasData()) {
             lastAuxUser = g_auxUserBytes;
             injectDeviceIrq(partition, GSI_MOUSE, 0x74);
