@@ -2590,18 +2590,35 @@ int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition) {
 // Injects a hardware interrupt vector directly into the vCPU via the
 // "pending interruption" register. This bypasses any PIC/APIC model --
 // it's a minimal stand-in until real 8259 PIC emulation exists.
-// DISABLED. WHvRequestInterrupt is the right API for device interrupts -- it goes
-// through the virtual APIC, respecting TPR/ISR priority and queuing in IRR instead
-// of overwriting -- but it returned WHV_E_INVALID_PARTITION_CONFIG (0xC0350005)
-// here, because it requires the partition to have been CREATED with
-// LocalApicEmulationMode = XApic and ours was not. With the call failing, boot
-// regressed badly (guest died ~14s in, framebuffer stuck at the 1.7% spinner).
+// DISABLED for now, but the earlier explanation of WHY was WRONG and is corrected
+// here.
 //
-// Enabling LocalApicEmulationMode at partition creation is a real option and may
-// well be the correct long-term fix, but it changes interrupt behaviour for every
-// device at once and would need re-validating against the U46/U47 LAPIC work that
-// the 0x139 fix depends on. Not something to fold into a tablet bug hunt.
+// WHvRequestInterrupt is the right API for device interrupts: it goes through the
+// virtual APIC, respecting TPR/ISR priority and queuing in IRR rather than
+// overwriting a single slot. It failed with WHV_E_INVALID_PARTITION_CONFIG
+// (0xC0350005), and I previously recorded that as "the partition lacks LAPIC
+// emulation". That is false -- WHvX64LocalApicEmulationModeXApic is set at
+// partition creation whenever uefiMode is on, which is always.
+//
+// Counting outcomes separately showed what is really happening: ok=1 fail=1, with
+// the failure on VECTOR 0x08. The local APIC cannot deliver vectors below 0x10 --
+// 0..15 are reserved for CPU exceptions -- so the API correctly rejects it. The
+// call works fine for legal vectors.
+//
+// Vector 0x08 is our LEGACY PIC-remapped fallback, used by ioapicResolveVector
+// while an IOAPIC entry is still pristine. The keyboard's legacy fallback is 0x09,
+// also below 0x10 and therefore also illegal to deliver through the APIC -- and
+// meaningless to a Windows kernel in APIC mode even via raw injection. That is a
+// real bug in its own right and a strong candidate for why main-loop PS/2 IRQ
+// delivery destabilises the guest.
+//
+// Switching wholesale still needs care: with the API enabled, boot did not survive
+// (guest exited ~20s in). Legacy vectors must stop being injected once the guest
+// is in APIC mode before this can be turned on.
 #define U99_REQUEST_INTERRUPT 0
+long g_reqIrqOk = 0, g_reqIrqFail = 0;
+HRESULT g_reqIrqLastHr = 0;
+unsigned char g_reqIrqLastVector = 0;
 
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
     logBpEvent("injectInterrupt vector=0x%02X", vector);
@@ -2635,15 +2652,24 @@ void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
     interrupt.Destination = 0;             // APIC ID of the single vCPU
     interrupt.Vector = vector;
     HRESULT irqHr = WHvRequestInterrupt(partition, &interrupt, sizeof(interrupt));
-    if (SUCCEEDED(irqHr)) return;
+    // Count outcomes separately. Last time this was tried, ONE failure was logged
+    // (vector 0x08) and I concluded from it that the partition lacked LAPIC
+    // emulation -- which is false: WHvX64LocalApicEmulationModeXApic is set at
+    // creation whenever uefiMode is on, which is always. Whether the failure is
+    // systematic or a one-off at a particular moment changes the diagnosis
+    // completely, so measure it instead of inferring from a single line.
+    if (SUCCEEDED(irqHr)) { g_reqIrqOk++; return; }
+    g_reqIrqFail++;
+    g_reqIrqLastHr = irqHr;
+    g_reqIrqLastVector = vector;
     // Fall through to the legacy path if the platform refuses the request, so a
     // failure here degrades to the old behaviour rather than dropping the IRQ.
     {
         static int reqFailLogged = 0;
         if (reqFailLogged < 5) {
             reqFailLogged++;
-            printf("[irq] WHvRequestInterrupt failed hr=0x%lX vector=0x%02X -- using legacy injection\n",
-                   (unsigned long)irqHr, vector);
+            printf("[irq] WHvRequestInterrupt failed hr=0x%lX vector=0x%02X (ok=%ld fail=%ld) -- using legacy injection\n",
+                   (unsigned long)irqHr, vector, g_reqIrqOk, g_reqIrqFail);
             fflush(stdout);
         }
     }
