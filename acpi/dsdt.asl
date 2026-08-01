@@ -101,7 +101,8 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "LCLHST", "LHVMDSDT", 0x00000001)
                 Package () { 0x0002FFFF, Zero, Zero, 16 },   /* dev 2, AHCI  INTA# -> GSI 16 */
                 Package () { 0x0003FFFF, Zero, Zero, 17 },   /* dev 3, NIC   INTA# -> GSI 17 */
                 Package () { 0x0001FFFF, Zero, Zero, 18 },   /* dev 1, ISA   INTA# -> GSI 18 */
-                Package () { 0x0000FFFF, Zero, Zero, 19 }    /* dev 0, host  INTA# -> GSI 19 */
+                Package () { 0x0000FFFF, Zero, Zero, 19 },   /* dev 0, host  INTA# -> GSI 19 */
+                Package () { 0x0004FFFF, Zero, Zero, 20 }    /* dev 4, EHCI  INTA# -> GSI 20 */
             })
 
             /*

@@ -2564,6 +2564,54 @@ unsigned char pciIsaBridgeConfig[256] = { 0 };  // 0:1.0 -- PIIX3 ISA bridge
 unsigned char pciPmConfig[256] = { 0 };         // 0:1.3 -- PIIX4 power management
 unsigned char pciAhciConfig[256] = { 0 };       // 0:2.0 -- AHCI (SATA) controller
 unsigned char pciRtl8139Config[256] = { 0 };    // 0:3.0 -- RTL8139 NIC
+unsigned char pciEhciConfig[256] = { 0 };       // 0:4.0 -- EHCI USB 2.0 controller
+
+// --- EHCI (USB 2.0) host controller ---------------------------------------
+//
+// WHY: absolute ("tablet") pointing. The PS/2 aux device is inherently RELATIVE
+// -- auxSendPacket sends dx/dy deltas -- so the host and guest cursors drift
+// apart and can never track 1:1 the way VMware does. Absolute positioning needs
+// a device whose reports carry coordinates, and the only way to get one into
+// stock Windows with NO guest additions is a USB HID tablet: Windows binds it
+// with inbox drivers. Confirmed present in this WinPE via the debugger --
+// usbehci, USBXHCI, USBPORT, usbhub, hidparse and mouclass are all loaded.
+//
+// EHCI rather than xHCI because the register model is far smaller (a capability
+// block plus ~10 operational registers) while still being a controller this
+// guest already has a driver for. Our tablet is declared HIGH-SPEED so no
+// companion controller is needed -- EHCI alone cannot talk to full/low-speed
+// devices, and modelling a UHCI/OHCI companion purely to host one HID device
+// would double the work for nothing.
+#define EHCI_BAR_SIZE   0x1000
+#define EHCI_CAPLENGTH  0x20     // operational registers start here, within the BAR
+#define GSI_EHCI        20       // matches the _PRT entry for device 4 in acpi/dsdt.asl
+
+UINT32 ehciBarBase = 0;          // guest-programmed BAR0 GPA, once set
+int ehciBarMapped = 0;           // BAR0 programmed => MMIO is being decoded
+int ehciBarSizing = 0;           // guest wrote 0xFFFFFFFF to probe the BAR size
+
+// Operational register state. Kept as named fields rather than a backing buffer
+// because almost every one of them has real semantics (RW1C change bits, a reset
+// that must self-clear), and the AHCI ABAR taught us that letting a driver store
+// status bits verbatim produces exactly the sort of self-sustaining interrupt
+// storm U61 had to unpick.
+UINT32 ehciUsbCmd = 0;
+UINT32 ehciUsbSts = 0x00001000;  // HCHalted set: the controller starts halted
+UINT32 ehciUsbIntr = 0;
+UINT32 ehciFrIndex = 0;
+UINT32 ehciCtrlDsSegment = 0;
+UINT32 ehciPeriodicBase = 0;
+UINT32 ehciAsyncBase = 0;
+UINT32 ehciConfigFlag = 0;
+// PORTSC for our single root port. Powered, with the tablet permanently attached:
+// CCS (bit0) = device present, CSC (bit1) = connect change pending so the hub
+// driver notices, PP (bit12) = port powered.
+UINT32 ehciPortSc = 0x00001003;
+
+// Uncapped, per the standing rule in this file: six times now a capped log has
+// produced a wrong conclusion here. "usbehci is talking to us" must be a counter,
+// never an inference from how many lines a log happened to print.
+long g_ehciMmioReads = 0, g_ehciMmioWrites = 0, g_ehciPortResets = 0;
 int pciConfigSpacesInit = 0;
 
 // PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
@@ -3409,6 +3457,18 @@ void pciInitConfigSpaces(void) {
     // INTA# matches the _PRT entry for device 2 in acpi/dsdt.asl (-> GSI 16).
     pciAhciConfig[0x3D] = 0x01; // interrupt pin: INTA#
 
+    // 0:4.0 -- EHCI USB 2.0 controller (ICH9 USB2 EHCI #1). Class 0C/03/20 is
+    // what makes Windows load usbehci.sys against it; prog-IF 0x20 specifically
+    // means EHCI (0x00 UHCI, 0x10 OHCI, 0x30 xHCI).
+    pciEhciConfig[0x00] = 0x86; pciEhciConfig[0x01] = 0x80; // vendor 0x8086 (Intel)
+    pciEhciConfig[0x02] = 0x3A; pciEhciConfig[0x03] = 0x29; // device 0x293A (ICH9 EHCI)
+    pciEhciConfig[0x08] = 0x03; // revision ID
+    pciEhciConfig[0x09] = 0x20; // prog IF: EHCI
+    pciEhciConfig[0x0A] = 0x03; // subclass: USB controller
+    pciEhciConfig[0x0B] = 0x0C; // base class: serial bus controller
+    pciEhciConfig[0x0E] = 0x00; // header type 0, single-function
+    pciEhciConfig[0x3D] = 0x01; // interrupt pin: INTA# -> GSI 20 via the _PRT
+
     // Real Realtek RTL8139 IDs -- same reasoning as AHCI above, matches a
     // real chip so nothing keyed off vendor/device ID gets confused.
     pciRtl8139Config[0x00] = 0xEC; pciRtl8139Config[0x01] = 0x10; // vendor 0x10EC (Realtek)
@@ -3429,6 +3489,7 @@ unsigned char *pciSelectConfigSpace(UINT32 bus, UINT32 dev, UINT32 func) {
     if (dev == 1 && func == 3) return pciPmConfig;
     if (dev == 2 && func == 0) return pciAhciConfig;
     if (dev == 3 && func == 0) return pciRtl8139Config;
+    if (dev == 4 && func == 0) return pciEhciConfig;
     return NULL;
 }
 
@@ -3652,6 +3713,170 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     WHV_REGISTER_VALUE ripVal = { 0 };
     ripVal.Reg64 = exitContext->VpContext.Rip + (UINT64)insnTotalLen;
     WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &ripVal);
+    return 1;
+}
+
+// EHCI BAR0 (offset 0x10), same sizing protocol as AHCI's BAR5: write all-ones
+// to read back a size mask, then write the real aligned base. Unlike the ABAR we
+// never allocate a backing buffer -- every EHCI register has semantics, so the
+// GPA is left unmapped and each access faults out to ehciHandleMmio below.
+void ehciHandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset,
+                          UINT32 accessSize, UINT64 *rax) {
+    if (io->AccessInfo.IsWrite) {
+        if (baseOffset == 0x10 && accessSize >= 4) {
+            UINT32 written = (UINT32)io->Rax;
+            if (written == 0xFFFFFFFF) {
+                ehciBarSizing = 1;
+            } else {
+                ehciBarSizing = 0;
+                UINT32 newBase = written & ~(UINT32)(EHCI_BAR_SIZE - 1);
+                if (newBase != 0 && newBase != ehciBarBase) {
+                    ehciBarBase = newBase;
+                    ehciBarMapped = 1;
+                    printf("[ehci] BAR0 at 0x%X -- trapped MMIO (%d bytes, decoded per access)\n",
+                           ehciBarBase, EHCI_BAR_SIZE);
+                    fflush(stdout);
+                }
+            }
+        }
+        return;
+    }
+    if (baseOffset == 0x10 && accessSize >= 4) {
+        // Size mask: 4KB, memory space, 32-bit, non-prefetchable (low bits 0).
+        *rax = ehciBarSizing ? (UINT32)(~(EHCI_BAR_SIZE - 1)) : ehciBarBase;
+    }
+}
+
+// Decodes accesses to the EHCI register block. Layout per the EHCI 1.0 spec:
+// a read-only capability block at BAR+0, then the operational registers at
+// BAR+CAPLENGTH.
+int ehciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    UINT64 gpa = exitContext->MemoryAccess.Gpa;
+    if (!ehciBarMapped) return 0;
+    if (gpa < ehciBarBase || gpa >= (UINT64)ehciBarBase + EHCI_BAR_SIZE) return 0;
+    UINT32 off = (UINT32)(gpa - ehciBarBase);
+
+    int isWrite = 0, isImm = 0, regNum = 0, insnTotalLen = 0;
+    UINT32 immVal = 0;
+    if (!ioapicDecodeMmio(exitContext->MemoryAccess.InstructionBytes,
+                          exitContext->MemoryAccess.InstructionByteCount,
+                          &isWrite, &isImm, &regNum, &immVal, &insnTotalLen)) {
+        static int ehciFailLog = 0;
+        if (ehciFailLog++ < 20) {
+            printf("[ehci-mmio] undecodable instruction at rip=0x%llX off=0x%X\n",
+                   (unsigned long long)exitContext->VpContext.Rip, off);
+            fflush(stdout);
+        }
+        return 0;
+    }
+
+    if (isWrite) g_ehciMmioWrites++; else g_ehciMmioReads++;
+
+    UINT32 value = immVal;
+    if (isWrite && !isImm) {
+        WHV_REGISTER_VALUE srcVal = { 0 };
+        WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &srcVal);
+        value = (UINT32)srcVal.Reg64;
+    }
+
+    UINT32 result = 0;
+    if (off < EHCI_CAPLENGTH) {
+        // Capability registers are read-only; writes are simply dropped.
+        switch (off & ~3u) {
+            case 0x00:
+                // CAPLENGTH (byte 0) + HCIVERSION (word at 2) = EHCI 1.0.
+                result = EHCI_CAPLENGTH | (0x0100u << 16);
+                break;
+            case 0x04:
+                // HCSPARAMS: 1 port, port power control supported (PPC, bit 4).
+                result = 0x00000011u;
+                break;
+            case 0x08:
+                // HCCPARAMS: 32-bit addressing only, no extended capabilities
+                // (EECP = 0, so no BIOS/OS handoff dance is advertised).
+                result = 0x00000000u;
+                break;
+            default:
+                result = 0; // HCSP-PORTROUTE and reserved space
+                break;
+        }
+    } else {
+        UINT32 op = off - EHCI_CAPLENGTH;
+        switch (op) {
+            case 0x00: // USBCMD
+                if (isWrite) {
+                    if (value & 0x2u) {
+                        // HCRESET: self-clearing, and it returns the controller
+                        // to its powered-on state. The port keeps its connect
+                        // status because the device is physically still there.
+                        ehciUsbCmd = 0;
+                        ehciUsbSts = 0x00001000; // HCHalted
+                        ehciPeriodicBase = ehciAsyncBase = 0;
+                        ehciConfigFlag = 0;
+                        ehciFrIndex = 0;
+                        value &= ~0x2u;
+                    }
+                    ehciUsbCmd = value & ~0x2u;
+                    // Run/Stop drives HCHalted, inverted.
+                    if (ehciUsbCmd & 0x1u) ehciUsbSts &= ~0x00001000u;
+                    else                   ehciUsbSts |= 0x00001000u;
+                }
+                result = ehciUsbCmd;
+                break;
+            case 0x04: // USBSTS -- bits 5:0 are write-1-to-clear
+                if (isWrite) ehciUsbSts &= ~(value & 0x3Fu);
+                result = ehciUsbSts;
+                break;
+            case 0x08: if (isWrite) ehciUsbIntr = value & 0x3F; result = ehciUsbIntr; break;
+            case 0x0C: if (isWrite) ehciFrIndex = value & 0x3FFF; result = ehciFrIndex; break;
+            case 0x10: if (isWrite) ehciCtrlDsSegment = value; result = ehciCtrlDsSegment; break;
+            case 0x14: if (isWrite) ehciPeriodicBase = value & ~0xFFFu; result = ehciPeriodicBase; break;
+            case 0x18: if (isWrite) ehciAsyncBase = value & ~0x1Fu; result = ehciAsyncBase; break;
+            case 0x40: if (isWrite) ehciConfigFlag = value & 0x1; result = ehciConfigFlag; break;
+            case 0x44: { // PORTSC[0]
+                if (isWrite) {
+                    // CSC (bit1) and PEC (bit3) are write-1-to-clear; preserve
+                    // them unless the driver is explicitly acknowledging.
+                    UINT32 rw1c = value & 0x0000002Au;      // CSC | PEC | OCC
+                    UINT32 keep = ehciPortSc & ~0x0000002Au;
+                    UINT32 next = (value & ~0x0000002Au) | (keep & 0x0000002Au);
+                    next &= ~rw1c;
+                    if (value & 0x100u) {
+                        // Port Reset asserted. A real controller drives reset
+                        // while the bit is set; we complete it immediately and
+                        // report the outcome for a HIGH-SPEED device: PR clears
+                        // and PED (bit2) comes up. A full/low-speed device would
+                        // instead clear PED and hand the port to a companion,
+                        // which is exactly what we are avoiding by being HS.
+                        next &= ~0x100u;
+                        next |= 0x4u;
+                        g_ehciPortResets++;
+                    }
+                    // CCS and PP are ours to report, not the driver's to set.
+                    next = (next & ~0x1u) | 0x1u;   // still connected
+                    next |= 0x1000u;                // still powered
+                    ehciPortSc = next;
+                }
+                result = ehciPortSc;
+                break;
+            }
+            default:
+                result = 0;
+                break;
+        }
+    }
+
+    if (!isWrite) {
+        WHV_REGISTER_VALUE dstVal = { 0 };
+        dstVal.Reg64 = result;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &dstVal);
+    }
+    // InstructionLength is not populated for MMIO exits, so advance RIP by the
+    // length our own decode determined (same as the IOAPIC/ABAR paths).
+    WHV_REGISTER_NAME ehciRipName = WHvX64RegisterRip;
+    WHV_REGISTER_VALUE ehciRipVal = { 0 };
+    ehciRipVal.Reg64 = exitContext->VpContext.Rip + (UINT64)insnTotalLen;
+    WHvSetVirtualProcessorRegisters(partition, 0, &ehciRipName, 1, &ehciRipVal);
     return 1;
 }
 
@@ -3914,6 +4139,8 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
             ahciHandleBar5Access(partition, io, baseOffset, accessSize, &rax);
         } else if (cfg == pciRtl8139Config && baseOffset >= 0x10 && baseOffset <= 0x13) {
             rtl8139HandleBar0Access(io, baseOffset, accessSize, &rax);
+        } else if (cfg == pciEhciConfig && baseOffset >= 0x10 && baseOffset <= 0x13) {
+            ehciHandleBar0Access(io, baseOffset, accessSize, &rax);
         } else if (cfg != NULL && baseOffset <= 255) {
             if (io->AccessInfo.IsWrite) {
                 UINT32 i;
@@ -7591,6 +7818,10 @@ int main(int argc, char *argv[]) {
             }
                 printf("[heartbeat]   COM2 TX (uncapped): total=%ld  KD leaders: 0x30='0'=%ld 0x69='i'=%ld 0x62='b'=%ld\n",
                        g_uart2TxTotal, g_uart2Tx30, g_uart2Tx69, g_uart2Tx62);
+                printf("[heartbeat]   EHCI (uncapped): barBase=0x%X reads=%ld writes=%ld portResets=%ld "
+                       "USBCMD=0x%08X USBSTS=0x%08X CONFIGFLAG=%u PORTSC=0x%08X\n",
+                       ehciBarBase, g_ehciMmioReads, g_ehciMmioWrites, g_ehciPortResets,
+                       ehciUsbCmd, ehciUsbSts, ehciConfigFlag, ehciPortSc);
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
                 printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
@@ -8635,6 +8866,9 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 if (ahciHandleAbarMmio(partition, &exitContext)) { // U58: trapped ABAR
+                    break;
+                }
+                if (ehciHandleMmio(partition, &exitContext)) { // USB 2.0 controller
                     break;
                 }
                 UINT64 faultAddr = exitContext.MemoryAccess.Gpa;
