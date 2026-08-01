@@ -2069,6 +2069,15 @@ int kbHead = 0, kbTail = 0;
 // usbServiceSchedules.
 long g_kbEnqueuedTotal = 0, g_auxEnqueuedTotal = 0;
 
+// Bytes that came from REAL USER INPUT, as opposed to command responses the
+// device generates (ACKs, reset/identify replies). The distinction matters for
+// interrupt delivery: the guest POLLS for command responses -- it has just issued
+// the command and is waiting on the status register -- but it can only learn about
+// a keystroke from an interrupt. Injecting for command responses therefore buys
+// nothing and fires during the i8042 init handshake, which is exactly when an
+// unexpected interrupt destabilised boot.
+volatile LONG g_kbUserBytes = 0, g_auxUserBytes = 0;
+
 void kbEnqueue(unsigned char b) {
     kbQueue[kbTail] = b;
     kbTail = (kbTail + 1) % 64;
@@ -2227,6 +2236,7 @@ int g_rawMouseAvailable = 0;
 // that it is the working pointer again.
 long g_auxPackets = 0;        // packets actually queued to the guest
 long g_auxBytesToGuest = 0;   // bytes the guest actually read back out of port 0x60
+long g_kbBytesToGuest = 0;    // keystroke bytes the guest actually read
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
@@ -2265,6 +2275,7 @@ void auxSendPacket(int dx, int dy) {
     if (overflowX) status |= 0x40; // bit 6: X overflow
     if (overflowY) status |= 0x80; // bit 7: Y overflow
 
+    InterlockedIncrement(&g_auxUserBytes);
     auxEnqueue(status);
     auxEnqueue((unsigned char)(dx & 0xFF));
     auxEnqueue((unsigned char)(dy & 0xFF));
@@ -2356,12 +2367,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_KEYDOWN: {
             unsigned char sc = vkToScancode((int)wParam);
-            if (sc != 0) kbEnqueue(sc);
+            if (sc != 0) { kbEnqueue(sc); InterlockedIncrement(&g_kbUserBytes); }
             return 0;
         }
         case WM_KEYUP: {
             unsigned char sc = vkToScancode((int)wParam);
-            if (sc != 0) kbEnqueue(sc | 0x80);
+            if (sc != 0) { kbEnqueue(sc | 0x80); InterlockedIncrement(&g_kbUserBytes); }
             return 0;
         }
         // Raw device motion, used INSTEAD of WM_MOUSEMOVE deltas for movement.
@@ -4620,9 +4631,41 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
         // while it is (or until a small attempt budget runs out), and go silent
         // otherwise: that gives the handshake the nudges it needs without ever
         // hammering a driver that cannot answer.
-        // DISABLED -- main-loop PS/2 interrupt delivery is destabilising in every
-        // shape tried, and a reliably booting guest matters more than a partly
-        // working mouse.
+        // RE-ENABLED, in its least aggressive form: exactly one interrupt per byte
+        // placed in an output buffer, which is what the i8042 does.
+        //
+        // This is required, not an optimisation. Input interrupts are otherwise
+        // delivered only from the HALTED loop, and once Windows settles into
+        // polling the ACPI PM timer (lastPort=0xB008, IRQL 0) it never halts -- so
+        // keystrokes sat queued forever with kbPending=1 and the guest simply never
+        // read them. Typing appeared to work in testing only because the guest was
+        // still busy right after painting and hit HLT between operations.
+        //
+        // Earlier attempts here failed on the RETRY policy, not on delivery itself:
+        // a flat 20ms re-assert and a bounded backoff both broke boot, while this
+        // per-byte form booted cleanly in every run. It also predates the RTC
+        // starvation fix, which was independently starving these interrupts and
+        // made those experiments much harder to read.
+        // Keyed on USER-INPUT arrivals only, not on every byte the device queues.
+        // Command responses (ACKs, reset/identify replies) are polled for by the
+        // guest and need no interrupt from here -- and injecting for them fired
+        // during the i8042 init handshake, which is when boot broke. A keystroke,
+        // by contrast, is unsolicited: an interrupt is the only way the guest can
+        // learn about it, which is why input dies once Windows settles into
+        // polling the PM timer and stops halting.
+        static long lastKbUser = -1, lastAuxUser = -1;
+        if (lastKbUser < 0) { lastKbUser = g_kbUserBytes; lastAuxUser = g_auxUserBytes; }
+        if (g_kbUserBytes != lastKbUser && kbHasData()) {
+            lastKbUser = g_kbUserBytes;
+            injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+        } else if (g_auxUserBytes != lastAuxUser && auxHasData()) {
+            lastAuxUser = g_auxUserBytes;
+            injectDeviceIrq(partition, GSI_MOUSE, 0x74);
+        } else {
+            lastKbUser = g_kbUserBytes;
+            lastAuxUser = g_auxUserBytes;
+        }
+        // Historical note on what NOT to retry here:
         //
         // Four variants were measured: unconditional, flat 20ms re-assert, one
         // interrupt per byte arrival, and a bounded retry that backed off when the
@@ -4738,8 +4781,9 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     // never even sees that aux data is waiting. Undrained keyboard
                     // bytes would therefore block mouse initialisation completely,
                     // no matter how the interrupt is delivered.
-                    printf("[ps2-mouse] queued=%ld consumed=%ld gated=%ld kbPending=%d auxPending=%d "
-                           "(reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
+                    printf("[ps2-input] kbUser=%ld kbRead=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
+                           "kbPending=%d auxPending=%d (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
+                           (long)g_kbUserBytes, g_kbBytesToGuest,
                            g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated,
                            kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
                            auxReportingEnabled, auxPortEnabled,
@@ -9944,7 +9988,16 @@ int main(int argc, char *argv[]) {
                         else returnValue = 0x00;
                     }
                     else if (port == 0x60) {
-                        if (kbHasData()) returnValue = kbDequeue();
+                        if (kbHasData()) {
+                            // Counted for the same reason as the aux side: whether
+                            // the guest READS a keystroke is the only direct
+                            // evidence the keyboard works. Inferring it from
+                            // framebuffer changes is unreliable -- Tab does not
+                            // always repaint anything visible, which already
+                            // produced one false "it works".
+                            g_kbBytesToGuest++;
+                            returnValue = kbDequeue();
+                        }
                         else if (auxHasData()) {
                             // Count what the guest actually CONSUMES. g_auxPackets
                             // only records what we queued, which says nothing about
