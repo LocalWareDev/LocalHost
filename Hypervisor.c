@@ -2237,6 +2237,7 @@ int g_rawMouseAvailable = 0;
 long g_auxPackets = 0;        // packets actually queued to the guest
 long g_auxBytesToGuest = 0;   // bytes the guest actually read back out of port 0x60
 long g_kbBytesToGuest = 0;    // keystroke bytes the guest actually read
+long g_kbIrqSent = 0, g_kbIrqMasked = 0;  // keyboard IRQs we fired / that were masked
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
@@ -4657,7 +4658,13 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
         if (lastKbUser < 0) { lastKbUser = g_kbUserBytes; lastAuxUser = g_auxUserBytes; }
         if (g_kbUserBytes != lastKbUser && kbHasData()) {
             lastKbUser = g_kbUserBytes;
-            injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+            // Counted, and the DELIVERY result kept, because "we injected" and
+            // "the guest got it" are different claims -- injectDeviceIrq returns 0
+            // when the GSI is masked. kbRead frozen while kbUser climbs means the
+            // guest is not reading; this says whether that is because we never
+            // fired, fired into a masked line, or fired and were ignored.
+            g_kbIrqSent++;
+            if (!injectDeviceIrq(partition, GSI_KEYBOARD, 0x09)) g_kbIrqMasked++;
         } else if (g_auxUserBytes != lastAuxUser && auxHasData()) {
             lastAuxUser = g_auxUserBytes;
             injectDeviceIrq(partition, GSI_MOUSE, 0x74);
@@ -4781,9 +4788,9 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     // never even sees that aux data is waiting. Undrained keyboard
                     // bytes would therefore block mouse initialisation completely,
                     // no matter how the interrupt is delivered.
-                    printf("[ps2-input] kbUser=%ld kbRead=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
+                    printf("[ps2-input] kbUser=%ld kbRead=%ld kbIrq=%ld masked=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
                            "kbPending=%d auxPending=%d (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
-                           (long)g_kbUserBytes, g_kbBytesToGuest,
+                           (long)g_kbUserBytes, g_kbBytesToGuest, g_kbIrqSent, g_kbIrqMasked,
                            g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated,
                            kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
                            auxReportingEnabled, auxPortEnabled,
