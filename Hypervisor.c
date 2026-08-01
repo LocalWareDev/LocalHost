@@ -594,6 +594,11 @@ int g_loopAdvHitCount = 0;
 // pass 1 then runs at full speed and only pass 2 bears the per-call overhead
 // (which balloons exitCount) up to the crash.
 int g_sawReset = 0;
+// Set once the guest programs any IOAPIC redirection entry, i.e. it has moved
+// from PIC to APIC interrupt routing. Gates the legacy-vector fallback, which is
+// correct during firmware but illegal afterwards -- see ioapicResolveVector.
+int g_guestApicMode = 0;
+long g_legacyVectorDropped = 0;
 // U28: exitCount at the pass-2 reset, and whether the windowed GetSubsegment
 // capture (DR2 at RtlpHpLfhBucketGetSubsegment+0x45) has been armed yet. That
 // site is HOT, so we only arm it in a narrow window before the ~reset+120k
@@ -2615,6 +2620,14 @@ int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition) {
 // Switching wholesale still needs care: with the API enabled, boot did not survive
 // (guest exited ~20s in). Legacy vectors must stop being injected once the guest
 // is in APIC mode before this can be turned on.
+// STILL 0. With step 1 in place (no illegal low vectors reach here) the API no
+// longer fails -- zero WHvRequestInterrupt failures across a whole boot -- but the
+// GUEST does: it triple-faulted 14s in, "[Unhandled exit reason: 4]"
+// (UnrecoverableException), immediately after the first RTC tick was delivered
+// through the APIC as vector 0xD1. The identical tick delivered by raw injection
+// is fine. So routing real device interrupts through WHvRequestInterrupt needs
+// more than a legal vector -- most likely EOI/level semantics we do not model yet.
+// Left wired up behind this switch since the vector split it needed is now done.
 #define U99_REQUEST_INTERRUPT 0
 long g_reqIrqOk = 0, g_reqIrqFail = 0;
 HRESULT g_reqIrqLastHr = 0;
@@ -2644,6 +2657,16 @@ void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
     // the virtual APIC, which respects TPR/ISR priority and queues in IRR instead
     // of overwriting. Edge trigger is correct here because the level behaviour is
     // already modelled above by re-asserting while the condition holds.
+    // Only vectors 0x10 and above can go through the APIC -- 0..15 are reserved
+    // for CPU exceptions and WHvRequestInterrupt rejects them
+    // (WHV_E_INVALID_PARTITION_CONFIG). Firmware legitimately uses the low
+    // PIC-remapped vectors while the guest is still in PIC mode, so those keep
+    // using raw injection, which is what they have always used and what boot
+    // depends on. Once the guest is in APIC mode ioapicResolveVector no longer
+    // hands out low vectors at all (see g_guestApicMode), so this split is
+    // temporary by construction rather than a permanent special case.
+    if (vector < 0x10) goto legacyInjection;
+
     WHV_INTERRUPT_CONTROL interrupt;
     memset(&interrupt, 0, sizeof(interrupt));
     interrupt.Type = WHvX64InterruptTypeFixed;
@@ -2673,6 +2696,7 @@ void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
             fflush(stdout);
         }
     }
+legacyInjection:
 #endif
 
     WHV_REGISTER_NAME regName = WHvRegisterPendingInterruption;
@@ -4540,22 +4564,35 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     // IRQ delivery hit. Windows is the only consumer that needs them, and by the
     // time it initialises the aux device the kernel has long since been
     // discovered.
-    // DO NOT deliver PS/2 keyboard/mouse interrupts from here. Tried twice, both
-    // times it broke boot -- the guest never got past the firmware/early-kernel
-    // phase (framebuffer stuck at 1.8% for 220-270s) even when asserted only on
-    // the rising edge with a 20ms re-assert. An earlier attempt at main-loop PS/2
-    // delivery had already been reverted for wedging firmware at ~25000 exits, so
-    // this is now the third confirmation. Those IRQs stay in the halted loop.
+    // PS/2 keyboard/mouse interrupts, retried now that the legacy-vector bug is
+    // fixed. Every previous attempt at delivering these from the main loop broke
+    // boot, and the suspected reason was that while an IOAPIC entry is still
+    // pristine injectDeviceIrq fell back to legacy vector 0x09 -- below 0x10,
+    // reserved for CPU exceptions, and meaningless to a Windows kernel in APIC
+    // mode. ioapicResolveVector now DROPS those instead (g_guestApicMode), so the
+    // conditions that broke it no longer exist.
     //
-    // The cost is real and known: because they only fire while the guest is idle,
-    // the mouse never initialises. i8042prt resets the aux device during a BUSY
-    // phase of boot, gets no IRQ12, times out and retries. Typing works only
-    // because you type at an idle guest. Fixing this needs the interrupt to reach
-    // a busy guest without destabilising it -- most likely the LocalApicEmulationMode
-    // work noted above, not another attempt at poking it from this loop. One
-    // strong suspect for the instability: while IOAPIC entry 1 is still pristine
-    // injectDeviceIrq falls back to legacy vector 0x09, which is meaningless to a
-    // Windows kernel in APIC mode.
+    // Still gated on the kernel being up (firmware polls the i8042 and injecting
+    // during that phase wedged it at ~25000 exits), and still edge-asserted with a
+    // slow re-assert so a pending byte cannot become a 1kHz storm.
+    if (g_bpModuleBase && guestInterruptsEnabled(partition)) {
+        static LARGE_INTEGER lastPs2Tick;
+        static int ps2Asserted = 0;
+        int havePs2 = kbHasData() || auxHasData();
+        if (!havePs2) {
+            ps2Asserted = 0;                             // drained; re-arm the edge
+        } else {
+            double sincePs2Ms = lastPs2Tick.QuadPart
+                ? (double)(now.QuadPart - lastPs2Tick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+                : 1e9;
+            if (!ps2Asserted || sincePs2Ms >= 20.0) {
+                lastPs2Tick = now;
+                ps2Asserted = 1;
+                if (kbHasData())       injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+                else if (auxHasData()) injectDeviceIrq(partition, GSI_MOUSE, 0x74);
+            }
+        }
+    }
 
     ehciProcessAsyncSchedule();
     ehciProcessPeriodicSchedule();
@@ -4630,10 +4667,19 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
             // visible whether or not the tablet is enabled and regardless of how
             // idle the guest is.
             {
+                // Also fires when reporting/port state changes, not just on packet
+                // counts. Keyed on counts alone the line went stale the moment the
+                // mouse stopped moving, and a stale "reporting=0" printed BEFORE
+                // the guest sent 0xF4 read exactly like the enable had never
+                // happened.
                 static long lastAux = -1, lastAuxGated = -1;
-                if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated) {
+                static int lastReporting = -1, lastPortEnabled = -1;
+                if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated ||
+                    auxReportingEnabled != lastReporting || auxPortEnabled != lastPortEnabled) {
                     lastAux = g_auxPackets;
                     lastAuxGated = g_auxPacketsGated;
+                    lastReporting = auxReportingEnabled;
+                    lastPortEnabled = auxPortEnabled;
                     printf("[ps2-mouse] packets=%ld gated=%ld (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
                            g_auxPackets, g_auxPacketsGated, auxReportingEnabled, auxPortEnabled,
                            g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
@@ -5867,6 +5913,18 @@ void ioapicWriteRegister(IoApicState *ap, UINT32 reg, UINT32 value) {
         UINT64 old = ap->redirTable[entry];
         if (isHigh) ap->redirTable[entry] = (old & 0xFFFFFFFFULL) | ((UINT64)value << 32);
         else ap->redirTable[entry] = (old & 0xFFFFFFFF00000000ULL) | value;
+        // The guest programming ANY redirection entry means it has moved to APIC
+        // interrupt routing. From that point the legacy PIC-remapped vectors are
+        // not just unhelpful, they are illegal: 0x08 (RTC) and 0x09 (keyboard) sit
+        // below 0x10, which the local APIC reserves for CPU exceptions -- the APIC
+        // refuses to deliver them, and a Windows kernel in APIC mode has no
+        // handler registered for them either way. See ioapicResolveVector.
+        if (!g_guestApicMode) {
+            g_guestApicMode = 1;
+            printf("[apic] guest programmed an IOAPIC redirection entry -- APIC mode; "
+                   "legacy vector fallback now disabled\n");
+            fflush(stdout);
+        }
     }
 }
 
@@ -5898,6 +5956,22 @@ int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outV
     int entry = (gsi < 24) ? gsi : (gsi - IOAPIC2_GSI_BASE);
     UINT64 rte = ap->redirTable[entry];
     if (rte == 0x10000ULL) {
+        // Entry still at its power-on default. While the guest is in PIC mode
+        // (firmware, bootloader) the legacy vector is exactly right and boot
+        // depends on it. Once the guest has moved to APIC routing, however, an
+        // unprogrammed entry means it has not routed this GSI yet -- so DROP it
+        // rather than inject a legacy vector.
+        //
+        // Injecting anyway was actively harmful: 0x08 and 0x09 are below 0x10,
+        // which the local APIC reserves for CPU exceptions. WHvRequestInterrupt
+        // rejects them outright (measured: hr=0xC0350005 on vector 0x08 while
+        // other vectors succeeded), and even forced in raw they land on a vector
+        // no Windows ISR is registered for. This is the most likely reason three
+        // separate attempts at main-loop PS/2 IRQ delivery broke the boot.
+        if (g_guestApicMode) {
+            g_legacyVectorDropped++;
+            return 0;
+        }
         *outVector = legacyVector;
         return 1;
     }
