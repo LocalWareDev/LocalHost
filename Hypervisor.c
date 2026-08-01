@@ -2612,6 +2612,8 @@ UINT32 ehciPortSc = 0x00001003;
 // produced a wrong conclusion here. "usbehci is talking to us" must be a counter,
 // never an inference from how many lines a log happened to print.
 long g_ehciMmioReads = 0, g_ehciMmioWrites = 0, g_ehciPortResets = 0;
+int g_ehciIrqPending = 0;   // set when a qTD with IOC retires, drained by the run loop
+long g_ehciIrqCount = 0, g_ehciLastIrqExit = 0;
 int pciConfigSpacesInit = 0;
 
 // PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
@@ -3744,6 +3746,443 @@ void ehciHandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset,
     if (baseOffset == 0x10 && accessSize >= 4) {
         // Size mask: 4KB, memory space, 32-bit, non-prefetchable (low bits 0).
         *rax = ehciBarSizing ? (UINT32)(~(EHCI_BAR_SIZE - 1)) : ehciBarBase;
+    }
+}
+
+// --- USB HID tablet: descriptors -------------------------------------------
+//
+// A single high-speed device permanently attached to the root port. The report
+// descriptor is the whole point: X and Y are declared ABSOLUTE (Input flag 0x02
+// = Data,Var,Abs) with a 0..32767 logical range, so each report carries a
+// position rather than a delta. That is what lets the guest cursor sit exactly
+// where the host cursor is, which a PS/2 mouse can never do.
+static const unsigned char usbTabletDeviceDesc[18] = {
+    18, 0x01,               // bLength, bDescriptorType = DEVICE
+    0x00, 0x02,             // bcdUSB 2.00
+    0x00, 0x00, 0x00,       // class/subclass/protocol: defined at interface level
+    64,                     // bMaxPacketSize0
+    0x27, 0x06,             // idVendor  0x0627 (QEMU's, a known-good HID tablet id)
+    0x01, 0x00,             // idProduct 0x0001
+    0x00, 0x01,             // bcdDevice 1.00
+    1, 2, 0,                // iManufacturer, iProduct, iSerialNumber
+    1                       // bNumConfigurations
+};
+
+// Config (9) + Interface (9) + HID (9) + Endpoint (7) = 34 bytes.
+static const unsigned char usbTabletConfigDesc[34] = {
+    9, 0x02,                // bLength, CONFIGURATION
+    34, 0x00,               // wTotalLength
+    1,                      // bNumInterfaces
+    1,                      // bConfigurationValue
+    0,                      // iConfiguration
+    0xA0,                   // bmAttributes: bus powered, remote wakeup
+    50,                     // bMaxPower (100mA)
+
+    9, 0x04,                // bLength, INTERFACE
+    0,                      // bInterfaceNumber
+    0,                      // bAlternateSetting
+    1,                      // bNumEndpoints
+    0x03,                   // bInterfaceClass: HID
+    0x00,                   // bInterfaceSubClass: no boot protocol -- a boot mouse
+                            // is relative by definition, so claiming it would
+                            // invite the guest to use the wrong report format
+    0x00,                   // bInterfaceProtocol
+    0,                      // iInterface
+
+    9, 0x21,                // bLength, HID descriptor
+    0x01, 0x01,             // bcdHID 1.01
+    0x00,                   // bCountryCode
+    1,                      // bNumDescriptors
+    0x22,                   // bDescriptorType: REPORT
+    74, 0x00,               // wDescriptorLength (must match the array below)
+
+    7, 0x05,                // bLength, ENDPOINT
+    0x81,                   // bEndpointAddress: EP1 IN
+    0x03,                   // bmAttributes: interrupt
+    8, 0x00,                // wMaxPacketSize (our report is 6 bytes)
+    10                      // bInterval
+};
+
+// 6-byte report: buttons(1) + X(2, LE) + Y(2, LE) + wheel(1).
+static const unsigned char usbTabletReportDesc[74] = {
+    0x05, 0x01,             // Usage Page (Generic Desktop)
+    0x09, 0x02,             // Usage (Mouse)
+    0xA1, 0x01,             // Collection (Application)
+    0x09, 0x01,             //   Usage (Pointer)
+    0xA1, 0x00,             //   Collection (Physical)
+    0x05, 0x09,             //     Usage Page (Button)
+    0x19, 0x01,             //     Usage Minimum (1)
+    0x29, 0x03,             //     Usage Maximum (3)
+    0x15, 0x00,             //     Logical Minimum (0)
+    0x25, 0x01,             //     Logical Maximum (1)
+    0x95, 0x03,             //     Report Count (3)
+    0x75, 0x01,             //     Report Size (1)
+    0x81, 0x02,             //     Input (Data,Var,Abs)
+    0x95, 0x01,             //     Report Count (1)
+    0x75, 0x05,             //     Report Size (5)
+    0x81, 0x01,             //     Input (Constant) -- padding to a byte
+    0x05, 0x01,             //     Usage Page (Generic Desktop)
+    0x09, 0x30,             //     Usage (X)
+    0x09, 0x31,             //     Usage (Y)
+    0x15, 0x00,             //     Logical Minimum (0)
+    0x26, 0xFF, 0x7F,       //     Logical Maximum (32767)
+    0x35, 0x00,             //     Physical Minimum (0)
+    0x46, 0xFF, 0x7F,       //     Physical Maximum (32767)
+    0x75, 0x10,             //     Report Size (16)
+    0x95, 0x02,             //     Report Count (2)
+    0x81, 0x02,             //     Input (Data,Var,ABSOLUTE) -- the whole point
+    0x05, 0x01,             //     Usage Page (Generic Desktop)
+    0x09, 0x38,             //     Usage (Wheel)
+    0x15, 0x81,             //     Logical Minimum (-127)
+    0x25, 0x7F,             //     Logical Maximum (127)
+    0x75, 0x08,             //     Report Size (8)
+    0x95, 0x01,             //     Report Count (1)
+    0x81, 0x06,             //     Input (Data,Var,Rel)
+    0xC0,                   //   End Collection
+    0xC0                    // End Collection
+};
+
+// --- USB HID tablet: device state ------------------------------------------
+int usbTabletAddress = 0;        // address assigned by SET_ADDRESS
+int usbTabletPendingAddr = -1;   // takes effect after the status stage completes
+int usbTabletConfigured = 0;
+unsigned char usbTabletSetup[8];         // most recent SETUP packet
+unsigned char usbTabletReplyBuf[128];    // staged response for the data stage
+UINT32 usbTabletReplyLen = 0, usbTabletReplyPos = 0;
+long g_usbSetupPackets = 0, g_usbDescriptorReads = 0, g_usbStalls = 0, g_usbReportsSent = 0;
+
+// Absolute pointer state, fed by the window (0..32767 in both axes).
+volatile LONG g_tabletX = 16384, g_tabletY = 16384;
+volatile LONG g_tabletButtons = 0, g_tabletWheel = 0;
+volatile LONG g_tabletDirty = 0;
+
+static UINT32 usbMin32(UINT32 a, UINT32 b) { return a < b ? a : b; }
+
+// Builds a USB string descriptor (UTF-16LE) in place.
+static UINT32 usbMakeStringDesc(unsigned char *out, const char *ascii) {
+    UINT32 n = 0, i;
+    UINT32 len = 0;
+    while (ascii[len]) len++;
+    out[0] = (unsigned char)(2 + len * 2);
+    out[1] = 0x03;
+    n = 2;
+    for (i = 0; i < len; i++) { out[n++] = (unsigned char)ascii[i]; out[n++] = 0; }
+    return n;
+}
+
+// Handles a control request on endpoint 0. Returns the number of bytes staged
+// into usbTabletReplyBuf for the data stage, or -1 to STALL.
+int usbTabletHandleControl(const unsigned char *setup) {
+    unsigned char bmRequestType = setup[0];
+    unsigned char bRequest = setup[1];
+    UINT16 wValue = (UINT16)(setup[2] | (setup[3] << 8));
+    UINT16 wIndex = (UINT16)(setup[4] | (setup[5] << 8));
+    UINT16 wLength = (UINT16)(setup[6] | (setup[7] << 8));
+
+    usbTabletReplyLen = 0;
+    usbTabletReplyPos = 0;
+
+    // Log the actual conversation. Enumeration stalls are essentially impossible
+    // to diagnose from aggregate counters -- "stalls=1" says nothing about WHICH
+    // request the guest gave up on -- and guessing cost a rebuild already.
+    static int usbSetupLogged = 0;
+    if (usbSetupLogged < 60) {
+        usbSetupLogged++;
+        printf("[usb-setup #%d] bmRequestType=0x%02X bRequest=0x%02X wValue=0x%04X wIndex=0x%04X wLength=%u\n",
+               usbSetupLogged, bmRequestType, bRequest, wValue, wIndex, wLength);
+        fflush(stdout);
+    }
+
+    // Standard device requests
+    if ((bmRequestType & 0x60) == 0x00) {
+        switch (bRequest) {
+            case 0x06: { // GET_DESCRIPTOR
+                unsigned char type = (unsigned char)(wValue >> 8);
+                UINT32 n = 0;
+                g_usbDescriptorReads++;
+                if (type == 0x01) {                    // DEVICE
+                    n = sizeof(usbTabletDeviceDesc);
+                    memcpy(usbTabletReplyBuf, usbTabletDeviceDesc, n);
+                } else if (type == 0x02) {             // CONFIGURATION
+                    n = sizeof(usbTabletConfigDesc);
+                    memcpy(usbTabletReplyBuf, usbTabletConfigDesc, n);
+                } else if (type == 0x03) {             // STRING
+                    unsigned char idx = (unsigned char)(wValue & 0xFF);
+                    if (idx == 0) {                    // supported languages
+                        usbTabletReplyBuf[0] = 4; usbTabletReplyBuf[1] = 0x03;
+                        usbTabletReplyBuf[2] = 0x09; usbTabletReplyBuf[3] = 0x04; // en-US
+                        n = 4;
+                    } else if (idx == 1) {
+                        n = usbMakeStringDesc(usbTabletReplyBuf, "LocalHost");
+                    } else if (idx == 2) {
+                        n = usbMakeStringDesc(usbTabletReplyBuf, "LocalHost USB Tablet");
+                    } else {
+                        g_usbStalls++;
+                        return -1;
+                    }
+                } else if (type == 0x22) {             // HID REPORT descriptor
+                    n = sizeof(usbTabletReportDesc);
+                    memcpy(usbTabletReplyBuf, usbTabletReportDesc, n);
+                } else if (type == 0x21) {             // HID descriptor alone
+                    n = 9;
+                    memcpy(usbTabletReplyBuf, usbTabletConfigDesc + 18, 9);
+                } else if (type == 0x06) {             // DEVICE_QUALIFIER
+                    // Required, not optional: we declare bcdUSB 2.00 and operate
+                    // at high speed, and a high-speed-capable device MUST answer
+                    // this (it describes how the device would look at its OTHER
+                    // speed). Stalling it is only correct for a full-speed-only
+                    // device -- doing so here cost one STALL during enumeration
+                    // and Windows never went on to SET_CONFIGURATION.
+                    usbTabletReplyBuf[0] = 10;         // bLength
+                    usbTabletReplyBuf[1] = 0x06;       // bDescriptorType
+                    usbTabletReplyBuf[2] = 0x00;       // bcdUSB 2.00
+                    usbTabletReplyBuf[3] = 0x02;
+                    usbTabletReplyBuf[4] = 0x00;       // bDeviceClass
+                    usbTabletReplyBuf[5] = 0x00;       // bDeviceSubClass
+                    usbTabletReplyBuf[6] = 0x00;       // bDeviceProtocol
+                    usbTabletReplyBuf[7] = 64;         // bMaxPacketSize0
+                    usbTabletReplyBuf[8] = 1;          // bNumConfigurations
+                    usbTabletReplyBuf[9] = 0;          // bReserved
+                    n = 10;
+                } else if (type == 0x07) {             // OTHER_SPEED_CONFIGURATION
+                    // Same layout as our configuration, retyped.
+                    n = sizeof(usbTabletConfigDesc);
+                    memcpy(usbTabletReplyBuf, usbTabletConfigDesc, n);
+                    usbTabletReplyBuf[1] = 0x07;
+                } else {
+                    g_usbStalls++;
+                    return -1;
+                }
+                usbTabletReplyLen = usbMin32(n, wLength);
+                return (int)usbTabletReplyLen;
+            }
+            case 0x05: // SET_ADDRESS -- applies after the status stage
+                usbTabletPendingAddr = wValue & 0x7F;
+                return 0;
+            case 0x09: // SET_CONFIGURATION
+                usbTabletConfigured = (wValue != 0);
+                return 0;
+            case 0x08: // GET_CONFIGURATION
+                usbTabletReplyBuf[0] = (unsigned char)usbTabletConfigured;
+                usbTabletReplyLen = usbMin32(1, wLength);
+                return (int)usbTabletReplyLen;
+            case 0x00: // GET_STATUS
+                usbTabletReplyBuf[0] = 0x01; // self-powered
+                usbTabletReplyBuf[1] = 0x00;
+                usbTabletReplyLen = usbMin32(2, wLength);
+                return (int)usbTabletReplyLen;
+            case 0x01: case 0x03: // CLEAR_FEATURE / SET_FEATURE
+                return 0;
+            case 0x0A: // GET_INTERFACE
+                usbTabletReplyBuf[0] = 0;
+                usbTabletReplyLen = usbMin32(1, wLength);
+                return (int)usbTabletReplyLen;
+            case 0x0B: // SET_INTERFACE
+                return 0;
+            default:
+                g_usbStalls++;
+                return -1;
+        }
+    }
+
+    // Class (HID) requests
+    if ((bmRequestType & 0x60) == 0x20) {
+        switch (bRequest) {
+            case 0x0A: // SET_IDLE
+            case 0x0B: // SET_PROTOCOL
+            case 0x09: // SET_REPORT
+                return 0;
+            case 0x01: { // GET_REPORT -- answer with the current position
+                UINT32 n = 6;
+                usbTabletReplyBuf[0] = (unsigned char)g_tabletButtons;
+                usbTabletReplyBuf[1] = (unsigned char)(g_tabletX & 0xFF);
+                usbTabletReplyBuf[2] = (unsigned char)((g_tabletX >> 8) & 0xFF);
+                usbTabletReplyBuf[3] = (unsigned char)(g_tabletY & 0xFF);
+                usbTabletReplyBuf[4] = (unsigned char)((g_tabletY >> 8) & 0xFF);
+                usbTabletReplyBuf[5] = 0;
+                usbTabletReplyLen = usbMin32(n, wLength);
+                return (int)usbTabletReplyLen;
+            }
+            case 0x02: // GET_IDLE
+                usbTabletReplyBuf[0] = 0;
+                usbTabletReplyLen = usbMin32(1, wLength);
+                return (int)usbTabletReplyLen;
+            case 0x03: // GET_PROTOCOL
+                usbTabletReplyBuf[0] = 1; // report protocol
+                usbTabletReplyLen = usbMin32(1, wLength);
+                return (int)usbTabletReplyLen;
+            default:
+                g_usbStalls++;
+                return -1;
+        }
+    }
+
+    g_usbStalls++;
+    return -1;
+}
+
+// --- EHCI schedule execution ------------------------------------------------
+static UINT32 ehciMemRead32(UINT64 gpa) {
+    if (!guestMemory || gpa + 4 > (UINT64)guestMemSize) return 0;
+    return *(UINT32 *)((unsigned char *)guestMemory + gpa);
+}
+static void ehciMemWrite32(UINT64 gpa, UINT32 v) {
+    if (!guestMemory || gpa + 4 > (UINT64)guestMemSize) return;
+    *(UINT32 *)((unsigned char *)guestMemory + gpa) = v;
+}
+
+// qTD buffers are up to five 4KB pages; only pointer 0 carries a byte offset.
+// Transfers here are tiny (<= 64 bytes) but can still straddle a page boundary,
+// so walk the pages properly rather than assuming buffer 0 covers it.
+static UINT32 ehciQtdCopy(UINT64 qtdGpa, UINT32 offset, unsigned char *hostBuf,
+                          UINT32 len, int toGuest) {
+    UINT32 done = 0;
+    while (done < len) {
+        UINT32 cur = offset + done;
+        UINT32 page = cur >> 12;
+        if (page > 4) break;
+        UINT32 bufPtr = ehciMemRead32(qtdGpa + 0x0C + page * 4);
+        UINT32 pageOff = (page == 0) ? (bufPtr & 0xFFF) + cur : (cur & 0xFFF);
+        UINT64 gpa = (UINT64)(bufPtr & ~0xFFFu) + pageOff;
+        UINT32 chunk = 0x1000 - (UINT32)(gpa & 0xFFF);
+        if (chunk > len - done) chunk = len - done;
+        if (!guestMemory || gpa + chunk > (UINT64)guestMemSize) break;
+        unsigned char *p = (unsigned char *)guestMemory + gpa;
+        if (toGuest) memcpy(p, hostBuf + done, chunk);
+        else         memcpy(hostBuf + done, p, chunk);
+        done += chunk;
+    }
+    return done;
+}
+
+// Walks the async (control/bulk) schedule and executes any active qTDs against
+// our virtual tablet. Called from the run loop rather than on a register write,
+// because a real HC runs the schedule continuously and USBPORT queues transfers
+// without touching a doorbell.
+void ehciProcessAsyncSchedule(void) {
+    if (!(ehciUsbCmd & 0x1u)) return;        // Run/Stop clear -- HC halted
+    if (!(ehciUsbCmd & 0x20u)) return;       // async schedule not enabled
+    if (!ehciAsyncBase || !guestMemory) return;
+
+    UINT64 qh = ehciAsyncBase;
+    int qhGuard = 0;
+    int raisedInterrupt = 0;
+
+    // The async list is circular; bound the walk so a malformed list cannot spin.
+    for (qhGuard = 0; qhGuard < 32; qhGuard++) {
+        UINT32 epChar = ehciMemRead32(qh + 0x04);
+        UINT32 devAddr = epChar & 0x7F;
+        UINT32 endpt = (epChar >> 8) & 0xF;
+
+        // Only our device answers. Address 0 is the enumeration default, which
+        // every device must respond to until SET_ADDRESS takes effect.
+        int forUs = (devAddr == 0 || (int)devAddr == usbTabletAddress);
+
+        UINT64 qtd = ehciMemRead32(qh + 0x10) & ~0x1Fu;
+        int qtdGuard = 0;
+        while (forUs && qtd && !(ehciMemRead32(qh + 0x10) & 0x1u) && qtdGuard < 16) {
+            qtdGuard++;
+            UINT32 token = ehciMemRead32(qtd + 0x08);
+            if (!(token & 0x80u)) break;                 // not Active -- nothing to do
+            UINT32 pid = (token >> 8) & 0x3;
+            UINT32 total = (token >> 16) & 0x7FFF;
+            UINT32 moved = 0;
+
+            if (pid == 2) {                              // SETUP
+                unsigned char setup[8];
+                ehciQtdCopy(qtd, 0, setup, 8, 0);
+                memcpy(usbTabletSetup, setup, 8);
+                g_usbSetupPackets++;
+                int r = usbTabletHandleControl(setup);
+                if (r < 0) {
+                    // STALL: halt the qTD so the driver sees the error, exactly
+                    // as hardware would, instead of silently completing.
+                    token &= ~0x80u;
+                    token |= 0x40u;
+                    ehciMemWrite32(qtd + 0x08, token);
+                    ehciMemWrite32(qh + 0x18, token);
+                    // ...and RAISE THE ERROR INTERRUPT. A halted qTD is still a
+                    // completed transfer as far as the driver is concerned, and
+                    // it only inspects the queue from its ISR. Breaking out here
+                    // without signalling left Windows waiting forever on a
+                    // perfectly ordinary protocol stall -- measured: enumeration
+                    // stopped dead at the Microsoft OS string descriptor (index
+                    // 0xEE), which every device is entitled to stall.
+                    ehciUsbSts |= 0x2u;   // USBERRINT
+                    if (token & 0x8000u) ehciUsbSts |= 0x1u;
+                    raisedInterrupt = 1;
+                    break;
+                }
+                moved = total;
+            } else if (pid == 1) {                       // IN (device -> host)
+                if (endpt == 0) {
+                    UINT32 avail = usbTabletReplyLen - usbTabletReplyPos;
+                    UINT32 n = usbMin32(avail, total);
+                    if (n) {
+                        ehciQtdCopy(qtd, 0, usbTabletReplyBuf + usbTabletReplyPos, n, 1);
+                        usbTabletReplyPos += n;
+                    }
+                    moved = n;
+                } else {
+                    // Interrupt IN on EP1 -- the HID report itself. Delivered
+                    // from the periodic schedule in practice, but answering here
+                    // too costs nothing and some stacks probe via async.
+                    unsigned char rep[6];
+                    rep[0] = (unsigned char)g_tabletButtons;
+                    rep[1] = (unsigned char)(g_tabletX & 0xFF);
+                    rep[2] = (unsigned char)((g_tabletX >> 8) & 0xFF);
+                    rep[3] = (unsigned char)(g_tabletY & 0xFF);
+                    rep[4] = (unsigned char)((g_tabletY >> 8) & 0xFF);
+                    rep[5] = (unsigned char)g_tabletWheel;
+                    UINT32 n = usbMin32(6, total);
+                    ehciQtdCopy(qtd, 0, rep, n, 1);
+                    g_usbReportsSent++;
+                    moved = n;
+                }
+            } else {                                     // OUT
+                moved = total;
+            }
+
+            // SET_ADDRESS takes effect only once its STATUS stage completes. For
+            // a control transfer with NO data stage -- which SET_ADDRESS is --
+            // that status stage is a zero-length IN, not an OUT. Applying it only
+            // on OUT meant the address was never adopted: the device kept
+            // answering on 0, the driver gave up and re-reset the port, and
+            // enumeration looped (measured: setups=2, portResets=2, addr=0).
+            // Keying on "zero-length transfer on endpoint 0" covers both
+            // directions and both control-transfer shapes.
+            if (endpt == 0 && total == 0 && usbTabletPendingAddr >= 0) {
+                usbTabletAddress = usbTabletPendingAddr;
+                usbTabletPendingAddr = -1;
+                printf("[usb] tablet address set to %d\n", usbTabletAddress);
+                fflush(stdout);
+            }
+
+            // Retire the qTD: clear Active, report the residual byte count.
+            UINT32 residual = (total > moved) ? (total - moved) : 0;
+            token &= ~0x80u;
+            token = (token & ~(0x7FFFu << 16)) | (residual << 16);
+            ehciMemWrite32(qtd + 0x08, token);
+            ehciMemWrite32(qh + 0x18, token);            // mirror into the overlay
+
+            if (token & 0x8000u) raisedInterrupt = 1;    // IOC
+
+            UINT32 next = ehciMemRead32(qtd + 0x00);
+            ehciMemWrite32(qh + 0x10, next);             // advance the overlay
+            if (next & 0x1u) break;                      // T bit -- end of chain
+            qtd = next & ~0x1Fu;
+        }
+
+        UINT32 link = ehciMemRead32(qh + 0x00);
+        if (link & 0x1u) break;                          // T bit -- list terminates
+        UINT64 nextQh = link & ~0x1Fu;
+        if (nextQh == ehciAsyncBase || nextQh == 0) break; // wrapped
+        qh = nextQh;
+    }
+
+    if (raisedInterrupt) {
+        ehciUsbSts |= 0x1u;                              // USBINT
+        if (ehciUsbIntr & 0x1u) g_ehciIrqPending = 1;
     }
 }
 
@@ -7724,6 +8163,30 @@ int main(int argc, char *argv[]) {
         // buffer and returns immediately in the common case.
         ahciServiceLevelInterrupt(partition, exitCount);
 
+        // Run the USB async schedule. A real host controller executes its
+        // schedules continuously off the frame timer, and USBPORT queues
+        // transfers without ringing any doorbell we could trap -- so this has to
+        // be polled rather than driven from a register write. Throttled because
+        // walking guest memory on every single exit would dominate the loop.
+        if (exitCount % 64 == 0) {
+            ehciProcessAsyncSchedule();
+            // EHCI's interrupt is LEVEL-triggered: the line stays asserted while
+            // an enabled status bit is set in USBSTS, and only the driver writing
+            // 1-to-clear takes it away. Injecting a single edge per completion
+            // left USBSTS=0x1 unacknowledged forever and enumeration stopped dead
+            // after the first descriptor -- the identical failure U56 had to fix
+            // for AHCI. Re-assert while the condition holds, throttled so it
+            // cannot become the self-sustaining storm U61 had to unpick.
+            if ((ehciUsbSts & ehciUsbIntr & 0x3F) != 0) {
+                if (exitCount - g_ehciLastIrqExit >= 256 && guestInterruptsEnabled(partition)) {
+                    g_ehciLastIrqExit = exitCount;
+                    g_ehciIrqCount++;
+                    injectDeviceIrq(partition, GSI_EHCI, 0x75);
+                }
+            }
+            g_ehciIrqPending = 0;
+        }
+
         if (exitCount % 5000 == 0) {
             static LARGE_INTEGER startTick = { 0 };
             LARGE_INTEGER nowTick;
@@ -7822,6 +8285,10 @@ int main(int argc, char *argv[]) {
                        "USBCMD=0x%08X USBSTS=0x%08X CONFIGFLAG=%u PORTSC=0x%08X\n",
                        ehciBarBase, g_ehciMmioReads, g_ehciMmioWrites, g_ehciPortResets,
                        ehciUsbCmd, ehciUsbSts, ehciConfigFlag, ehciPortSc);
+                printf("[heartbeat]   USB tablet: setups=%ld descriptorReads=%ld stalls=%ld reports=%ld "
+                       "addr=%d configured=%d asyncBase=0x%X irqs=%ld\n",
+                       g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
+                       usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount);
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
                 printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
