@@ -931,20 +931,95 @@ int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outV
 // working exactly as before), and once the guest programs the entry we deliver the
 // vector the guest actually asked for. A masked entry means the guest does not
 // want the interrupt, so it is dropped rather than forced through.
-static int injectDeviceIrq(WHV_PARTITION_HANDLE partition, int gsi, unsigned char legacyVector) {
-    unsigned char vec;
-    if (!ioapicResolveVector(gsi, legacyVector, &vec)) return 0; // masked by the guest
-    injectInterrupt(partition, vec);
-    return 1;
-}
-
+// --- Interrupt queue -------------------------------------------------------
+//
+// WHvRegisterPendingInterruption is a SINGLE SLOT holding one undelivered
+// interrupt. Writing it while the guest has not yet taken the previous one simply
+// destroys that one, and there is no queue anywhere to catch it.
+//
+// That is fatal here because the RTC fires at ~1kHz. Measured: 14 keystrokes
+// queued, 14 keyboard IRQs fired on the guest's own unmasked vector 0xA0, and the
+// guest read NONE of them, while the RTC delivered 36083 interrupts in the same
+// run. The keyboard was never ignored -- it was overwritten, every time.
+//
+// Simply refusing to overwrite is not the answer either: the slot is occupied
+// essentially always, so the new interrupt gets dropped instead and input still
+// never lands (measured skippedBusy=5025 with kbRead still frozen). Whichever one
+// is discarded, a 1kHz source starves everything else.
+//
+// So queue them and drain in PRIORITY order, oldest first within a priority. Input
+// outranks storage, which outranks the timer: a late timer tick is invisible, a
+// lost keystroke is not.
 // GSIs for the devices we emulate. The PCI ones match the _PRT in acpi/dsdt.asl
 // (device 2 = AHCI -> GSI 16, device 3 = NIC -> GSI 17); the ISA ones are their
-// classic IRQ numbers.
+// classic IRQ numbers. Declared here because the interrupt queue below needs them
+// to decide priority.
 #define GSI_KEYBOARD 1
 #define GSI_MOUSE    12
 #define GSI_AHCI     16
 #define GSI_NIC      17
+
+#define IRQ_PRIO_INPUT   0
+#define IRQ_PRIO_DEVICE  1
+#define IRQ_PRIO_TIMER   2
+#define IRQ_QUEUE_MAX    64
+
+typedef struct { unsigned char vector; int prio; unsigned long seq; } QueuedIrq;
+static QueuedIrq g_irqQueue[IRQ_QUEUE_MAX];
+static int g_irqQueueCount = 0;
+static unsigned long g_irqSeq = 0;
+long g_irqQueued = 0, g_irqDelivered = 0, g_irqQueueFull = 0;
+
+static void queueInterrupt(unsigned char vector, int prio) {
+    if (g_irqQueueCount >= IRQ_QUEUE_MAX) { g_irqQueueFull++; return; }
+    g_irqQueue[g_irqQueueCount].vector = vector;
+    g_irqQueue[g_irqQueueCount].prio = prio;
+    g_irqQueue[g_irqQueueCount].seq = g_irqSeq++;
+    g_irqQueueCount++;
+    g_irqQueued++;
+}
+
+// Hands the guest one queued interrupt if its pending slot is free. Called every
+// run-loop pass, so a backlog drains as fast as the guest will accept.
+void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
+    if (g_irqQueueCount == 0) return;
+    WHV_REGISTER_NAME pendName = WHvRegisterPendingInterruption;
+    WHV_REGISTER_VALUE existing = { 0 };
+    if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &pendName, 1, &existing))) return;
+    if (existing.Reg64 & 1ULL) return;              // guest has not taken the last one
+    if (!guestInterruptsEnabled(partition)) return;
+
+    int best = 0, i;
+    for (i = 1; i < g_irqQueueCount; i++) {
+        if (g_irqQueue[i].prio < g_irqQueue[best].prio ||
+            (g_irqQueue[i].prio == g_irqQueue[best].prio && g_irqQueue[i].seq < g_irqQueue[best].seq))
+            best = i;
+    }
+    unsigned char vec = g_irqQueue[best].vector;
+    for (i = best; i < g_irqQueueCount - 1; i++) g_irqQueue[i] = g_irqQueue[i + 1];
+    g_irqQueueCount--;
+
+    WHV_REGISTER_VALUE regValue = { 0 };
+    regValue.Reg64 = 1ULL | ((UINT64)vec << 16);    // pending, type 0 (external), vector
+    WHvSetVirtualProcessorRegisters(partition, 0, &pendName, 1, &regValue);
+    g_irqDelivered++;
+}
+
+static int injectDeviceIrqPrio(WHV_PARTITION_HANDLE partition, int gsi,
+                               unsigned char legacyVector, int prio) {
+    unsigned char vec;
+    if (!ioapicResolveVector(gsi, legacyVector, &vec)) return 0; // masked by the guest
+    queueInterrupt(vec, prio);
+    drainInterruptQueue(partition);                 // deliver immediately if possible
+    return 1;
+}
+
+static int injectDeviceIrq(WHV_PARTITION_HANDLE partition, int gsi, unsigned char legacyVector) {
+    // Input devices outrank everything else; see the queue comment above.
+    int prio = (gsi == GSI_KEYBOARD || gsi == GSI_MOUSE) ? IRQ_PRIO_INPUT : IRQ_PRIO_DEVICE;
+    return injectDeviceIrqPrio(partition, gsi, legacyVector, prio);
+}
+
 
 // WHV rejects injecting a pending interruption while the guest has
 // interrupts masked (EFLAGS.IF=0) -- that produces an
@@ -2238,6 +2313,7 @@ long g_auxPackets = 0;        // packets actually queued to the guest
 long g_auxBytesToGuest = 0;   // bytes the guest actually read back out of port 0x60
 long g_kbBytesToGuest = 0;    // keystroke bytes the guest actually read
 long g_kbIrqSent = 0, g_kbIrqMasked = 0;  // keyboard IRQs we fired / that were masked
+long g_injectSkippedBusy = 0;             // injections skipped because one was still pending
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
@@ -4788,9 +4864,10 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     // never even sees that aux data is waiting. Undrained keyboard
                     // bytes would therefore block mouse initialisation completely,
                     // no matter how the interrupt is delivered.
-                    printf("[ps2-input] kbUser=%ld kbRead=%ld kbIrq=%ld masked=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
+                    printf("[ps2-input] kbUser=%ld kbRead=%ld kbIrq=%ld masked=%ld skippedBusy=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
                            "kbPending=%d auxPending=%d (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
                            (long)g_kbUserBytes, g_kbBytesToGuest, g_kbIrqSent, g_kbIrqMasked,
+                           g_injectSkippedBusy,
                            g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated,
                            kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
                            auxReportingEnabled, auxPortEnabled,
@@ -6147,7 +6224,11 @@ int deliverRtcPeriodicIrq(WHV_PARTITION_HANDLE partition) {
                    diagCount, rtcVector, diagSkippedDisabled, diagFired);
             fflush(stdout);
         }
-        injectInterrupt(partition, rtcVector);
+        // Lowest priority: a deferred tick is invisible to the guest, whereas a
+        // keystroke displaced by one is lost. Before the queue existed this call
+        // clobbered every other device's pending interrupt ~1000 times a second.
+        queueInterrupt(rtcVector, IRQ_PRIO_TIMER);
+        drainInterruptQueue(partition);
         return 1;
     }
     return 0;
@@ -8880,6 +8961,11 @@ int main(int argc, char *argv[]) {
         // U56b: keep the level-triggered AHCI interrupt asserted while the driver
         // has an unserviced status bit. Cheap -- reads two dwords from our own
         // buffer and returns immediately in the common case.
+        // Hand the guest a queued interrupt whenever its pending slot frees up.
+        // Cheap (one register read in the common case) and it is what stops a
+        // backlog forming behind the RTC.
+        drainInterruptQueue(partition);
+
         ahciServiceLevelInterrupt(partition, exitCount);
 
         // Run the USB async schedule. A real host controller executes its
