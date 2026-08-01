@@ -2664,6 +2664,9 @@ long g_ehciMmioReads = 0, g_ehciMmioWrites = 0, g_ehciPortResets = 0;
 int g_ehciIrqPending = 0;   // set when a qTD with IOC retires, drained by the run loop
 long g_ehciIrqCount = 0, g_ehciLastIrqExit = 0, g_ehciIrqDropped = 0;
 UINT64 g_lastIntQh = 0;   // most recent interrupt-endpoint QH seen in the periodic list
+long g_ehciUsbStsWrites = 0;        // driver acknowledgements == its ISR running
+long g_ehciDoorbells = 0;           // async-advance doorbell rings answered
+UINT32 g_ehciLastUsbStsWritten = 0; // what it last wrote there
 int pciConfigSpacesInit = 0;
 
 // PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
@@ -4277,11 +4280,12 @@ static int ehciRunQueueHead(UINT64 qh) {
 
             if (token & 0x8000u) raisedInterrupt = 1;    // IOC
 
-            // Record which qTD we just finished. A real controller keeps this in
-            // the QH so it can resume from the right place; we need it so an
-            // append onto the end of a drained queue is still found (see above).
-            ehciMemWrite32(qh + 0x0C, (UINT32)qtd);
-
+            // The QH's Current qTD Pointer (0x0C) is deliberately left alone. We
+            // used to write it for the append-detection pass, which has since been
+            // removed, so the write is vestigial -- and it is a field USBPORT also
+            // reads for its own bookkeeping on this circular two-qTD interrupt
+            // queue. Scribbling into a structure the driver owns is exactly the
+            // class of bug that had us corrupting its placeholder queue heads.
             UINT32 next = ehciMemRead32(qtd + 0x00);
             ehciMemWrite32(qh + 0x10, next);             // advance the overlay
             if (next & 0x1u) break;                      // T bit -- end of chain
@@ -4496,10 +4500,11 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     ehciDumpIntQh("STALLED");
                 }
                 printf("[usb-status] moves=%ld reports=%ld irqs=%ld x=%ld y=%ld buttons=%ld "
-                       "USBCMD=0x%08X USBSTS=0x%08X dropped=%ld\n",
+                       "USBCMD=0x%08X USBSTS=0x%08X dropped=%ld ack=%ld(last=0x%X) doorbells=%ld\n",
                        lastMoves, lastReports, g_ehciIrqCount,
                        (long)g_tabletX, (long)g_tabletY, (long)g_tabletButtons,
-                       ehciUsbCmd, ehciUsbSts, g_ehciIrqDropped);
+                       ehciUsbCmd, ehciUsbSts, g_ehciIrqDropped,
+                       g_ehciUsbStsWrites, g_ehciLastUsbStsWritten, g_ehciDoorbells);
                 fflush(stdout);
             }
         }
@@ -4575,6 +4580,25 @@ int ehciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
                         ehciFrIndex = 0;
                         value &= ~0x2u;
                     }
+                    // Interrupt on Async Advance Doorbell (bit 6). Software rings
+                    // this when it unlinks a queue head from the async schedule
+                    // and must WAIT for hardware to answer -- the handshake that
+                    // tells it the controller has stopped touching the removed QH.
+                    // Hardware answers by setting USBSTS.IAA (bit 5) and clearing
+                    // the doorbell.
+                    //
+                    // We never implemented it, so any ring went unanswered and the
+                    // driver was left waiting forever. That matches the observed
+                    // stall exactly: acknowledgements and report delivery freeze at
+                    // the same instant and never resume, while interrupts keep
+                    // being delivered (dropped=0) and the guest stays healthy.
+                    // USBPORT unlinks queue heads during normal operation, so this
+                    // is not an edge case.
+                    if (value & 0x40u) {
+                        ehciUsbSts |= 0x20u;   // Interrupt on Async Advance
+                        value &= ~0x40u;       // doorbell self-clears once answered
+                        g_ehciDoorbells++;
+                    }
                     ehciUsbCmd = value & ~0x2u;
                     // Run/Stop drives HCHalted, inverted.
                     if (ehciUsbCmd & 0x1u) ehciUsbSts &= ~0x00001000u;
@@ -4583,7 +4607,16 @@ int ehciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
                 result = ehciUsbCmd;
                 break;
             case 0x04: // USBSTS -- bits 5:0 are write-1-to-clear
-                if (isWrite) ehciUsbSts &= ~(value & 0x3Fu);
+                if (isWrite) {
+                    // Every acknowledgement comes through here, so this counter is
+                    // a direct measure of "the driver's ISR ran". Reports flowed to
+                    // ~1280 before freezing, so the ISR clearly ran early; the
+                    // question is whether it stops at the same moment the reports
+                    // do. Uncapped, per the standing rule in this file.
+                    g_ehciUsbStsWrites++;
+                    g_ehciLastUsbStsWritten = value;
+                    ehciUsbSts &= ~(value & 0x3Fu);
+                }
                 result = ehciUsbSts;
                 break;
             case 0x08: if (isWrite) ehciUsbIntr = value & 0x3F; result = ehciUsbIntr; break;
