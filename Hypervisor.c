@@ -2095,6 +2095,11 @@ int auxPortEnabled = 0;
 // to the mouse device's own command handler (auxHandleCommand) instead of
 // the keyboard's.
 int nextByteTargetsAux = 0;
+// i8042 controller configuration byte, readable via 0x20 and writable via 0x60.
+// Default: port1 IRQ on, system flag set, translation on -- and port2 (aux) IRQ
+// left for the guest to enable, which is precisely what it wants to do.
+unsigned char i8042ConfigByte = 0x45;
+int nextByteIsConfig = 0;
 
 // Mouse device state, PS/2 spec defaults (set on 0xFF reset and 0xF6 set-
 // defaults): resolution 4 counts/mm, sample rate 100/s, 1:1 scaling,
@@ -2197,6 +2202,10 @@ int auxMouseTracking = 0;
 // (raw, unaccelerated deltas); if registration ever fails we fall back to deriving
 // deltas from WM_MOUSEMOVE's cooked coordinates rather than losing the mouse.
 int g_rawMouseAvailable = 0;
+// Uncapped PS/2 mouse tallies. The mouse has to be verifiable at a glance now
+// that it is the working pointer again.
+long g_auxPackets = 0;        // packets actually queued to the guest
+long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
 // Builds and enqueues one standard 3-byte PS/2 packet (status, dx, dy) if
@@ -2206,7 +2215,12 @@ unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 // every mouse-move or button-state-change message; real mice likewise only
 // send a packet when something actually changed, not on a fixed interval.
 void auxSendPacket(int dx, int dy) {
-    if (!auxReportingEnabled || !auxPortEnabled) return;
+    // Two gates the guest controls: the driver must have enabled reporting
+    // (0xF4) and the aux port must be on. Counted separately from accepted
+    // packets so "the mouse is dead" can be told apart from "the guest has not
+    // enabled it yet" -- otherwise both look identical from outside.
+    if (!auxReportingEnabled || !auxPortEnabled) { g_auxPacketsGated++; return; }
+    g_auxPackets++;
 
     // PS/2 Y+ is up; Windows client-area Y+ is down.
     dy = -dy;
@@ -4479,6 +4493,44 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     }
     g_usbLastServiceTick = now;
 
+    // PS/2 keyboard/mouse interrupts, on the same wall-clock tick.
+    //
+    // These used to be delivered ONLY from the halted loop, so they fired only
+    // while the guest was idle. That is why typing works (you type at an idle
+    // guest) but the mouse never initialised: i8042prt resets the aux device
+    // during early boot while the guest is busy and never halts, so IRQ12 never
+    // fired, the reset timed out, and Windows retried and gave up. Measured: the
+    // guest issues 0xD4+0xFF three times back to back with no reads in between,
+    // and auxReportingEnabled never leaves 0.
+    //
+    // Deliberately TIME-THROTTLED. Delivering these from the main loop on every
+    // iteration was tried before and flooded the guest badly enough to wedge
+    // firmware boot at ~25000 exits. Once per tick, only when a byte is actually
+    // waiting, is enough for a device whose real sample rate is 100Hz.
+    // GATED ON THE KERNEL BEING UP (g_bpModuleBase). Firmware POLLS the i8042 and
+    // does not want these interrupts at all: delivering them during the firmware
+    // phase wedged boot dead at exitCount ~20000 in 0.6s, still spinning on the
+    // 0x64 status port -- the same failure a previous attempt at main-loop PS/2
+    // IRQ delivery hit. Windows is the only consumer that needs them, and by the
+    // time it initialises the aux device the kernel has long since been
+    // discovered.
+    // DO NOT deliver PS/2 keyboard/mouse interrupts from here. Tried twice, both
+    // times it broke boot -- the guest never got past the firmware/early-kernel
+    // phase (framebuffer stuck at 1.8% for 220-270s) even when asserted only on
+    // the rising edge with a 20ms re-assert. An earlier attempt at main-loop PS/2
+    // delivery had already been reverted for wedging firmware at ~25000 exits, so
+    // this is now the third confirmation. Those IRQs stay in the halted loop.
+    //
+    // The cost is real and known: because they only fire while the guest is idle,
+    // the mouse never initialises. i8042prt resets the aux device during a BUSY
+    // phase of boot, gets no IRQ12, times out and retries. Typing works only
+    // because you type at an idle guest. Fixing this needs the interrupt to reach
+    // a busy guest without destabilising it -- most likely the LocalApicEmulationMode
+    // work noted above, not another attempt at poking it from this loop. One
+    // strong suspect for the instability: while IOAPIC entry 1 is still pristine
+    // injectDeviceIrq falls back to legacy vector 0x09, which is meaningless to a
+    // Windows kernel in APIC mode.
+
     ehciProcessAsyncSchedule();
     ehciProcessPeriodicSchedule();
 
@@ -4548,6 +4600,20 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
             : 1e9;
         if (sinceMs >= 3000.0) {
             lastStatus = now;
+            // PS/2 mouse health, printed on the same wall-clock timer so it is
+            // visible whether or not the tablet is enabled and regardless of how
+            // idle the guest is.
+            {
+                static long lastAux = -1, lastAuxGated = -1;
+                if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated) {
+                    lastAux = g_auxPackets;
+                    lastAuxGated = g_auxPacketsGated;
+                    printf("[ps2-mouse] packets=%ld gated=%ld (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
+                           g_auxPackets, g_auxPacketsGated, auxReportingEnabled, auxPortEnabled,
+                           g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
+                    fflush(stdout);
+                }
+            }
             if ((long)g_tabletMoves != lastMoves || g_usbReportsSent != lastReports) {
                 // Evaluate the stall condition against the PREVIOUS sample, before
                 // overwriting it -- comparing after the update is always false,
@@ -9474,6 +9540,21 @@ int main(int argc, char *argv[]) {
                         fflush(stdout);
                     }
 
+                    // Full i8042 write trace. The [aux] lines only cover the
+                    // handful of commands that happen to be aux-tagged, which made
+                    // the mouse-detection conversation look far emptier than it is
+                    // -- and "the guest never sent a device command" is a claim
+                    // that needs the WHOLE exchange to support it, not a filtered
+                    // view of it. Bounded so it cannot flood.
+                    if (port == 0x60 || port == 0x64) {
+                        static int i8042LogCount = 0;
+                        if (i8042LogCount < 150) {
+                            i8042LogCount++;
+                            printf("[i8042 #%d] write port=0x%X val=0x%02X\n", i8042LogCount, port, val);
+                            fflush(stdout);
+                        }
+                    }
+
                     if (port == 0x70) {
                         cmosSelectedReg = val & 0x7F;
                         if (rtcDiagLoadBaseKnown) rtcDiagLogAccess(partition, exitContext.VpContext.Rip, cmosSelectedReg, 1);
@@ -9491,7 +9572,42 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
-                    else if (port == 0x64 && val == 0x20) kbEnqueue(0x45);
+                    // Controller configuration byte, read (0x20) / write (0x60).
+                    //
+                    // This used to answer 0x20 with a HARDCODED 0x45 and ignore
+                    // 0x60 entirely, and that is why the guest never had a working
+                    // mouse. i8042prt writes a configuration byte enabling the
+                    // second-port interrupt, reads it back to confirm, and sees its
+                    // write vanish -- so it concludes there is no usable second
+                    // port and never sends the device a single command. Measured
+                    // exactly that: the guest issued only controller-level A7/A8
+                    // port enables, never 0xD4+0xFF (reset), 0xF2 (identify) or
+                    // 0xF4 (enable reporting), so auxReportingEnabled stayed 0 and
+                    // every mouse packet was gated (packets=0 gated=272).
+                    //
+                    // Bits: 0 = port1 IRQ, 1 = port2(aux) IRQ, 2 = system flag,
+                    // 4 = port1 clock disable, 5 = port2 clock disable,
+                    // 6 = translation. Clock-disable bits are kept in sync with
+                    // the A7/A8 enables so the two views cannot contradict.
+                    else if (port == 0x64 && val == 0x20) {
+                        unsigned char cfg = i8042ConfigByte;
+                        if (auxPortEnabled) cfg &= ~0x20; else cfg |= 0x20;
+                        kbEnqueue(cfg);
+                    }
+                    else if (port == 0x64 && val == 0x60) {
+                        nextByteIsConfig = 1;
+                        printf("[aux] controller: next byte is the configuration byte\n");
+                        fflush(stdout);
+                    }
+                    else if (port == 0x60 && nextByteIsConfig) {
+                        nextByteIsConfig = 0;
+                        i8042ConfigByte = val;
+                        // Bit 5 set means the aux clock is DISABLED.
+                        auxPortEnabled = (val & 0x20) ? 0 : 1;
+                        printf("[aux] controller: config byte = 0x%02X (port2 IRQ=%d, aux clock %s)\n",
+                               val, (val & 0x02) ? 1 : 0, (val & 0x20) ? "disabled" : "enabled");
+                        fflush(stdout);
+                    }
                     else if (port == 0x64 && val == 0xAA) kbEnqueue(0x55); // controller self-test: 0x55 = passed
                     else if (port == 0x64 && val == 0xAB) kbEnqueue(0x00); // test first PS/2 port: 0x00 = passed
                     else if (port == 0x64 && val == 0xA7) { auxPortEnabled = 0; printf("[aux] controller: disable AUX port\n"); fflush(stdout); }
