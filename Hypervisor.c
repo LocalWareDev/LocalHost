@@ -2306,7 +2306,15 @@ char g_windowTitle[256] = "Hypervisor.c -- Guest Display";
 // Forward declarations: the USB tablet state is defined further down with the
 // rest of the EHCI model, but the window procedure below is what feeds it.
 extern int usbTabletConfigured;
+extern int g_tabletEnabled;
+// "The tablet owns the pointer" -- true only when it is both enabled and actually
+// configured by the guest. PS/2 keeps the pointer otherwise.
+#define LH_TABLET_OWNS_POINTER (g_tabletEnabled && usbTabletConfigured)
 extern volatile LONG g_tabletX, g_tabletY, g_tabletButtons, g_tabletWheel, g_tabletDirty;
+// Counts pointer updates arriving at the window. Separates "the motion never
+// reached us" from "USB never delivered it" -- reports=0 alone cannot tell those
+// apart, and that ambiguity has already cost one wrong guess in this file.
+extern volatile LONG g_tabletMoves;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -2348,7 +2356,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // Suppressed once the USB tablet is configured: WM_MOUSEMOVE
                     // already reports the absolute position, and feeding relative
                     // deltas in as well would move the guest cursor twice.
-                    if (!usbTabletConfigured &&
+                    if (!LH_TABLET_OWNS_POINTER &&
                         !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && auxCursorPosKnown) {
                         int dx = ri.data.mouse.lLastX;
                         int dy = ri.data.mouse.lLastY;
@@ -2398,11 +2406,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     InterlockedExchange(&g_tabletX, (LONG)(((LONGLONG)cx * 32767) / (w - 1 > 0 ? w - 1 : 1)));
                     InterlockedExchange(&g_tabletY, (LONG)(((LONGLONG)cy * 32767) / (h - 1 > 0 ? h - 1 : 1)));
                     InterlockedExchange(&g_tabletDirty, 1);
+                    InterlockedIncrement(&g_tabletMoves);
                 }
             }
             // Once the tablet is configured it owns the pointer; emitting PS/2
             // deltas as well would move the guest cursor twice per motion.
-            if (!usbTabletConfigured && !g_rawMouseAvailable && auxCursorPosKnown) {
+            if (!LH_TABLET_OWNS_POINTER && !g_rawMouseAvailable && auxCursorPosKnown) {
                 int dx = x - auxLastCursorX;
                 int dy = y - auxLastCursorY;
                 if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
@@ -2427,7 +2436,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (down) InterlockedOr(&g_tabletButtons, (maskBit));              \
             else      InterlockedAnd(&g_tabletButtons, ~(LONG)(maskBit));      \
             InterlockedExchange(&g_tabletDirty, 1);                            \
-            if (usbTabletConfigured) return 0;                                 \
+            if (LH_TABLET_OWNS_POINTER) return 0;                              \
         } while (0)
 
         case WM_LBUTTONDOWN: { LH_TABLET_BUTTON(0x01, 1); auxButtonMask |= 0x01; auxSendPacket(0, 0); return 0; }
@@ -3892,6 +3901,18 @@ static const unsigned char usbTabletReportDesc[70] = {
 int usbTabletAddress = 0;        // address assigned by SET_ADDRESS
 int usbTabletPendingAddr = -1;   // takes effect after the status stage completes
 int usbTabletConfigured = 0;
+
+// Whether the tablet is allowed to OWN the pointer. Default off, opt in with
+// LOCALHOST_USB_TABLET=1.
+//
+// The controller and enumeration are solid, but report delivery still stalls: the
+// stream runs while the pointer is stationary and stops at the first real
+// movement, with USBSTS left unacknowledged. Because a configured tablet
+// suppresses the PS/2 mouse (otherwise every motion moves the guest cursor
+// twice), shipping it on by default would mean a stalled tablet leaves the guest
+// with NO pointer at all -- strictly worse than the relative mouse that already
+// works. So the default stays PS/2 until delivery is reliable.
+int g_tabletEnabled = 0;
 unsigned char usbTabletSetup[8];         // most recent SETUP packet
 unsigned char usbTabletReplyBuf[128];    // staged response for the data stage
 UINT32 usbTabletReplyLen = 0, usbTabletReplyPos = 0;
@@ -3901,6 +3922,7 @@ long g_usbSetupPackets = 0, g_usbDescriptorReads = 0, g_usbStalls = 0, g_usbRepo
 volatile LONG g_tabletX = 16384, g_tabletY = 16384;
 volatile LONG g_tabletButtons = 0, g_tabletWheel = 0;
 volatile LONG g_tabletDirty = 0;
+volatile LONG g_tabletMoves = 0;
 
 static UINT32 usbMin32(UINT32 a, UINT32 b) { return a < b ? a : b; }
 
@@ -4121,6 +4143,25 @@ static int ehciRunQueueHead(UINT64 qh) {
         int forUs = (devAddr == 0 || (int)devAddr == usbTabletAddress);
 
         UINT64 qtd = ehciMemRead32(qh + 0x10) & ~0x1Fu;
+
+        // If the overlay says the queue is finished, the driver may still have
+        // APPENDED a qTD by linking it from the last one we retired -- that is
+        // how software extends a queue that hardware has not yet noticed is
+        // empty. We record the last qTD in the QH's Current qTD Pointer (0x0C),
+        // which a real controller maintains, and follow its next pointer here.
+        // Without this the report stream ran until the first chain ended and then
+        // stopped forever: measured as reports frozen at 1578 the instant the
+        // pointer moved, with the guest still healthy and still painting.
+        if ((ehciMemRead32(qh + 0x10) & 0x1u) || qtd == 0) {
+            UINT32 cur = ehciMemRead32(qh + 0x0C) & ~0x1Fu;
+            if (cur) {
+                UINT32 appended = ehciMemRead32((UINT64)cur + 0x00);
+                if (!(appended & 0x1u) && (appended & ~0x1Fu)) {
+                    qtd = appended & ~0x1Fu;
+                    ehciMemWrite32(qh + 0x10, appended);   // adopt it into the overlay
+                }
+            }
+        }
         int qtdGuard = 0;
         while (forUs && qtd && !(ehciMemRead32(qh + 0x10) & 0x1u) && qtdGuard < 16) {
             qtdGuard++;
@@ -4166,9 +4207,22 @@ static int ehciRunQueueHead(UINT64 qh) {
                     }
                     moved = n;
                 } else {
-                    // Interrupt IN on EP1 -- the HID report itself. Delivered
-                    // from the periodic schedule in practice, but answering here
-                    // too costs nothing and some stacks probe via async.
+                    // Interrupt IN on EP1 -- the HID report itself.
+                    //
+                    // Stay silent unless the tablet owns the pointer. Delivering
+                    // reports while PS/2 is also live would move the guest cursor
+                    // twice per motion.
+                    if (!g_tabletEnabled) break;
+                    // NAK-when-idle is what real hardware does, but it does not
+                    // work against this stack as modelled: leaving the qTD Active
+                    // retires no IOC, so USBPORT gets no completion, never runs
+                    // its ISR, never clears USBSTS and never re-queues -- measured
+                    // as reports frozen at 2 with USBSTS stuck at 1. Completing
+                    // every poll (a duplicate report when nothing moved) is less
+                    // faithful but is what actually keeps the queue turning, and
+                    // duplicate absolute coordinates are idempotent for the guest.
+                    // Revisit if the transfer model ever grows real NAK handling.
+                    InterlockedExchange(&g_tabletDirty, 0);
                     unsigned char rep[6];
                     rep[0] = (unsigned char)g_tabletButtons;
                     rep[1] = (unsigned char)(g_tabletX & 0xFF);
@@ -4205,9 +4259,23 @@ static int ehciRunQueueHead(UINT64 qh) {
             token &= ~0x80u;
             token = (token & ~(0x7FFFu << 16)) | (residual << 16);
             ehciMemWrite32(qtd + 0x08, token);
+
+            // Deliberately NOT touching the data toggle. Flipping it in the QH
+            // overlay (the DTC=0 case, where hardware nominally owns it) was
+            // tried and made things worse: reports flowed briefly then froze at
+            // 60 while USBSTS stuck at 1, because USBPORT writes that field too
+            // and our flip desynchronised it. We do not model toggle-mismatch
+            // rejection anywhere, so there is nothing to gain by maintaining it
+            // -- leaving the driver's own value intact is both simpler and what
+            // actually keeps reports flowing.
             ehciMemWrite32(qh + 0x18, token);            // mirror into the overlay
 
             if (token & 0x8000u) raisedInterrupt = 1;    // IOC
+
+            // Record which qTD we just finished. A real controller keeps this in
+            // the QH so it can resume from the right place; we need it so an
+            // append onto the end of a drained queue is still found (see above).
+            ehciMemWrite32(qh + 0x0C, (UINT32)qtd);
 
             UINT32 next = ehciMemRead32(qtd + 0x00);
             ehciMemWrite32(qh + 0x10, next);             // advance the overlay
@@ -4274,6 +4342,98 @@ void ehciProcessPeriodicSchedule(void) {
     ehciFrIndex = (ehciFrIndex + 8) & 0x3FFF;            // advance one frame
 
     if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
+}
+
+// Services both USB schedules on a WALL-CLOCK basis, roughly once per frame.
+//
+// This must NOT be driven by exit count. A real host controller runs off its own
+// 1ms frame timer regardless of what the CPU is doing, and tying it to VM exits
+// created a deadlock: the guest goes idle precisely when it is waiting for input,
+// idling collapses the exit rate to ~64/sec, so the schedules were serviced about
+// once a second and the tablet went dead. Measured: 91 pointer updates arrived at
+// the window but only 4 reports reached the guest. The pointer worked for a few
+// seconds while the guest was still busy after Setup painted, then froze -- no
+// input meant no exits meant no polling meant no input.
+static LARGE_INTEGER g_usbLastServiceTick;
+void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (g_usbLastServiceTick.QuadPart != 0) {
+        double ms = (double)(now.QuadPart - g_usbLastServiceTick.QuadPart) * 1000.0 /
+                    (double)perfFrequency.QuadPart;
+        if (ms < 1.0) return;                            // ~1kHz, one USB frame
+    }
+    g_usbLastServiceTick = now;
+
+    ehciProcessAsyncSchedule();
+    ehciProcessPeriodicSchedule();
+
+    // Level-triggered: assert while an enabled status bit is set, and let the
+    // driver's write-1-to-clear take it away (see the USBSTS handler).
+    // Assert on the RISING edge, then re-assert only slowly while the driver has
+    // not acknowledged. Servicing at 1kHz and injecting every time produced 16822
+    // injections with USBSTS stuck at 1 -- the guest spent its time in our ISR
+    // instead of finishing USB init, and never even enabled the periodic schedule
+    // (USBCMD=0x00010021: async on, periodic off), so no report could ever flow.
+    // A real level-triggered line is asserted and HELD; it does not re-interrupt
+    // every frame. This is the same storm U61 had to unpick for AHCI.
+    static LARGE_INTEGER lastIrqTick;
+    static int irqAsserted = 0;
+    int wantIrq = (ehciUsbSts & ehciUsbIntr & 0x3F) != 0;
+    if (!wantIrq) {
+        irqAsserted = 0;                                 // driver acknowledged
+    } else if (guestInterruptsEnabled(partition)) {
+        double sinceIrqMs = lastIrqTick.QuadPart
+            ? (double)(now.QuadPart - lastIrqTick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+            : 1e9;
+        if (!irqAsserted || sinceIrqMs >= 20.0) {
+            lastIrqTick = now;
+            irqAsserted = 1;
+            g_ehciIrqCount++;
+            int delivered = injectDeviceIrq(partition, GSI_EHCI, 0x75);
+        // Is the interrupt actually landing anywhere? USBSTS staying set while we
+        // inject thousands of times means the driver's ISR is not running, and the
+        // usual reason is the vector: while an IOAPIC entry is still at its
+        // power-on default we fall back to a legacy vector nothing has registered
+        // a handler for. Bounded, and only interesting for the first few.
+        static int ehciIrqLogged = 0;
+        if (ehciIrqLogged < 8) {
+            ehciIrqLogged++;
+            unsigned char v = 0;
+            int ok = ioapicResolveVector(GSI_EHCI, 0x75, &v);
+            printf("[usb-irq #%d] GSI=%d resolved=%d vector=0x%02X delivered=%d USBSTS=0x%08X USBINTR=0x%08X\n",
+                   ehciIrqLogged, GSI_EHCI, ok, v, delivered, ehciUsbSts, ehciUsbIntr);
+            fflush(stdout);
+            }
+        }
+    }
+
+    // Report USB state on a TIMER, not from the heartbeat. The heartbeat fires
+    // every 5000 exits, and an idle guest produces ~64 exits/sec -- so it prints
+    // roughly once every 78 seconds, and its last line can easily predate the
+    // input being tested. That stale reading already made a working run look like
+    // "moves=0". Idle is the exact condition the tablet has to survive, so its
+    // instrumentation cannot be paced by guest activity either.
+    {
+        static LARGE_INTEGER lastStatus;
+        static long lastMoves = -1, lastReports = -1;
+        double sinceMs = lastStatus.QuadPart
+            ? (double)(now.QuadPart - lastStatus.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+            : 1e9;
+        if (sinceMs >= 3000.0) {
+            lastStatus = now;
+            if ((long)g_tabletMoves != lastMoves || g_usbReportsSent != lastReports) {
+                lastMoves = (long)g_tabletMoves;
+                lastReports = g_usbReportsSent;
+                printf("[usb-status] moves=%ld reports=%ld irqs=%ld x=%ld y=%ld buttons=%ld "
+                       "USBCMD=0x%08X USBSTS=0x%08X\n",
+                       lastMoves, lastReports, g_ehciIrqCount,
+                       (long)g_tabletX, (long)g_tabletY, (long)g_tabletButtons,
+                       ehciUsbCmd, ehciUsbSts);
+                fflush(stdout);
+            }
+        }
+    }
 }
 
 // Decodes accesses to the EHCI register block. Layout per the EHCI 1.0 spec:
@@ -8063,6 +8223,15 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            const char *tabletEnv = getenv("LOCALHOST_USB_TABLET");
+            if (tabletEnv && atol(tabletEnv) != 0) {
+                g_tabletEnabled = 1;
+                printf("[usb] tablet ENABLED -- absolute pointer owns the cursor, PS/2 mouse suppressed\n");
+            } else {
+                printf("[usb] tablet present but idle (PS/2 mouse owns the cursor). "
+                       "Set LOCALHOST_USB_TABLET=1 to try absolute pointing.\n");
+            }
+            fflush(stdout);
             const char *breakinEnv = getenv("LOCALHOST_KD_BREAKIN_SEC");
             if (breakinEnv) {
                 g_kdBreakinAtSec = atol(breakinEnv);
@@ -8192,6 +8361,12 @@ int main(int argc, char *argv[]) {
 
             int injected = 0;
 
+            // Service USB here too, not just in the outer loop. This is the HLT
+            // path -- where the guest sits whenever it is idle, which is exactly
+            // when it is waiting for the pointer input we are trying to deliver.
+            // Without this the tablet freezes the moment the guest goes quiet.
+            usbServiceSchedules(partition);
+
             if (pendingAtaIrq) {
                 injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: IRQ14/AHCI, routed
                 pendingAtaIrq = 0;
@@ -8258,25 +8433,7 @@ int main(int argc, char *argv[]) {
         // transfers without ringing any doorbell we could trap -- so this has to
         // be polled rather than driven from a register write. Throttled because
         // walking guest memory on every single exit would dominate the loop.
-        if (exitCount % 64 == 0) {
-            ehciProcessAsyncSchedule();
-            ehciProcessPeriodicSchedule();
-            // EHCI's interrupt is LEVEL-triggered: the line stays asserted while
-            // an enabled status bit is set in USBSTS, and only the driver writing
-            // 1-to-clear takes it away. Injecting a single edge per completion
-            // left USBSTS=0x1 unacknowledged forever and enumeration stopped dead
-            // after the first descriptor -- the identical failure U56 had to fix
-            // for AHCI. Re-assert while the condition holds, throttled so it
-            // cannot become the self-sustaining storm U61 had to unpick.
-            if ((ehciUsbSts & ehciUsbIntr & 0x3F) != 0) {
-                if (exitCount - g_ehciLastIrqExit >= 256 && guestInterruptsEnabled(partition)) {
-                    g_ehciLastIrqExit = exitCount;
-                    g_ehciIrqCount++;
-                    injectDeviceIrq(partition, GSI_EHCI, 0x75);
-                }
-            }
-            g_ehciIrqPending = 0;
-        }
+        usbServiceSchedules(partition);
 
         if (exitCount % 5000 == 0) {
             static LARGE_INTEGER startTick = { 0 };
@@ -8377,9 +8534,10 @@ int main(int argc, char *argv[]) {
                        ehciBarBase, g_ehciMmioReads, g_ehciMmioWrites, g_ehciPortResets,
                        ehciUsbCmd, ehciUsbSts, ehciConfigFlag, ehciPortSc);
                 printf("[heartbeat]   USB tablet: setups=%ld descriptorReads=%ld stalls=%ld reports=%ld "
-                       "addr=%d configured=%d asyncBase=0x%X irqs=%ld\n",
+                       "addr=%d configured=%d asyncBase=0x%X irqs=%ld moves=%ld periodicBase=0x%X\n",
                        g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
-                       usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount);
+                       usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
+                       (long)g_tabletMoves, ehciPeriodicBase);
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
                 printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
