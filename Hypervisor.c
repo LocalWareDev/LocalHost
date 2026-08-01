@@ -1192,6 +1192,20 @@ long g_kdRxDropped = 0;    // pipe bytes dropped because kdRxBuf was full
 // something scriptable. Seconds since VM start; 0 disables.
 long g_kdBreakinAtSec = 0;
 int  g_kdBreakinSent = 0;
+
+// U91: break in on GUEST PROGRESS rather than wall-clock seconds.
+//
+// Wall time turned out to be meaningless as a trigger. Two runs measured at the
+// same elapsedSec=61s were at exitCount 1335000 and 305000 -- a 4.4x difference
+// in how far the guest had actually got -- because host memory pressure slows
+// the guest down enormously. A 75s break caught 12 processes; a *later* 95s
+// break on a slower run caught only 2, which reads like the guest regressed when
+// really the clock is just not measuring the guest.
+//
+// exitCount is a direct measure of guest work done, so a threshold on it is
+// reproducible across runs regardless of how loaded the host is. Checked in the
+// heartbeat, which fires every 5000 exits -- ample granularity. 0 disables.
+long g_kdBreakinAtExits = 0;
 CRITICAL_SECTION kdRxLock;
 unsigned char kdRxBuf[4096];
 volatile int kdRxHead = 0, kdRxTail = 0; // ring buffer: pipe reader thread -> guest RBR reads
@@ -7299,6 +7313,13 @@ int main(int argc, char *argv[]) {
                 if (g_kdBreakinAtSec > 0)
                     printf("[kd] will inject a break-in %ld seconds in\n", g_kdBreakinAtSec);
             }
+            const char *breakinExitsEnv = getenv("LOCALHOST_KD_BREAKIN_EXITS");
+            if (breakinExitsEnv) {
+                g_kdBreakinAtExits = atol(breakinExitsEnv);
+                if (g_kdBreakinAtExits > 0)
+                    printf("[kd] will inject a break-in at exitCount %ld (guest progress, not wall time)\n",
+                           g_kdBreakinAtExits);
+            }
             HANDLE kdThread = CreateThread(NULL, 0, kdPipeReaderThread, NULL, 0, NULL);
             if (kdThread) CloseHandle(kdThread);
             HANDLE kdWriterThread = CreateThread(NULL, 0, kdPipeWriterThread, NULL, 0, NULL);
@@ -7500,16 +7521,19 @@ int main(int argc, char *argv[]) {
             if (g_bpModuleBase && hbRip > g_bpModuleBase && hbRip - g_bpModuleBase < 0x2000000ULL)
                 printf("[heartbeat]   ntoskrnl+0x%llX  (resolve: tools/pdbsym.py near <rva>)\n",
                        (unsigned long long)(hbRip - g_bpModuleBase));
-            // U69: fire the scripted break-in once the guest has had time to boot.
-            if (g_kdBreakinAtSec > 0 && !g_kdBreakinSent && kdClientConnected &&
-                elapsedSec >= (double)g_kdBreakinAtSec) {
+            // U69/U91: fire the scripted break-in once the guest has booted far
+            // enough -- measured either in wall-clock seconds or, preferably, in
+            // guest exits (see g_kdBreakinAtExits on why seconds mislead).
+            int breakinDue = (g_kdBreakinAtSec > 0 && elapsedSec >= (double)g_kdBreakinAtSec) ||
+                             (g_kdBreakinAtExits > 0 && exitCount >= g_kdBreakinAtExits);
+            if (breakinDue && !g_kdBreakinSent && kdClientConnected) {
                 EnterCriticalSection(&kdRxLock);
                 int biNext = (kdRxHead + 1) % (int)sizeof(kdRxBuf);
                 if (biNext != kdRxTail) { kdRxBuf[kdRxHead] = 0x62; kdRxHead = biNext; }
                 LeaveCriticalSection(&kdRxLock);
                 g_kdBreakinSent = 1;
-                printf("[kd] injected break-in byte 0x62 at %.1fs (LOCALHOST_KD_BREAKIN_SEC=%ld)\n",
-                       elapsedSec, g_kdBreakinAtSec);
+                printf("[kd] injected break-in byte 0x62 at %.1fs / exitCount=%ld (sec=%ld exits=%ld)\n",
+                       elapsedSec, exitCount, g_kdBreakinAtSec, g_kdBreakinAtExits);
                 fflush(stdout);
             }
             // U55: real running totals, not log-capped counts. Three separate
