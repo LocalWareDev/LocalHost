@@ -7563,7 +7563,12 @@ int main(int argc, char *argv[]) {
             // report whether it changes between heartbeats: changing means the guest
             // is rendering and our display path is the problem; static means it is
             // genuinely stuck before Setup's UI.
-            if (LOCALHOST_VERBOSE_DIAG && ramfbConfigWritten && ramfbAddress && guestMemory &&
+            // U97: NOT gated behind LOCALHOST_VERBOSE_DIAG any more. Sampling every
+            // 997th byte costs nothing, and "how much of the screen is non-black"
+            // is now the primary measurement in this investigation: setup.exe is
+            // confirmed running with a healthy win32k message pump, so the open
+            // question is purely whether its UI ever reaches the framebuffer.
+            if (ramfbConfigWritten && ramfbAddress && guestMemory &&
                 ramfbAddress + (UINT64)ramfbStride * ramfbHeight <= guestMemSize) {
                 static UINT32 lastFbSum = 0;
                 static int fbSumSeen = 0;
@@ -7575,10 +7580,12 @@ int main(int argc, char *argv[]) {
                     sum = sum * 31u + fb[k];
                     if (fb[k]) nonZero++;
                 }
-                printf("[heartbeat]   framebuffer: sum=0x%08X %s nonZeroSamples=%u/%llu\n",
+                UINT64 samples = total / 997;
+                printf("[heartbeat]   framebuffer: sum=0x%08X %s nonBlack=%u/%llu (%.1f%%)\n",
                        sum,
                        !fbSumSeen ? "(first sample)" : (sum != lastFbSum ? "CHANGED -- guest is painting" : "unchanged"),
-                       nonZero, (unsigned long long)(total / 997));
+                       nonZero, (unsigned long long)samples,
+                       samples ? (100.0 * (double)nonZero / (double)samples) : 0.0);
                 lastFbSum = sum;
                 fbSumSeen = 1;
             }
