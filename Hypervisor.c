@@ -2303,6 +2303,11 @@ HWND g_hwnd = NULL;
 HFONT g_font = NULL;
 char g_windowTitle[256] = "Hypervisor.c -- Guest Display";
 
+// Forward declarations: the USB tablet state is defined further down with the
+// rest of the EHCI model, but the window procedure below is what feeds it.
+extern int usbTabletConfigured;
+extern volatile LONG g_tabletX, g_tabletY, g_tabletButtons, g_tabletWheel, g_tabletDirty;
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_KEYDOWN: {
@@ -2340,7 +2345,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // MOUSE_MOVE_ABSOLUTE means a tablet/remote-desktop style
                     // device reporting screen coordinates; only relative motion is
                     // meaningful for a PS/2 mouse.
-                    if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && auxCursorPosKnown) {
+                    // Suppressed once the USB tablet is configured: WM_MOUSEMOVE
+                    // already reports the absolute position, and feeding relative
+                    // deltas in as well would move the guest cursor twice.
+                    if (!usbTabletConfigured &&
+                        !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && auxCursorPosKnown) {
                         int dx = ri.data.mouse.lLastX;
                         int dy = ri.data.mouse.lLastY;
                         if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
@@ -2373,7 +2382,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // clears auxCursorPosKnown, so raw motion is ignored until the pointer
             // is back over the window. PS/2 is a relative device -- it can only say
             // "moved by this much", never "the pointer is now here".
-            if (!g_rawMouseAvailable && auxCursorPosKnown) { // fallback only
+            // TABLET MODE: report the pointer's ABSOLUTE position, scaled to the
+            // HID report descriptor's 0..32767 logical range. This is the whole
+            // reason the USB tablet exists -- a position, not a delta, so the
+            // guest cursor lands exactly where the host cursor is instead of
+            // drifting. Scaled against the client rect so it stays correct when
+            // the window is resized and the framebuffer is stretched to fit.
+            {
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                int w = rc.right - rc.left, h = rc.bottom - rc.top;
+                if (w > 0 && h > 0) {
+                    int cx = x < 0 ? 0 : (x >= w ? w - 1 : x);
+                    int cy = y < 0 ? 0 : (y >= h ? h - 1 : y);
+                    InterlockedExchange(&g_tabletX, (LONG)(((LONGLONG)cx * 32767) / (w - 1 > 0 ? w - 1 : 1)));
+                    InterlockedExchange(&g_tabletY, (LONG)(((LONGLONG)cy * 32767) / (h - 1 > 0 ? h - 1 : 1)));
+                    InterlockedExchange(&g_tabletDirty, 1);
+                }
+            }
+            // Once the tablet is configured it owns the pointer; emitting PS/2
+            // deltas as well would move the guest cursor twice per motion.
+            if (!usbTabletConfigured && !g_rawMouseAvailable && auxCursorPosKnown) {
                 int dx = x - auxLastCursorX;
                 int dy = y - auxLastCursorY;
                 if (dx != 0 || dy != 0) auxSendPacket(dx, dy);
@@ -2390,12 +2419,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             auxMouseTracking = 0;
             return 0;
         }
-        case WM_LBUTTONDOWN: { auxButtonMask |= 0x01; auxSendPacket(0, 0); return 0; }
-        case WM_LBUTTONUP:   { auxButtonMask &= ~0x01; auxSendPacket(0, 0); return 0; }
-        case WM_RBUTTONDOWN: { auxButtonMask |= 0x02; auxSendPacket(0, 0); return 0; }
-        case WM_RBUTTONUP:   { auxButtonMask &= ~0x02; auxSendPacket(0, 0); return 0; }
-        case WM_MBUTTONDOWN: { auxButtonMask |= 0x04; auxSendPacket(0, 0); return 0; }
-        case WM_MBUTTONUP:   { auxButtonMask &= ~0x04; auxSendPacket(0, 0); return 0; }
+        // Buttons feed BOTH devices: the tablet's report byte when it is
+        // configured, and the PS/2 aux device otherwise, so clicking still works
+        // before USB enumeration completes (and on a guest with no USB stack).
+#define LH_TABLET_BUTTON(maskBit, down)                                        \
+        do {                                                                   \
+            if (down) InterlockedOr(&g_tabletButtons, (maskBit));              \
+            else      InterlockedAnd(&g_tabletButtons, ~(LONG)(maskBit));      \
+            InterlockedExchange(&g_tabletDirty, 1);                            \
+            if (usbTabletConfigured) return 0;                                 \
+        } while (0)
+
+        case WM_LBUTTONDOWN: { LH_TABLET_BUTTON(0x01, 1); auxButtonMask |= 0x01; auxSendPacket(0, 0); return 0; }
+        case WM_LBUTTONUP:   { LH_TABLET_BUTTON(0x01, 0); auxButtonMask &= ~0x01; auxSendPacket(0, 0); return 0; }
+        case WM_RBUTTONDOWN: { LH_TABLET_BUTTON(0x02, 1); auxButtonMask |= 0x02; auxSendPacket(0, 0); return 0; }
+        case WM_RBUTTONUP:   { LH_TABLET_BUTTON(0x02, 0); auxButtonMask &= ~0x02; auxSendPacket(0, 0); return 0; }
+        case WM_MBUTTONDOWN: { LH_TABLET_BUTTON(0x04, 1); auxButtonMask |= 0x04; auxSendPacket(0, 0); return 0; }
+        case WM_MBUTTONUP:   { LH_TABLET_BUTTON(0x04, 0); auxButtonMask &= ~0x04; auxSendPacket(0, 0); return 0; }
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -3794,7 +3834,13 @@ static const unsigned char usbTabletConfigDesc[34] = {
     0x00,                   // bCountryCode
     1,                      // bNumDescriptors
     0x22,                   // bDescriptorType: REPORT
-    74, 0x00,               // wDescriptorLength (must match the array below)
+    70, 0x00,               // wDescriptorLength -- MUST equal the exact item byte
+                            // count below. Declaring 74 against a 70-byte item
+                            // list sent four trailing 0x00 bytes, which are not
+                            // valid HID items: hidparse rejected the descriptor,
+                            // the device never started, and Windows halted the
+                            // whole controller (RS cleared, HCHalted set, port
+                            // PED dropped) right after reading it.
 
     7, 0x05,                // bLength, ENDPOINT
     0x81,                   // bEndpointAddress: EP1 IN
@@ -3804,7 +3850,7 @@ static const unsigned char usbTabletConfigDesc[34] = {
 };
 
 // 6-byte report: buttons(1) + X(2, LE) + Y(2, LE) + wheel(1).
-static const unsigned char usbTabletReportDesc[74] = {
+static const unsigned char usbTabletReportDesc[70] = {
     0x05, 0x01,             // Usage Page (Generic Desktop)
     0x09, 0x02,             // Usage (Mouse)
     0xA1, 0x01,             // Collection (Application)
@@ -4059,17 +4105,13 @@ static UINT32 ehciQtdCopy(UINT64 qtdGpa, UINT32 offset, unsigned char *hostBuf,
 // our virtual tablet. Called from the run loop rather than on a register write,
 // because a real HC runs the schedule continuously and USBPORT queues transfers
 // without touching a doorbell.
-void ehciProcessAsyncSchedule(void) {
-    if (!(ehciUsbCmd & 0x1u)) return;        // Run/Stop clear -- HC halted
-    if (!(ehciUsbCmd & 0x20u)) return;       // async schedule not enabled
-    if (!ehciAsyncBase || !guestMemory) return;
-
-    UINT64 qh = ehciAsyncBase;
-    int qhGuard = 0;
+// Executes any active qTDs queued on one queue head. Shared by both schedules:
+// control/bulk arrive on the async list, HID interrupt transfers on the periodic
+// list, and the qTD mechanics are identical either way. Returns 1 if a completion
+// interrupt should be raised.
+static int ehciRunQueueHead(UINT64 qh) {
     int raisedInterrupt = 0;
-
-    // The async list is circular; bound the walk so a malformed list cannot spin.
-    for (qhGuard = 0; qhGuard < 32; qhGuard++) {
+    {
         UINT32 epChar = ehciMemRead32(qh + 0x04);
         UINT32 devAddr = epChar & 0x7F;
         UINT32 endpt = (epChar >> 8) & 0xF;
@@ -4172,7 +4214,21 @@ void ehciProcessAsyncSchedule(void) {
             if (next & 0x1u) break;                      // T bit -- end of chain
             qtd = next & ~0x1Fu;
         }
+    }
+    return raisedInterrupt;
+}
 
+void ehciProcessAsyncSchedule(void) {
+    if (!(ehciUsbCmd & 0x1u)) return;        // Run/Stop clear -- HC halted
+    if (!(ehciUsbCmd & 0x20u)) return;       // async schedule not enabled
+    if (!ehciAsyncBase || !guestMemory) return;
+
+    UINT64 qh = ehciAsyncBase;
+    int raisedInterrupt = 0, qhGuard;
+
+    // The async list is circular; bound the walk so a malformed list cannot spin.
+    for (qhGuard = 0; qhGuard < 32; qhGuard++) {
+        if (ehciRunQueueHead(qh)) raisedInterrupt = 1;
         UINT32 link = ehciMemRead32(qh + 0x00);
         if (link & 0x1u) break;                          // T bit -- list terminates
         UINT64 nextQh = link & ~0x1Fu;
@@ -4180,10 +4236,44 @@ void ehciProcessAsyncSchedule(void) {
         qh = nextQh;
     }
 
-    if (raisedInterrupt) {
-        ehciUsbSts |= 0x1u;                              // USBINT
-        if (ehciUsbIntr & 0x1u) g_ehciIrqPending = 1;
+    if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
+}
+
+// Walks the periodic frame list, which is where interrupt endpoints live -- so
+// this is what actually delivers HID reports. PERIODICLISTBASE points at 1024
+// link pointers; bits 2:1 type-tag each one, and 1 = queue head (the only kind we
+// can service; iTD/siTD are isochronous, which a HID tablet never uses).
+//
+// A real controller consumes exactly one frame entry per millisecond. We advance
+// FRINDEX ourselves and service that entry, which keeps the driver's notion of
+// time roughly honest without pretending to real-time accuracy the rest of this
+// emulation does not have either.
+void ehciProcessPeriodicSchedule(void) {
+    if (!(ehciUsbCmd & 0x1u)) return;        // halted
+    if (!(ehciUsbCmd & 0x10u)) return;       // periodic schedule not enabled
+    if (!ehciPeriodicBase || !guestMemory) return;
+
+    UINT32 frame = (ehciFrIndex >> 3) & 0x3FF;
+    UINT64 entryGpa = (UINT64)ehciPeriodicBase + frame * 4;
+    UINT32 link = ehciMemRead32(entryGpa);
+
+    int raisedInterrupt = 0, guard;
+    for (guard = 0; guard < 16; guard++) {
+        if (link & 0x1u) break;                          // T bit -- nothing here
+        UINT32 type = (link >> 1) & 0x3;
+        UINT64 node = link & ~0x1Fu;
+        if (node == 0) break;
+        if (type == 1) {                                 // queue head
+            if (ehciRunQueueHead(node)) raisedInterrupt = 1;
+        }
+        UINT32 next = ehciMemRead32(node + 0x00);
+        if (next == link) break;                         // self-loop
+        link = next;
     }
+
+    ehciFrIndex = (ehciFrIndex + 8) & 0x3FFF;            // advance one frame
+
+    if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
 }
 
 // Decodes accesses to the EHCI register block. Layout per the EHCI 1.0 spec:
@@ -8170,6 +8260,7 @@ int main(int argc, char *argv[]) {
         // walking guest memory on every single exit would dominate the loop.
         if (exitCount % 64 == 0) {
             ehciProcessAsyncSchedule();
+            ehciProcessPeriodicSchedule();
             // EHCI's interrupt is LEVEL-triggered: the line stays asserted while
             // an enabled status bit is set in USBSTS, and only the driver writing
             // 1-to-clear takes it away. Injecting a single edge per completion
