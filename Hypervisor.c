@@ -2217,6 +2217,7 @@ int g_rawMouseAvailable = 0;
 // Uncapped PS/2 mouse tallies. The mouse has to be verifiable at a glance now
 // that it is the working pointer again.
 long g_auxPackets = 0;        // packets actually queued to the guest
+long g_auxBytesToGuest = 0;   // bytes the guest actually read back out of port 0x60
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
@@ -4687,8 +4688,8 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     lastAuxGated = g_auxPacketsGated;
                     lastReporting = auxReportingEnabled;
                     lastPortEnabled = auxPortEnabled;
-                    printf("[ps2-mouse] packets=%ld gated=%ld (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
-                           g_auxPackets, g_auxPacketsGated, auxReportingEnabled, auxPortEnabled,
+                    printf("[ps2-mouse] queued=%ld consumed=%ld gated=%ld (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
+                           g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated, auxReportingEnabled, auxPortEnabled,
                            g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
                     fflush(stdout);
                 }
@@ -9882,7 +9883,15 @@ int main(int argc, char *argv[]) {
                     }
                     else if (port == 0x60) {
                         if (kbHasData()) returnValue = kbDequeue();
-                        else if (auxHasData()) returnValue = auxDequeue();
+                        else if (auxHasData()) {
+                            // Count what the guest actually CONSUMES. g_auxPackets
+                            // only records what we queued, which says nothing about
+                            // whether the driver is reading it -- and "packets=1479
+                            // but no cursor" is precisely the case where those two
+                            // numbers disagree.
+                            g_auxBytesToGuest++;
+                            returnValue = auxDequeue();
+                        }
                         else returnValue = 0x00;
                     }
                     else if (port == 0x61) {
