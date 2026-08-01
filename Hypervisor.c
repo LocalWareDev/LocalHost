@@ -2663,6 +2663,7 @@ UINT32 ehciPortSc = 0x00001003;
 long g_ehciMmioReads = 0, g_ehciMmioWrites = 0, g_ehciPortResets = 0;
 int g_ehciIrqPending = 0;   // set when a qTD with IOC retires, drained by the run loop
 long g_ehciIrqCount = 0, g_ehciLastIrqExit = 0, g_ehciIrqDropped = 0;
+UINT64 g_lastIntQh = 0;   // most recent interrupt-endpoint QH seen in the periodic list
 int pciConfigSpacesInit = 0;
 
 // PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
@@ -4138,9 +4139,22 @@ static int ehciRunQueueHead(UINT64 qh) {
         UINT32 devAddr = epChar & 0x7F;
         UINT32 endpt = (epChar >> 8) & 0xF;
 
-        // Only our device answers. Address 0 is the enumeration default, which
-        // every device must respond to until SET_ADDRESS takes effect.
-        int forUs = (devAddr == 0 || (int)devAddr == usbTabletAddress);
+        // Only our device answers, and address 0 stops being us the moment
+        // SET_ADDRESS lands. Treating 0 as "always ours" was wrong and is what
+        // broke report delivery: USBPORT keeps EMPTY PLACEHOLDER queue heads in
+        // the periodic list with devAddr=0, ep=0, mps=0, and we happily adopted
+        // one of those as the tablet. Caught by dumping the QH at the stall:
+        //   qh=0x585FD000 devAddr=0 ep=0 mps=0 overlayTok=0x40 (Halted=1)
+        // So we were servicing a dummy queue -- inflating the report counter to
+        // ~300/sec, even marking it Halted -- while the real interrupt endpoint
+        // was never serviced at all. Hence "works briefly, then the pointer dies".
+        //
+        // A placeholder also has a zero max-packet-size, which no real endpoint
+        // has, so reject that too rather than relying on the address alone.
+        UINT32 maxPacket = (epChar >> 16) & 0x7FF;
+        int forUs = (usbTabletAddress == 0)
+                        ? (devAddr == 0 && maxPacket != 0)
+                        : ((int)devAddr == (UINT32)usbTabletAddress && maxPacket != 0);
 
         UINT64 qtd = ehciMemRead32(qh + 0x10) & ~0x1Fu;
 
@@ -4323,6 +4337,11 @@ void ehciProcessPeriodicSchedule(void) {
         UINT64 node = link & ~0x1Fu;
         if (node == 0) break;
         if (type == 1) {                                 // queue head
+            // Only remember a QH that actually belongs to our device, so the
+            // stall dump reports the real endpoint rather than a placeholder.
+            UINT32 ep = ehciMemRead32(node + 0x04);
+            if ((ep & 0x7F) == (UINT32)usbTabletAddress && ((ep >> 16) & 0x7FF) != 0)
+                g_lastIntQh = node;
             if (ehciRunQueueHead(node)) raisedInterrupt = 1;
         }
         UINT32 next = ehciMemRead32(node + 0x00);
@@ -4333,6 +4352,49 @@ void ehciProcessPeriodicSchedule(void) {
     ehciFrIndex = (ehciFrIndex + 8) & 0x3FFF;            // advance one frame
 
     if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
+}
+
+// Dumps the interrupt endpoint's queue head and its qTD chain straight out of
+// guest memory.
+//
+// This exists to settle one question that every remaining hypothesis about the
+// report stall depends on, and that our own counters cannot answer: when the
+// stream freezes, has the driver stopped QUEUEING work, or have we stopped
+// SERVICING work it queued? The Active bit in the qTD tokens says which.
+//   - an Active qTD sitting here while reports are frozen  => ours to fix
+//   - no Active qTD at all                                 => the driver stopped
+//                                                             queueing, and the
+//                                                             question moves to
+//                                                             why it stopped
+//                                                             acknowledging USBSTS
+// Reading guest memory directly also sidesteps kd entirely, whose ~75MB/s memory
+// drain destabilised the last two attempts to observe this.
+static void ehciDumpIntQh(const char *why) {
+    if (!g_lastIntQh || !guestMemory) return;
+    UINT64 qh = g_lastIntQh;
+    UINT32 epChar = ehciMemRead32(qh + 0x04);
+    UINT32 cur    = ehciMemRead32(qh + 0x0C);
+    UINT32 next   = ehciMemRead32(qh + 0x10);
+    UINT32 tok    = ehciMemRead32(qh + 0x18);
+    printf("[qh-dump/%s] qh=0x%llX devAddr=%u ep=%u mps=%u | cur=0x%08X next=0x%08X overlayTok=0x%08X (Active=%d Halted=%d bytes=%u)\n",
+           why, (unsigned long long)qh, epChar & 0x7F, (epChar >> 8) & 0xF,
+           (epChar >> 16) & 0x7FF, cur, next, tok,
+           (tok & 0x80) ? 1 : 0, (tok & 0x40) ? 1 : 0, (tok >> 16) & 0x7FFF);
+
+    UINT32 link = next;
+    int i;
+    for (i = 0; i < 4; i++) {
+        if (link & 0x1u) { printf("[qh-dump/%s]   qtd[%d]: T bit -- chain ends\n", why, i); break; }
+        UINT64 q = link & ~0x1Fu;
+        if (!q) { printf("[qh-dump/%s]   qtd[%d]: null pointer\n", why, i); break; }
+        UINT32 t = ehciMemRead32(q + 0x08);
+        UINT32 n = ehciMemRead32(q + 0x00);
+        printf("[qh-dump/%s]   qtd[%d]=0x%llX tok=0x%08X Active=%d Halted=%d PID=%u bytes=%u next=0x%08X\n",
+               why, i, (unsigned long long)q, t, (t & 0x80) ? 1 : 0, (t & 0x40) ? 1 : 0,
+               (t >> 8) & 0x3, (t >> 16) & 0x7FFF, n);
+        link = n;
+    }
+    fflush(stdout);
 }
 
 // Services both USB schedules on a WALL-CLOCK basis, roughly once per frame.
@@ -4419,8 +4481,20 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
         if (sinceMs >= 3000.0) {
             lastStatus = now;
             if ((long)g_tabletMoves != lastMoves || g_usbReportsSent != lastReports) {
+                // Evaluate the stall condition against the PREVIOUS sample, before
+                // overwriting it -- comparing after the update is always false,
+                // which is why the first attempt at this dump never fired.
+                int stalled = ((long)g_tabletMoves != lastMoves) &&
+                              (g_usbReportsSent == lastReports);
                 lastMoves = (long)g_tabletMoves;
                 lastReports = g_usbReportsSent;
+                // Dump the queue exactly when the symptom is present: pointer
+                // updates still arriving but the report stream frozen. Catching
+                // it in the act is the whole point -- a dump taken while things
+                // are healthy says nothing.
+                if (stalled && g_tabletEnabled && usbTabletConfigured) {
+                    ehciDumpIntQh("STALLED");
+                }
                 printf("[usb-status] moves=%ld reports=%ld irqs=%ld x=%ld y=%ld buttons=%ld "
                        "USBCMD=0x%08X USBSTS=0x%08X dropped=%ld\n",
                        lastMoves, lastReports, g_ehciIrqCount,
