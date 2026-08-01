@@ -6929,6 +6929,49 @@ int main(int argc, char *argv[]) {
     printf("[mem] guest RAM = %llu MB\n", (unsigned long long)(guestMemSize / (1024 * 1024)));
     fflush(stdout);
 
+    // U70: refuse to start a guest the host cannot back with PHYSICAL memory.
+    //
+    // Guest RAM is committed up front, so starting a 1536MB guest on a host with
+    // 800MB available does not fail cleanly -- it forces Windows to page out
+    // everything else, and the machine thrashes until it has to be hard
+    // powered off. That has now happened FOUR times on this hardware. The commit
+    // charge looks healthy while it happens (~75% of limit) because the pagefile
+    // has plenty of room; the metric that actually matters is ullAvailPhys, and
+    // this box boots with only ~0.8GB of its 7.8GB free.
+    //
+    // A hypervisor that can wedge the host by being asked for a normal amount of
+    // RAM is not finished, so this is a real preflight check rather than a
+    // diagnostic. The override exists because "I know, run it anyway" is a
+    // legitimate thing to want on a machine with different headroom.
+    {
+        MEMORYSTATUSEX memStatus;
+        memStatus.dwLength = sizeof(memStatus);
+        if (GlobalMemoryStatusEx(&memStatus)) {
+            const unsigned long long hostReserveMb = 512; // headroom Windows needs to stay responsive
+            unsigned long long availMb = memStatus.ullAvailPhys / (1024ULL * 1024ULL);
+            unsigned long long guestMb = (unsigned long long)(guestMemSize / (1024 * 1024));
+            printf("[mem] host available physical = %llu MB\n", availMb);
+            if (guestMb + hostReserveMb > availMb) {
+                long long safeMb = (long long)availMb - (long long)hostReserveMb;
+                printf("[mem] *** REFUSING TO START ***\n");
+                printf("[mem]   guest wants %llu MB, host has %llu MB available\n", guestMb, availMb);
+                printf("[mem]   Windows needs ~%llu MB of headroom; starting anyway thrashes the host\n",
+                       hostReserveMb);
+                if (safeMb >= 256)
+                    printf("[mem]   largest safe guest right now: ~%lld MB -- pass it as argv[4]\n", safeMb);
+                else
+                    printf("[mem]   no safe size right now: close some applications first\n");
+                printf("[mem]   set LOCALHOST_ALLOW_LOW_MEMORY=1 to override\n");
+                if (!getenv("LOCALHOST_ALLOW_LOW_MEMORY")) {
+                    fflush(stdout);
+                    return 1;
+                }
+                printf("[mem]   LOCALHOST_ALLOW_LOW_MEMORY set -- continuing anyway\n");
+            }
+            fflush(stdout);
+        }
+    }
+
     if (diskPath) {
         // Open .iso images read-only: installer/boot media should never
         // legitimately be written to this early (UdfDxe + the boot
