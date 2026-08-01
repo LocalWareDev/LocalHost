@@ -2135,10 +2135,17 @@ void auxResetState(void) {
 // style: an explicit reset handshake, a handful of specifically-modeled
 // commands, and a generic-ACK fallback for everything else.
 void auxHandleCommand(unsigned char val) {
-    // Always-on device trace, matching [ahci]/[uart2]'s existing style --
-    // useful for watching the reset/identification handshake once a real
-    // AUX-driving driver is reachable (see docs/roadmap.md phase 2 notes).
-    printf("[aux] command 0x%02X\n", val); fflush(stdout);
+    // Bounded. This was unbounded, and once the mouse actually started working it
+    // became one of the hottest log lines in the build -- every command, forever.
+    // That matters more than it sounds: when stdout is a CONSOLE rather than a
+    // file, each printf blocks the VM thread on console rendering, and a boot
+    // emits ~70000 lines. Enough of them to watch the init handshake, then quiet.
+    static int auxCmdLogged = 0;
+    if (auxCmdLogged < 80) {
+        auxCmdLogged++;
+        printf("[aux] command 0x%02X\n", val);
+        fflush(stdout);
+    }
     if (auxAwaitingParam) {
         // Parameter byte for a preceding 0xE8/0xF3 -- just acknowledge and
         // store it; the actual value doesn't affect our packet generation.
