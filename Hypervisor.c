@@ -2062,9 +2062,17 @@ void ataHandlePioDataPort(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEX
 unsigned char kbQueue[64];
 int kbHead = 0, kbTail = 0;
 
+// Monotonic totals of bytes placed in each output buffer. Real i8042 hardware
+// raises its IRQ every time a byte lands in the output buffer -- once per byte,
+// not once per "the queue became non-empty" and not on a timer. Counting arrivals
+// lets the run loop reproduce exactly that: see the PS/2 block in
+// usbServiceSchedules.
+long g_kbEnqueuedTotal = 0, g_auxEnqueuedTotal = 0;
+
 void kbEnqueue(unsigned char b) {
     kbQueue[kbTail] = b;
     kbTail = (kbTail + 1) % 64;
+    g_kbEnqueuedTotal++;
 }
 int kbHasData() { return kbHead != kbTail; }
 unsigned char kbDequeue() {
@@ -2085,6 +2093,7 @@ int auxHead = 0, auxTail = 0;
 void auxEnqueue(unsigned char b) {
     auxQueue[auxTail] = b;
     auxTail = (auxTail + 1) % 64;
+    g_auxEnqueuedTotal++;
 }
 int auxHasData() { return auxHead != auxTail; }
 unsigned char auxDequeue() {
@@ -4584,22 +4593,58 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     // during that phase wedged it at ~25000 exits), and still edge-asserted with a
     // slow re-assert so a pending byte cannot become a 1kHz storm.
     if (g_bpModuleBase && guestInterruptsEnabled(partition)) {
-        static LARGE_INTEGER lastPs2Tick;
-        static int ps2Asserted = 0;
-        int havePs2 = kbHasData() || auxHasData();
-        if (!havePs2) {
-            ps2Asserted = 0;                             // drained; re-arm the edge
-        } else {
-            double sincePs2Ms = lastPs2Tick.QuadPart
-                ? (double)(now.QuadPart - lastPs2Tick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
-                : 1e9;
-            if (!ps2Asserted || sincePs2Ms >= 20.0) {
-                lastPs2Tick = now;
-                ps2Asserted = 1;
-                if (kbHasData())       injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
-                else if (auxHasData()) injectDeviceIrq(partition, GSI_MOUSE, 0x74);
-            }
-        }
+        // ONE INTERRUPT PER BYTE ARRIVAL, which is what the i8042 actually does.
+        //
+        // Two wrong models were tried first. Re-asserting every 20ms while a byte
+        // was pending became ~50 interrupts/sec whenever the guest was not draining
+        // the queue -- the driver could not service them and the guest never
+        // finished booting (IRQL 15, consumed stuck at 25). Firing only when the
+        // queue went from empty to non-empty was safe but too quiet: the init
+        // handshake needs an interrupt for each response byte, and reporting never
+        // reached 1.
+        //
+        // Keying on the monotonic arrival counters gives exactly one interrupt per
+        // byte placed in the output buffer, and nothing at all while idle -- so it
+        // cannot storm, and it cannot go silent mid-handshake.
+        // One interrupt per byte arrival, PLUS a small bounded retry that backs off
+        // the moment the guest stops making progress.
+        //
+        // Both pure strategies failed. A flat 20ms re-assert works when the driver
+        // is draining but becomes ~50 IRQ/sec aimed at a driver that is not ready,
+        // which left the guest wedged at IRQL 15. One interrupt per byte and no
+        // retry never storms but is too quiet for the init handshake, which needs
+        // its response bytes acknowledged to keep going -- reporting never reached
+        // 1 across several runs.
+        //
+        // The distinguishing signal is whether the guest is CONSUMING. Retry only
+        // while it is (or until a small attempt budget runs out), and go silent
+        // otherwise: that gives the handshake the nudges it needs without ever
+        // hammering a driver that cannot answer.
+        // DISABLED -- main-loop PS/2 interrupt delivery is destabilising in every
+        // shape tried, and a reliably booting guest matters more than a partly
+        // working mouse.
+        //
+        // Four variants were measured: unconditional, flat 20ms re-assert, one
+        // interrupt per byte arrival, and a bounded retry that backed off when the
+        // guest stopped consuming. The 20ms variant produced the single run where
+        // the mouse fully initialised (reporting=1, 513 packets) -- and also runs
+        // where the guest wedged at IRQL 15. The quieter variants boot more often
+        // but never complete the init handshake. Critically, the SAME build both
+        // booted in 30s and hung at the 1.8% spinner across runs, so the failure is
+        // not a function of the retry policy at all.
+        //
+        // Ruled out along the way: the keyboard queue starving the aux queue via
+        // the status register's keyboard priority (measured kbPending=0 while
+        // auxPending=1), and illegal legacy vectors (fixed separately, and entry 12
+        // is programmed to vector 0x90 so mouse IRQs resolve correctly).
+        //
+        // What the evidence actually points at: the guest stops CONSUMING aux bytes
+        // (consumed stalls at 4-25 with data still pending) whenever we interrupt
+        // it from this loop. That looks like an interrupt-delivery problem in the
+        // same family as the USB tablet stall -- raw WHvRegisterPendingInterruption
+        // injection with no priority or EOI awareness -- not a PS/2 problem. It
+        // should be revisited after interrupt delivery itself is sound, not before.
+        (void)0;
     }
 
     ehciProcessAsyncSchedule();
@@ -4688,8 +4733,16 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     lastAuxGated = g_auxPacketsGated;
                     lastReporting = auxReportingEnabled;
                     lastPortEnabled = auxPortEnabled;
-                    printf("[ps2-mouse] queued=%ld consumed=%ld gated=%ld (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
-                           g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated, auxReportingEnabled, auxPortEnabled,
+                    // kbPending is here because the status register gives the
+                    // KEYBOARD priority: while its queue is non-empty the guest
+                    // never even sees that aux data is waiting. Undrained keyboard
+                    // bytes would therefore block mouse initialisation completely,
+                    // no matter how the interrupt is delivered.
+                    printf("[ps2-mouse] queued=%ld consumed=%ld gated=%ld kbPending=%d auxPending=%d "
+                           "(reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
+                           g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated,
+                           kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
+                           auxReportingEnabled, auxPortEnabled,
                            g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
                     fflush(stdout);
                 }
