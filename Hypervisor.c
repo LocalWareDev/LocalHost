@@ -2576,8 +2576,65 @@ int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition) {
 // Injects a hardware interrupt vector directly into the vCPU via the
 // "pending interruption" register. This bypasses any PIC/APIC model --
 // it's a minimal stand-in until real 8259 PIC emulation exists.
+// DISABLED. WHvRequestInterrupt is the right API for device interrupts -- it goes
+// through the virtual APIC, respecting TPR/ISR priority and queuing in IRR instead
+// of overwriting -- but it returned WHV_E_INVALID_PARTITION_CONFIG (0xC0350005)
+// here, because it requires the partition to have been CREATED with
+// LocalApicEmulationMode = XApic and ours was not. With the call failing, boot
+// regressed badly (guest died ~14s in, framebuffer stuck at the 1.7% spinner).
+//
+// Enabling LocalApicEmulationMode at partition creation is a real option and may
+// well be the correct long-term fix, but it changes interrupt behaviour for every
+// device at once and would need re-validating against the U46/U47 LAPIC work that
+// the 0x139 fix depends on. Not something to fold into a tablet bug hunt.
+#define U99_REQUEST_INTERRUPT 0
+
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector) {
     logBpEvent("injectInterrupt vector=0x%02X", vector);
+
+#if U99_REQUEST_INTERRUPT
+    // Deliver through the emulated LOCAL APIC rather than forcing an event in.
+    //
+    // WHvRegisterPendingInterruption (below) is raw event injection: a SINGLE-SLOT
+    // register with no priority, no queuing and no EOI awareness. Setting it while
+    // an interruption is already pending silently loses the previous one, and
+    // forcing a vector in while the guest is still inside that vector's ISR
+    // desynchronises the LAPIC's in-service bookkeeping. Once that happens the
+    // vector can stop being delivered permanently.
+    //
+    // That is exactly the observed USB stall: acknowledgements and report delivery
+    // freeze together after ~2000 successful interrupts, while we keep injecting to
+    // an unmasked GSI on the vector Windows itself programmed (dropped=0). AHCI has
+    // survived this all along only because storahci polls as well as taking
+    // interrupts; USBPORT is purely interrupt-driven and is the first subsystem
+    // here that cannot tolerate a lost or blocked one.
+    //
+    // WHvRequestInterrupt is the API meant for device interrupts: it goes through
+    // the virtual APIC, which respects TPR/ISR priority and queues in IRR instead
+    // of overwriting. Edge trigger is correct here because the level behaviour is
+    // already modelled above by re-asserting while the condition holds.
+    WHV_INTERRUPT_CONTROL interrupt;
+    memset(&interrupt, 0, sizeof(interrupt));
+    interrupt.Type = WHvX64InterruptTypeFixed;
+    interrupt.DestinationMode = WHvX64InterruptDestinationModePhysical;
+    interrupt.TriggerMode = WHvX64InterruptTriggerModeEdge;
+    interrupt.Destination = 0;             // APIC ID of the single vCPU
+    interrupt.Vector = vector;
+    HRESULT irqHr = WHvRequestInterrupt(partition, &interrupt, sizeof(interrupt));
+    if (SUCCEEDED(irqHr)) return;
+    // Fall through to the legacy path if the platform refuses the request, so a
+    // failure here degrades to the old behaviour rather than dropping the IRQ.
+    {
+        static int reqFailLogged = 0;
+        if (reqFailLogged < 5) {
+            reqFailLogged++;
+            printf("[irq] WHvRequestInterrupt failed hr=0x%lX vector=0x%02X -- using legacy injection\n",
+                   (unsigned long)irqHr, vector);
+            fflush(stdout);
+        }
+    }
+#endif
+
     WHV_REGISTER_NAME regName = WHvRegisterPendingInterruption;
     WHV_REGISTER_VALUE regValue = { 0 };
 
@@ -4443,6 +4500,13 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
         double sinceIrqMs = lastIrqTick.QuadPart
             ? (double)(now.QuadPart - lastIrqTick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
             : 1e9;
+        // 20ms re-assert, and it is load-bearing. Tested at 2000ms (effectively
+        // rising-edge-only, to see whether our own repeated injections were
+        // wedging LAPIC delivery): the driver acknowledged exactly ONCE and never
+        // even enabled the periodic schedule (USBCMD=0x00010021, reports=0). A
+        // level-triggered line has to persist until acknowledged -- if the guest
+        // misses the single edge there is nothing to retry -- so re-assertion is
+        // required, and over-injection is NOT the cause of the later stall.
         if (!irqAsserted || sinceIrqMs >= 20.0) {
             lastIrqTick = now;
             irqAsserted = 1;
