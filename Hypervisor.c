@@ -8761,7 +8761,25 @@ int main(int argc, char *argv[]) {
             // Without this the tablet freezes the moment the guest goes quiet.
             usbServiceSchedules(partition);
 
-            if (pendingAtaIrq) {
+            // INPUT FIRST. This chain is an else-if, and deliverRtcPeriodicIrq
+            // succeeds on essentially every pass once the guest enables the RTC
+            // periodic interrupt (PIE=1, ~1kHz) -- so with the keyboard and mouse
+            // sitting BELOW it, their branches were never reached and their
+            // interrupts were never delivered at all. Keystrokes piled up unread
+            // (measured kbPending=1 with the guest idle at IRQL 0) and the mouse
+            // could never finish initialising. The clock was starving input.
+            //
+            // Input is rare and the RTC is constant, so giving input priority costs
+            // the timer nothing: at worst a periodic tick is deferred by one pass
+            // of this loop, and deliverRtcPeriodicIrq will simply deliver it next
+            // time round.
+            if (kbHasData()) {
+                injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+                injected = 1;
+            } else if (auxHasData()) {
+                injectDeviceIrq(partition, GSI_MOUSE, 0x74);
+                injected = 1;
+            } else if (pendingAtaIrq) {
                 injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: IRQ14/AHCI, routed
                 pendingAtaIrq = 0;
                 injected = 1;
@@ -8770,17 +8788,8 @@ int main(int argc, char *argv[]) {
                 // own comment -- this is what Windows HAL's phase-0 timer
                 // test actually waits for.
                 injected = 1;
-            } else if (kbHasData()) {
-                injectDeviceIrq(partition, GSI_KEYBOARD, 0x09); // U53: IRQ1 keyboard, routed
-                injected = 1;
-            } else if (auxHasData()) {
-                // IRQ12 - PS/2 mouse (slave PIC IRQ4 -> legacy remap vector
-                // 0x70+4). Re-checked every loop iteration like the other
-                // sources above, so a multi-byte mouse packet naturally gets
-                // one interrupt per byte, matching real i8042 hardware,
-                // without any extra packet-boundary bookkeeping here.
-                injectDeviceIrq(partition, GSI_MOUSE, 0x74); // U53: IRQ12 mouse, routed
-                injected = 1;
+            // (keyboard and mouse are handled at the TOP of this chain now -- see
+            // the comment there for why they cannot sit below the RTC)
             } else if (pendingRtl8139Irq) {
                 // IRQ11 - RTL8139 NIC. Needed here (not just the outer
                 // loop's deliverPendingRtl8139Irq) so a packet arriving
