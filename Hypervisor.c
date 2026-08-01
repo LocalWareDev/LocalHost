@@ -2662,7 +2662,7 @@ UINT32 ehciPortSc = 0x00001003;
 // never an inference from how many lines a log happened to print.
 long g_ehciMmioReads = 0, g_ehciMmioWrites = 0, g_ehciPortResets = 0;
 int g_ehciIrqPending = 0;   // set when a qTD with IOC retires, drained by the run loop
-long g_ehciIrqCount = 0, g_ehciLastIrqExit = 0;
+long g_ehciIrqCount = 0, g_ehciLastIrqExit = 0, g_ehciIrqDropped = 0;
 int pciConfigSpacesInit = 0;
 
 // PM1a_CNT_BLK (pmBase+4): bit0 is SCI_EN ("ACPI mode enabled"). Real
@@ -4144,24 +4144,15 @@ static int ehciRunQueueHead(UINT64 qh) {
 
         UINT64 qtd = ehciMemRead32(qh + 0x10) & ~0x1Fu;
 
-        // If the overlay says the queue is finished, the driver may still have
-        // APPENDED a qTD by linking it from the last one we retired -- that is
-        // how software extends a queue that hardware has not yet noticed is
-        // empty. We record the last qTD in the QH's Current qTD Pointer (0x0C),
-        // which a real controller maintains, and follow its next pointer here.
-        // Without this the report stream ran until the first chain ended and then
-        // stopped forever: measured as reports frozen at 1578 the instant the
-        // pointer moved, with the guest still healthy and still painting.
-        if ((ehciMemRead32(qh + 0x10) & 0x1u) || qtd == 0) {
-            UINT32 cur = ehciMemRead32(qh + 0x0C) & ~0x1Fu;
-            if (cur) {
-                UINT32 appended = ehciMemRead32((UINT64)cur + 0x00);
-                if (!(appended & 0x1u) && (appended & ~0x1Fu)) {
-                    qtd = appended & ~0x1Fu;
-                    ehciMemWrite32(qh + 0x10, appended);   // adopt it into the overlay
-                }
-            }
-        }
+        // NOTE: an "append detection" pass used to live here -- if the overlay
+        // said the queue was drained it followed the Current qTD Pointer's next
+        // link to pick up anything the driver had appended. It did not fix the
+        // stall it was written for, and it can re-adopt a qTD that was already
+        // retired, servicing it over and over. That inflated the report rate to
+        // ~300/sec against an endpoint whose bInterval only asks for ~15/sec,
+        // which is almost certainly what drowned the guest's HID queue. Removed;
+        // if queue-append handling is genuinely needed it has to key off the
+        // qTD's Active bit, not merely off the pointer being non-terminal.
         int qtdGuard = 0;
         while (forUs && qtd && !(ehciMemRead32(qh + 0x10) & 0x1u) && qtdGuard < 16) {
             qtdGuard++;
@@ -4390,7 +4381,12 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
             lastIrqTick = now;
             irqAsserted = 1;
             g_ehciIrqCount++;
+            // injectDeviceIrq returns 0 when the guest has MASKED this GSI, in
+            // which case nothing was delivered. Counting attempts made "irqs
+            // climbing" look like "interrupts arriving" when it may mean the
+            // opposite, so count the two separately.
             int delivered = injectDeviceIrq(partition, GSI_EHCI, 0x75);
+            if (!delivered) g_ehciIrqDropped++;
         // Is the interrupt actually landing anywhere? USBSTS staying set while we
         // inject thousands of times means the driver's ISR is not running, and the
         // usual reason is the vector: while an IOAPIC entry is still at its
@@ -4426,10 +4422,10 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                 lastMoves = (long)g_tabletMoves;
                 lastReports = g_usbReportsSent;
                 printf("[usb-status] moves=%ld reports=%ld irqs=%ld x=%ld y=%ld buttons=%ld "
-                       "USBCMD=0x%08X USBSTS=0x%08X\n",
+                       "USBCMD=0x%08X USBSTS=0x%08X dropped=%ld\n",
                        lastMoves, lastReports, g_ehciIrqCount,
                        (long)g_tabletX, (long)g_tabletY, (long)g_tabletButtons,
-                       ehciUsbCmd, ehciUsbSts);
+                       ehciUsbCmd, ehciUsbSts, g_ehciIrqDropped);
                 fflush(stdout);
             }
         }
