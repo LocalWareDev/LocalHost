@@ -969,8 +969,42 @@ static QueuedIrq g_irqQueue[IRQ_QUEUE_MAX];
 static int g_irqQueueCount = 0;
 static unsigned long g_irqSeq = 0;
 long g_irqQueued = 0, g_irqDelivered = 0, g_irqQueueFull = 0;
+long g_irqCoalesced = 0;    // already pending for that vector
+long g_irqDeferredTpr = 0;  // held back because the guest has that level masked
+long g_irqTprReadFail = 0;  // CR8 unreadable -- we deliver anyway, see drainInterruptQueue
+
+// TPR gating, scoped to INPUT vectors only. Set to 0 to disable it entirely.
+//
+// Applying it to EVERY vector was measured and is catastrophic: the guest triple
+// faults ~15s in, reproducibly, before it has even programmed the IOAPIC. Early
+// Windows boot sits at a high IRQL for long stretches, so a blanket gate starves
+// the timer and storage exactly when the HAL is waiting on them -- those runs
+// never started AHCI at all (PxCMD=0, zero IRQ injections), while the unmodified
+// baseline booted fine on the same host minutes earlier. Bisected against that
+// baseline; the queue coalescing below was cleared by the same bisection.
+//
+// The deadlock the gate exists to prevent is specific to the i8042: i8042prt
+// raises to IRQL 10 and takes its interrupt spinlock, and a keyboard/mouse ISR
+// entered there re-enters that same lock on a one-vCPU guest and spins forever.
+// Only the input vectors need it, and confining it to them leaves the timer and
+// storage paths -- which demonstrably work -- exactly as they were.
+#define IRQ_RESPECT_TPR   1
+#define IRQ_COALESCE_IRR  1
 
 static void queueInterrupt(unsigned char vector, int prio) {
+    int i;
+#if !IRQ_COALESCE_IRR
+    (void)i;
+#endif
+    // ONE PENDING ENTRY PER VECTOR, which is what a real APIC's IRR is: a single
+    // bit per vector, not a count. Without this a source that keeps firing while
+    // the guest has that level masked -- the RTC, at ~1kHz -- fills the queue in
+    // 64ms and pushes every other device's interrupt out of it.
+#if IRQ_COALESCE_IRR
+    for (i = 0; i < g_irqQueueCount; i++) {
+        if (g_irqQueue[i].vector == vector) { g_irqCoalesced++; return; }
+    }
+#endif
     if (g_irqQueueCount >= IRQ_QUEUE_MAX) { g_irqQueueFull++; return; }
     g_irqQueue[g_irqQueueCount].vector = vector;
     g_irqQueue[g_irqQueueCount].prio = prio;
@@ -1041,20 +1075,66 @@ static void dumpIdtGate(WHV_PARTITION_HANDLE partition, unsigned char vector, co
 
 // Hands the guest one queued interrupt if its pending slot is free. Called every
 // run-loop pass, so a backlog drains as fast as the guest will accept.
+// RESPECTS THE GUEST'S TASK PRIORITY. This is not a refinement, it is the
+// difference between a working guest and a deadlocked one.
+//
+// WHvRegisterPendingInterruption shoves a vector straight into the vCPU's event
+// injection field. It does NOT go through the virtual APIC, so it does not
+// consult the TPR -- meaning we were delivering interrupts the guest had
+// explicitly masked, at moments the guest's own code treats as impossible.
+//
+// On x64 Windows, IRQL *is* CR8. When i8042prt calls KeAcquireInterruptSpinLock
+// it raises to the i8042 interrupt object's synchronise IRQL (10, the higher of
+// its keyboard vector 0xA0 and mouse vector 0x90) and takes the lock -- and at
+// that IRQL, hardware would mask BOTH those vectors. Injecting the mouse vector
+// anyway ran its ISR, which tried to acquire the lock the interrupted code was
+// already holding, on a guest with one vCPU: an unbreakable spin at DIRQL.
+// Measured exactly that -- rip parked in ntoskrnl's spin path, cr8=0xA, exit
+// count frozen for ten minutes, immediately after the mouse init handshake.
+//
+// A vector is deliverable only when its priority class (vector >> 4) strictly
+// outranks CR8. Anything else stays QUEUED, not dropped, and goes out as soon as
+// the guest lowers IRQL -- which is exactly what the queue is for.
 void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
     if (g_irqQueueCount == 0) return;
     WHV_REGISTER_NAME pendName = WHvRegisterPendingInterruption;
     WHV_REGISTER_VALUE existing = { 0 };
+    unsigned tpr = 0;
     if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &pendName, 1, &existing))) return;
     if (existing.Reg64 & 1ULL) return;              // guest has not taken the last one
     if (!guestInterruptsEnabled(partition)) return;
 
-    int best = 0, i;
-    for (i = 1; i < g_irqQueueCount; i++) {
-        if (g_irqQueue[i].prio < g_irqQueue[best].prio ||
+    // Read CR8 in its OWN call, and treat a failure as "deliver anyway".
+    //
+    // Both of those are load-bearing. Batching it with WHvRegisterPendingInterruption
+    // above -- they are different register classes -- made the whole call fail, and
+    // because the old code then returned, NOTHING was ever delivered: the guest ran
+    // with every device interrupt silently withheld and triple-faulted 15s in, twice.
+    // The tell was delivered=0 deferredTpr=0 while the RTC reported 25 ticks fired.
+    // An unreadable TPR must never be able to silence every device in the machine.
+    {
+        WHV_REGISTER_NAME cr8Name = WHvX64RegisterCr8;
+        WHV_REGISTER_VALUE cr8 = { 0 };
+        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, &cr8Name, 1, &cr8)))
+            tpr = (unsigned)(cr8.Reg64 & 0xF);
+        else
+            g_irqTprReadFail++;                     // tpr stays 0: nothing is masked
+    }
+
+    int best = -1, i;
+    for (i = 0; i < g_irqQueueCount; i++) {
+#if IRQ_RESPECT_TPR
+        // Input only -- see IRQ_RESPECT_TPR's comment for why this is not applied
+        // to the timer and storage vectors.
+        if (g_irqQueue[i].prio == IRQ_PRIO_INPUT &&
+            (unsigned)(g_irqQueue[i].vector >> 4) <= tpr) { g_irqDeferredTpr++; continue; }
+#endif
+        if (best < 0 ||
+            g_irqQueue[i].prio < g_irqQueue[best].prio ||
             (g_irqQueue[i].prio == g_irqQueue[best].prio && g_irqQueue[i].seq < g_irqQueue[best].seq))
             best = i;
     }
+    if (best < 0) return;                           // nothing deliverable right now
     unsigned char vec = g_irqQueue[best].vector;
     for (i = best; i < g_irqQueueCount - 1; i++) g_irqQueue[i] = g_irqQueue[i + 1];
     g_irqQueueCount--;
@@ -2194,7 +2274,21 @@ void ataHandlePioDataPort(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEX
     WHvSetVirtualProcessorRegisters(partition, 0, names, 4, values);
 }
 
-unsigned char kbQueue[64];
+// Both PS/2 queues are written by TWO threads and nothing serialised them: the
+// window thread produces keystrokes and mouse packets from WndProc, the VM
+// thread produces device command replies and performs every dequeue. The ring
+// indices, the shared arrival-sequence counter and the mouse's 3-byte packet
+// framing are all exposed to that race, and a torn mouse packet is not a subtle
+// corruption -- the guest reads the fields out of phase and the pointer flies
+// off the screen. Initialised in main() before the window thread is created.
+CRITICAL_SECTION ps2Lock;
+#define PS2_LOCK()   EnterCriticalSection(&ps2Lock)
+#define PS2_UNLOCK() LeaveCriticalSection(&ps2Lock)
+
+// One slot is always left empty so head==tail unambiguously means "empty".
+#define PS2_QUEUE_SIZE 64
+
+unsigned char kbQueue[PS2_QUEUE_SIZE];
 int kbHead = 0, kbTail = 0;
 
 // Monotonic totals of bytes placed in each output buffer. Real i8042 hardware
@@ -2219,18 +2313,35 @@ volatile LONG g_kbUserBytes = 0, g_auxUserBytes = 0;
 // status register means one unread keyboard byte hides the mouse FOREVER -- and
 // that is exactly what happened. See the status-register read for the full story.
 unsigned long g_ps2Seq = 0;
-unsigned long kbSeqQ[64], auxSeqQ[64];
+unsigned long kbSeqQ[PS2_QUEUE_SIZE], auxSeqQ[PS2_QUEUE_SIZE];
+
+// Bytes discarded because a queue was already full. This used to be impossible
+// to see because it was also impossible to detect: both enqueues simply advanced
+// the tail past the head, which does not lose one byte -- it silently reorders
+// the entire queue and desynchronises the mouse's packet framing. A nonzero
+// count here means the guest is not draining; for the mouse it should stay at
+// zero now that motion is coalesced rather than queued unbounded.
+long g_kbDropped = 0, g_auxDropped = 0;
+
+static int ps2Used(int head, int tail) { return (tail - head + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE; }
+static int ps2Free(int head, int tail) { return PS2_QUEUE_SIZE - 1 - ps2Used(head, tail); }
 
 void kbEnqueue(unsigned char b) {
+    PS2_LOCK();
+    if (ps2Free(kbHead, kbTail) < 1) { g_kbDropped++; PS2_UNLOCK(); return; }
     kbSeqQ[kbTail] = g_ps2Seq++;
     kbQueue[kbTail] = b;
-    kbTail = (kbTail + 1) % 64;
+    kbTail = (kbTail + 1) % PS2_QUEUE_SIZE;
     g_kbEnqueuedTotal++;
+    PS2_UNLOCK();
 }
 int kbHasData() { return kbHead != kbTail; }
 unsigned char kbDequeue() {
-    unsigned char b = kbQueue[kbHead];
-    kbHead = (kbHead + 1) % 64;
+    unsigned char b;
+    PS2_LOCK();
+    b = kbQueue[kbHead];
+    kbHead = (kbHead + 1) % PS2_QUEUE_SIZE;
+    PS2_UNLOCK();
     return b;
 }
 
@@ -2240,27 +2351,37 @@ unsigned char kbDequeue() {
 // as independent queues with a fixed keyboard-first read priority rather
 // than one interleaved FIFO, so this is modeled the same way rather than
 // merged with kbQueue.
-unsigned char auxQueue[64];
+unsigned char auxQueue[PS2_QUEUE_SIZE];
 int auxHead = 0, auxTail = 0;
 
 void auxEnqueue(unsigned char b) {
+    PS2_LOCK();
+    if (ps2Free(auxHead, auxTail) < 1) { g_auxDropped++; PS2_UNLOCK(); return; }
     auxSeqQ[auxTail] = g_ps2Seq++;
     auxQueue[auxTail] = b;
-    auxTail = (auxTail + 1) % 64;
+    auxTail = (auxTail + 1) % PS2_QUEUE_SIZE;
     g_auxEnqueuedTotal++;
+    PS2_UNLOCK();
 }
 
 // Which queue holds the OLDEST undelivered byte -- i.e. which one a real single
 // output buffer would be presenting right now. Returns 1 for aux, 0 for keyboard.
 int ps2AuxIsNext(void) {
-    if (!kbHasData()) return auxHasData();
-    if (!auxHasData()) return 0;
-    return (auxSeqQ[auxHead] < kbSeqQ[kbHead]) ? 1 : 0;
+    int r;
+    PS2_LOCK();
+    if (!kbHasData())      r = auxHasData();
+    else if (!auxHasData()) r = 0;
+    else                    r = (auxSeqQ[auxHead] < kbSeqQ[kbHead]) ? 1 : 0;
+    PS2_UNLOCK();
+    return r;
 }
 int auxHasData() { return auxHead != auxTail; }
 unsigned char auxDequeue() {
-    unsigned char b = auxQueue[auxHead];
-    auxHead = (auxHead + 1) % 64;
+    unsigned char b;
+    PS2_LOCK();
+    b = auxQueue[auxHead];
+    auxHead = (auxHead + 1) % PS2_QUEUE_SIZE;
+    PS2_UNLOCK();
     return b;
 }
 
@@ -2284,12 +2405,24 @@ unsigned char auxResolution = 2;   // 2 = 4 counts/mm (the spec default code, no
 unsigned char auxSampleRate = 100;
 int auxScaling2to1 = 0;
 int auxReportingEnabled = 0;
+// Lives here with the rest of the device state rather than down with the host
+// input plumbing, because the 0xE9 status reply reports it too.
+unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
 
 // Set by 0xE8 (set resolution) / 0xF3 (set sample rate): the next
 // AUX-directed byte (still individually 0xD4-prefixed by the driver) is a
 // parameter for that command rather than a new command.
 int auxAwaitingParam = 0;
 unsigned char auxAwaitingParamFor = 0;
+
+// Discards anything the mouse has queued but the guest has not read. Real
+// hardware does this on reset -- the device stops streaming and its buffer is
+// emptied -- and it matters here: a reset issued mid-motion would otherwise put
+// the reply (0xFA 0xAA 0x00) BEHIND leftover packet bytes, so i8042prt reads a
+// movement byte where it expects the ACK and fails the handshake it just
+// started. Which is exactly the handshake that has to work. Defined with the
+// motion state it clears, further down.
+void auxFlushQueue(void);
 
 void auxResetState(void) {
     auxResolution = 2;
@@ -2330,20 +2463,23 @@ void auxHandleCommand(unsigned char val) {
     switch (val) {
         case 0xFF: // Reset
             auxResetState();
+            auxFlushQueue();  // the reply must be the FIRST thing the guest reads back
             auxEnqueue(0xFA); // command acknowledged
             auxEnqueue(0xAA); // self-test passed
             auxEnqueue(0x00); // device ID: 0x00 = standard PS/2 mouse
             break;
         case 0xF6: // Set defaults
             auxResetState();
+            auxFlushQueue();
             auxEnqueue(0xFA);
             break;
         case 0xF4: // Enable data reporting
             auxReportingEnabled = 1;
             auxEnqueue(0xFA);
             break;
-        case 0xF5: // Disable data reporting
+        case 0xF5: // Disable data reporting -- streaming stops and the buffer is dropped
             auxReportingEnabled = 0;
+            auxFlushQueue();
             auxEnqueue(0xFA);
             break;
         case 0xE8: // Set resolution -- next byte is the parameter
@@ -2367,6 +2503,19 @@ void auxHandleCommand(unsigned char val) {
         case 0xF2: // Get device ID
             auxEnqueue(0xFA);
             auxEnqueue(0x00);
+            break;
+        case 0xE9: // Status request -- ACK then THREE status bytes
+            // i8042prt really does send this (observed mid-handshake, between the
+            // scaling and resolution commands). It fell through to the generic ACK
+            // below, which answers with one byte where the device owes four: the
+            // driver is then three bytes out of phase with the stream for the rest
+            // of the conversation, reading the next command's ACK as its status.
+            auxEnqueue(0xFA);
+            auxEnqueue((unsigned char)((auxScaling2to1 ? 0x10 : 0x00) |
+                                       (auxReportingEnabled ? 0x20 : 0x00) |
+                                       (auxButtonMask & 0x07)));
+            auxEnqueue(auxResolution);
+            auxEnqueue(auxSampleRate);
             break;
         default: // Generic ACK, matching the keyboard's own catch-all.
             auxEnqueue(0xFA);
@@ -2393,47 +2542,204 @@ long g_kbBytesToGuest = 0;    // keystroke bytes the guest actually read
 long g_kbIrqSent = 0, g_kbIrqMasked = 0;  // keyboard IRQs we fired / that were masked
 long g_injectSkippedBusy = 0;             // injections skipped because one was still pending
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
-unsigned char auxButtonMask = 0; // bit0=left, bit1=right, bit2=middle
+long g_auxIrqSent = 0, g_auxIrqMasked = 0;  // mouse IRQs we fired / that were masked
+long g_auxCoalesced = 0;      // host motion events folded into a later packet
 
-// Builds and enqueues one standard 3-byte PS/2 packet (status, dx, dy) if
-// reporting is enabled and there's AUX port. dx/dy are relative motion in
-// client pixels (PS/2 is inherently relative -- no guest resolution or
-// cursor-position knowledge needed here, same as real hardware). Called on
-// every mouse-move or button-state-change message; real mice likewise only
-// send a packet when something actually changed, not on a fixed interval.
-void auxSendPacket(int dx, int dy) {
+// --- The output buffer's interrupt ---
+//
+// A real i8042 raises an IRQ when a byte MOVES INTO its single output buffer,
+// and the guest's ISR reads exactly ONE byte per interrupt. So the rule is one
+// interrupt per byte PRESENTED, which re-raises by itself after every read that
+// leaves more data behind.
+//
+// Neither rule tried before is that rule, and both fail the same way. "One
+// interrupt per byte enqueued" keys on a monotonic arrival counter, so a reply
+// that lands as one batch -- 0xFA 0xAA 0x00 for a mouse reset, 0xFA 0x00 for an
+// identify -- got exactly ONE interrupt, the guest read one byte, and the rest
+// were stranded with nothing left to announce them. That is what the mouse init
+// handshake was dying on: reset completed, 0xF2 (identify) was acknowledged, the
+// ID byte never arrived, i8042prt timed out and started the whole sequence over.
+// The other rule, "re-assert while any data is pending", delivers every byte but
+// becomes a storm aimed at a driver that is not ready -- the ~50/sec version of
+// it is what wedged the guest at IRQL 15 in earlier attempts.
+//
+// Keying on the ARRIVAL SEQUENCE of the byte at the head of the output buffer is
+// the rule itself: one interrupt per byte, in order, and silence while idle.
+static unsigned long g_ps2AnnouncedSeq = 0;
+static int g_ps2Announced = 0;
+static LARGE_INTEGER g_ps2AnnouncedAt;
+
+// Identifies the byte the output buffer is presenting. Returns 0 when empty.
+static int ps2OutputHead(int *isAux, unsigned long *seq) {
+    int found = 0;
+    PS2_LOCK();
+    if (kbHasData() || auxHasData()) {
+        int aux = ps2AuxIsNext();
+        *isAux = aux;
+        *seq = aux ? auxSeqQ[auxHead] : kbSeqQ[kbHead];
+        found = 1;
+    }
+    PS2_UNLOCK();
+    return found;
+}
+
+// Raises the interrupt for whatever the output buffer holds right now, at most
+// once per byte. Returns 1 if an interrupt was actually queued for the guest.
+int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
+    int isAux = 0, delivered;
+    unsigned long seq = 0;
+    LARGE_INTEGER now;
+
+    if (!ps2OutputHead(&isAux, &seq)) { g_ps2Announced = 0; return 0; }
+
+    QueryPerformanceCounter(&now);
+    if (g_ps2Announced && seq == g_ps2AnnouncedSeq) {
+        // Same byte still sitting unread. Re-announce it, but slowly. A real
+        // controller holds its line asserted until the byte is read, so going
+        // permanently silent after a single edge means one missed interrupt
+        // wedges the ENTIRE controller -- there is only one output buffer, so an
+        // unread byte blocks the other device too. Twice a second is two orders
+        // of magnitude below the 20ms re-assert that destabilised boot before,
+        // and cannot storm anything.
+        double sinceMs = perfFrequency.QuadPart
+            ? (double)(now.QuadPart - g_ps2AnnouncedAt.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+            : 0.0;
+        if (sinceMs < 500.0) return 0;
+    }
+
+    if (isAux) {
+        g_auxIrqSent++;
+        delivered = injectDeviceIrq(partition, GSI_MOUSE, 0x74);
+        if (!delivered) g_auxIrqMasked++;
+    } else {
+        g_kbIrqSent++;
+        delivered = injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+        if (!delivered) g_kbIrqMasked++;
+    }
+
+    // Only counted as announced if it actually went somewhere. A masked GSI
+    // means the guest has not programmed that IOAPIC entry yet (normal during
+    // early boot); retrying costs one vector resolve per pass and stops the byte
+    // being lost to a window the guest was never listening in.
+    if (delivered) {
+        g_ps2Announced = 1;
+        g_ps2AnnouncedSeq = seq;
+        g_ps2AnnouncedAt = now;
+    }
+    return delivered;
+}
+
+// --- Host motion -> PS/2 packets ---
+//
+// Motion the guest has not been given yet. PS/2 is a RELATIVE protocol, so
+// motion that cannot be sent right now is simply added to the next packet: the
+// pointer still arrives exactly where the host pointer is, described in fewer,
+// larger steps. That is what a real mouse does too -- it samples at a fixed rate
+// and reports the movement accumulated since its last report.
+//
+// This is what keeps the byte stream intact. Host raw input arrives at the
+// physical mouse's polling rate (125-1000 reports/sec) while the guest drains
+// the output buffer one byte per interrupt. Queueing all of it overruns a
+// 64-byte ring in a fraction of a second, and an overrun does not merely lose
+// motion -- it breaks the 3-byte packet framing, after which the guest reads
+// every field out of phase and the cursor flies off the screen.
+static int auxPendingDx = 0, auxPendingDy = 0;
+static int auxPendingMotion = 0;
+static unsigned char auxLastReportedButtons = 0;
+
+// At most this much un-read mouse data in flight (four packets). Enough that a
+// burst still feels smooth; past it the guest is behind, and more packets would
+// only add latency to a position it is about to be told about anyway.
+#define AUX_MAX_INFLIGHT 12
+
+void auxFlushQueue(void) {
+    PS2_LOCK();
+    auxHead = auxTail = 0;
+    auxPendingDx = auxPendingDy = 0;
+    auxPendingMotion = 0;
+    PS2_UNLOCK();
+}
+
+// Builds and enqueues one standard 3-byte PS/2 packet (status, dx, dy) from the
+// accumulated motion and the current button state. Caller holds ps2Lock.
+static void auxFlushMotionLocked(void) {
+    int buttonsChanged = (auxButtonMask != auxLastReportedButtons);
+    int px, py, restX = 0, restY = 0;
+    unsigned char status;
+
+    if (!auxPendingMotion && !buttonsChanged) return;
+
     // Two gates the guest controls: the driver must have enabled reporting
     // (0xF4) and the aux port must be on. Counted separately from accepted
     // packets so "the mouse is dead" can be told apart from "the guest has not
     // enabled it yet" -- otherwise both look identical from outside.
-    if (!auxReportingEnabled || !auxPortEnabled) { g_auxPacketsGated++; return; }
+    if (!auxReportingEnabled || !auxPortEnabled) {
+        g_auxPacketsGated++;
+        auxPendingDx = auxPendingDy = 0;
+        auxPendingMotion = 0;
+        auxLastReportedButtons = auxButtonMask;
+        return;
+    }
+
+    // Hold motion back while the guest is behind -- but never a button change,
+    // which cannot be folded into a later packet without losing the click.
+    if (!buttonsChanged && ps2Used(auxHead, auxTail) >= AUX_MAX_INFLIGHT) { g_auxCoalesced++; return; }
+    if (ps2Free(auxHead, auxTail) < 3) { g_auxCoalesced++; return; }
+
+    px = auxPendingDx;
+    py = -auxPendingDy;             // PS/2 Y+ is up; Windows client-area Y+ is down
+    auxPendingDx = auxPendingDy = 0;
+    auxPendingMotion = 0;
+    auxLastReportedButtons = auxButtonMask;
     g_auxPackets++;
 
-    // PS/2 Y+ is up; Windows client-area Y+ is down.
-    dy = -dy;
+    // Each field is 9-bit signed (sign bit in the status byte + 8 data bits).
+    // Anything past that stays pending and goes out in the next packet rather
+    // than being clipped: a large accumulated movement should arrive slightly
+    // later, not partly vanish. Carrying the remainder also means the overflow
+    // bits (6 and 7) are never needed -- drivers treat those as "discard this
+    // packet", which would throw the movement away.
+    if (px > 255)  { restX = px - 255;  px = 255;  }
+    if (px < -256) { restX = px + 256;  px = -256; }
+    if (py > 255)  { restY = py - 255;  py = 255;  }
+    if (py < -256) { restY = py + 256;  py = -256; }
+    if (restX || restY) {
+        auxPendingDx = restX;
+        auxPendingDy = -restY;      // back into host convention
+        auxPendingMotion = 1;
+    }
 
-    // Clamp to the 9-bit signed range each field can represent (sign bit +
-    // 8 data bits), setting the overflow bits instead of wrapping if a
-    // single event's motion exceeds it (a fast physical flick could in
-    // principle exceed this between two WM_MOUSEMOVE messages).
-    unsigned char status = auxButtonMask & 0x07;
-    status |= 0x08; // bit 3: always-1 marker, used by drivers to resync the byte stream
-
-    int overflowX = 0, overflowY = 0;
-    if (dx > 255) { dx = 255; overflowX = 1; }
-    if (dx < -256) { dx = -256; overflowX = 1; }
-    if (dy > 255) { dy = 255; overflowY = 1; }
-    if (dy < -256) { dy = -256; overflowY = 1; }
-
-    if (dx < 0) status |= 0x10; // bit 4: X sign
-    if (dy < 0) status |= 0x20; // bit 5: Y sign
-    if (overflowX) status |= 0x40; // bit 6: X overflow
-    if (overflowY) status |= 0x80; // bit 7: Y overflow
+    status = (unsigned char)(auxButtonMask & 0x07);
+    status |= 0x08;                 // bit 3: always-1 marker, used by drivers to resync the stream
+    if (px < 0) status |= 0x10;     // bit 4: X sign
+    if (py < 0) status |= 0x20;     // bit 5: Y sign
 
     InterlockedIncrement(&g_auxUserBytes);
     auxEnqueue(status);
-    auxEnqueue((unsigned char)(dx & 0xFF));
-    auxEnqueue((unsigned char)(dy & 0xFF));
+    auxEnqueue((unsigned char)(px & 0xFF));
+    auxEnqueue((unsigned char)(py & 0xFF));
+}
+
+// Called from the window thread on every mouse-move or button-state change.
+// dx/dy are relative motion in client pixels.
+void auxSendPacket(int dx, int dy) {
+    PS2_LOCK();
+    if (dx || dy) {
+        auxPendingDx += dx;
+        auxPendingDy += dy;
+        auxPendingMotion = 1;
+    }
+    auxFlushMotionLocked();
+    PS2_UNLOCK();
+}
+
+// Called from the VM thread each time the guest reads a byte out of the output
+// buffer: as it drains, held-back motion flows out at exactly the rate the guest
+// is willing to consume, instead of piling up behind it.
+void auxDrainPendingMotion(void) {
+    PS2_LOCK();
+    auxFlushMotionLocked();
+    PS2_UNLOCK();
 }
 
 unsigned char vkToScancode(int vk) {
@@ -4759,127 +5065,37 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     // during that phase wedged it at ~25000 exits), and still edge-asserted with a
     // slow re-assert so a pending byte cannot become a 1kHz storm.
     if (g_bpModuleBase && guestInterruptsEnabled(partition)) {
-        // ONE INTERRUPT PER BYTE ARRIVAL, which is what the i8042 actually does.
+        // Delivery from HERE is required, not an optimisation. Input interrupts
+        // were once raised only from the HALTED loop, and once Windows settles
+        // into polling the ACPI PM timer (lastPort=0xB008, IRQL 0) it never halts
+        // -- so keystrokes sat queued forever with kbPending=1 and the guest
+        // simply never read them. Typing appeared to work in testing only because
+        // the guest was still busy right after painting and hit HLT in between.
         //
-        // Two wrong models were tried first. Re-asserting every 20ms while a byte
-        // was pending became ~50 interrupts/sec whenever the guest was not draining
-        // the queue -- the driver could not service them and the guest never
-        // finished booting (IRQL 15, consumed stuck at 25). Firing only when the
-        // queue went from empty to non-empty was safe but too quiet: the init
-        // handshake needs an interrupt for each response byte, and reporting never
-        // reached 1.
-        //
-        // Keying on the monotonic arrival counters gives exactly one interrupt per
-        // byte placed in the output buffer, and nothing at all while idle -- so it
-        // cannot storm, and it cannot go silent mid-handshake.
-        // One interrupt per byte arrival, PLUS a small bounded retry that backs off
-        // the moment the guest stops making progress.
-        //
-        // Both pure strategies failed. A flat 20ms re-assert works when the driver
-        // is draining but becomes ~50 IRQ/sec aimed at a driver that is not ready,
-        // which left the guest wedged at IRQL 15. One interrupt per byte and no
-        // retry never storms but is too quiet for the init handshake, which needs
-        // its response bytes acknowledged to keep going -- reporting never reached
-        // 1 across several runs.
-        //
-        // The distinguishing signal is whether the guest is CONSUMING. Retry only
-        // while it is (or until a small attempt budget runs out), and go silent
-        // otherwise: that gives the handshake the nudges it needs without ever
-        // hammering a driver that cannot answer.
-        // RE-ENABLED, in its least aggressive form: exactly one interrupt per byte
-        // placed in an output buffer, which is what the i8042 does.
-        //
-        // This is required, not an optimisation. Input interrupts are otherwise
-        // delivered only from the HALTED loop, and once Windows settles into
-        // polling the ACPI PM timer (lastPort=0xB008, IRQL 0) it never halts -- so
-        // keystrokes sat queued forever with kbPending=1 and the guest simply never
-        // read them. Typing appeared to work in testing only because the guest was
-        // still busy right after painting and hit HLT between operations.
-        //
-        // Earlier attempts here failed on the RETRY policy, not on delivery itself:
-        // a flat 20ms re-assert and a bounded backoff both broke boot, while this
-        // per-byte form booted cleanly in every run. It also predates the RTC
-        // starvation fix, which was independently starving these interrupts and
-        // made those experiments much harder to read.
-        // Keyed on USER-INPUT arrivals only, not on every byte the device queues.
-        // Command responses (ACKs, reset/identify replies) are polled for by the
-        // guest and need no interrupt from here -- and injecting for them fired
-        // during the i8042 init handshake, which is when boot broke. A keystroke,
-        // by contrast, is unsolicited: an interrupt is the only way the guest can
-        // learn about it, which is why input dies once Windows settles into
-        // polling the PM timer and stops halting.
-        // Now keyed on EVERY byte that lands in an output buffer, not just user
-        // input -- including command responses.
-        //
-        // Command responses were deliberately excluded before, because injecting
-        // for them destabilised boot. That was measured BEFORE the priority
-        // interrupt queue existed: back then every injection could clobber another
-        // device's undelivered interrupt, so the extra traffic was actively
-        // harmful. With the queue, interrupts are queued and drained in priority
-        // order instead of overwriting one another, so the reason for excluding
-        // them is gone.
-        //
-        // And they are needed: the guest waits for an interrupt after each byte of
-        // a device reply. Without one it times out and retries -- measured as the
-        // mouse reading exactly 3 bytes of its reset reply and then re-issuing the
-        // reset three more times without reading anything.
-        static long lastKbUser = -1, lastAuxUser = -1;
-        if (lastKbUser < 0) { lastKbUser = g_kbEnqueuedTotal; lastAuxUser = g_auxEnqueuedTotal; }
-        if (g_kbEnqueuedTotal != lastKbUser && kbHasData()) {
-            lastKbUser = g_kbEnqueuedTotal;
-            // Counted, and the DELIVERY result kept, because "we injected" and
-            // "the guest got it" are different claims -- injectDeviceIrq returns 0
-            // when the GSI is masked. kbRead frozen while kbUser climbs means the
-            // guest is not reading; this says whether that is because we never
-            // fired, fired into a masked line, or fired and were ignored.
-            g_kbIrqSent++;
-            if (!injectDeviceIrq(partition, GSI_KEYBOARD, 0x09)) g_kbIrqMasked++;
-            // On the very first keystroke, show whether the guest has an ISR
-            // connected for the keyboard vector at all -- with the RTC's vector
-            // alongside it as a known-working control.
-            {
-                static int idtDumped = 0;
-                if (!idtDumped) {
-                    idtDumped = 1;
-                    unsigned char kbVec = 0, msVec = 0;
-                    ioapicResolveVector(GSI_KEYBOARD, 0x09, &kbVec);
-                    ioapicResolveVector(GSI_MOUSE, 0x74, &msVec);
-                    printf("[idt] --- first keystroke: is anything listening? ---\n");
-                    dumpIdtGate(partition, kbVec, "keyboard");
-                    dumpIdtGate(partition, msVec, "mouse");
-                    dumpIdtGate(partition, 0xD1,  "RTC/ctrl");
-                }
+        // The RULE for how often to raise them lives in ps2ServiceOutputIrq: one
+        // interrupt per byte the output buffer presents. Four other rules were
+        // measured before it and all of them failed on the same axis -- too loud
+        // (a 20ms re-assert, ~50/sec, wedged the guest at IRQL 15) or too quiet
+        // (per-batch arrival counters stranded every reply byte after the first,
+        // so the mouse init handshake never completed). See that function.
+        int raised = ps2ServiceOutputIrq(partition);
+
+        // On the first PS/2 interrupt of a run, show whether the guest has an ISR
+        // connected for these vectors at all -- with the RTC's vector alongside
+        // as a known-working control.
+        if (raised) {
+            static int idtDumped = 0;
+            if (!idtDumped) {
+                unsigned char kbVec = 0, msVec = 0;
+                idtDumped = 1;
+                ioapicResolveVector(GSI_KEYBOARD, 0x09, &kbVec);
+                ioapicResolveVector(GSI_MOUSE, 0x74, &msVec);
+                printf("[idt] --- first PS/2 interrupt: is anything listening? ---\n");
+                dumpIdtGate(partition, kbVec, "keyboard");
+                dumpIdtGate(partition, msVec, "mouse");
+                dumpIdtGate(partition, 0xD1,  "RTC/ctrl");
             }
-        } else if (g_auxEnqueuedTotal != lastAuxUser && auxHasData()) {
-            lastAuxUser = g_auxEnqueuedTotal;
-            injectDeviceIrq(partition, GSI_MOUSE, 0x74);
-        } else {
-            lastKbUser = g_kbEnqueuedTotal;
-            lastAuxUser = g_auxEnqueuedTotal;
         }
-        // Historical note on what NOT to retry here:
-        //
-        // Four variants were measured: unconditional, flat 20ms re-assert, one
-        // interrupt per byte arrival, and a bounded retry that backed off when the
-        // guest stopped consuming. The 20ms variant produced the single run where
-        // the mouse fully initialised (reporting=1, 513 packets) -- and also runs
-        // where the guest wedged at IRQL 15. The quieter variants boot more often
-        // but never complete the init handshake. Critically, the SAME build both
-        // booted in 30s and hung at the 1.8% spinner across runs, so the failure is
-        // not a function of the retry policy at all.
-        //
-        // Ruled out along the way: the keyboard queue starving the aux queue via
-        // the status register's keyboard priority (measured kbPending=0 while
-        // auxPending=1), and illegal legacy vectors (fixed separately, and entry 12
-        // is programmed to vector 0x90 so mouse IRQs resolve correctly).
-        //
-        // What the evidence actually points at: the guest stops CONSUMING aux bytes
-        // (consumed stalls at 4-25 with data still pending) whenever we interrupt
-        // it from this loop. That looks like an interrupt-delivery problem in the
-        // same family as the USB tablet stall -- raw WHvRegisterPendingInterruption
-        // injection with no priority or EOI awareness -- not a PS/2 problem. It
-        // should be revisited after interrupt delivery itself is sound, not before.
-        (void)0;
     }
 
     ehciProcessAsyncSchedule();
@@ -4960,12 +5176,14 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                 // mouse stopped moving, and a stale "reporting=0" printed BEFORE
                 // the guest sent 0xF4 read exactly like the enable had never
                 // happened.
-                static long lastAux = -1, lastAuxGated = -1;
+                static long lastAux = -1, lastAuxGated = -1, lastAuxRead = -1;
                 static int lastReporting = -1, lastPortEnabled = -1;
                 if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated ||
+                    g_auxBytesToGuest != lastAuxRead ||
                     auxReportingEnabled != lastReporting || auxPortEnabled != lastPortEnabled) {
                     lastAux = g_auxPackets;
                     lastAuxGated = g_auxPacketsGated;
+                    lastAuxRead = g_auxBytesToGuest;
                     lastReporting = auxReportingEnabled;
                     lastPortEnabled = auxPortEnabled;
                     // kbPending is here because the status register gives the
@@ -4973,14 +5191,36 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     // never even sees that aux data is waiting. Undrained keyboard
                     // bytes would therefore block mouse initialisation completely,
                     // no matter how the interrupt is delivered.
-                    printf("[ps2-input] kbUser=%ld kbRead=%ld kbIrq=%ld masked=%ld skippedBusy=%ld | mouseQueued=%ld mouseRead=%ld gated=%ld "
+                    printf("[ps2-input] kbUser=%ld kbRead=%ld kbIrq=%ld masked=%ld drop=%ld skippedBusy=%ld | "
+                           "mousePackets=%ld mouseRead=%ld mouseIrq=%ld masked=%ld gated=%ld coalesced=%ld drop=%ld | "
                            "kbPending=%d auxPending=%d (reporting=%d portEnabled=%d rawInput=%d tabletOwns=%d)\n",
                            (long)g_kbUserBytes, g_kbBytesToGuest, g_kbIrqSent, g_kbIrqMasked,
-                           g_injectSkippedBusy,
-                           g_auxPackets, g_auxBytesToGuest, g_auxPacketsGated,
+                           g_kbDropped, g_injectSkippedBusy,
+                           g_auxPackets, g_auxBytesToGuest, g_auxIrqSent, g_auxIrqMasked,
+                           g_auxPacketsGated, g_auxCoalesced, g_auxDropped,
                            kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
                            auxReportingEnabled, auxPortEnabled,
                            g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
+                    fflush(stdout);
+                }
+            }
+            // Interrupt queue health. deferredTpr is the interesting one: it is
+            // how often the guest had the relevant level masked, which used to be
+            // ignored entirely and is what deadlocked i8042prt at DIRQL.
+            {
+                // Keyed on QUEUED too, not just delivered. Keying it on delivered
+                // alone made the worst possible state -- nothing being delivered at
+                // all -- print nothing at all, which is precisely how a bug that
+                // silently withheld every interrupt in the machine stayed invisible.
+                static long lastQueued = -1, lastDelivered = -1, lastDeferred = -1;
+                if (g_irqQueued != lastQueued || g_irqDelivered != lastDelivered ||
+                    g_irqDeferredTpr != lastDeferred) {
+                    lastQueued = g_irqQueued;
+                    lastDelivered = g_irqDelivered;
+                    lastDeferred = g_irqDeferredTpr;
+                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d\n",
+                           g_irqQueued, g_irqDelivered, g_irqCoalesced, g_irqDeferredTpr,
+                           g_irqTprReadFail, g_irqQueueFull, g_irqQueueCount);
                     fflush(stdout);
                 }
             }
@@ -8586,6 +8826,9 @@ int main(int argc, char *argv[]) {
     lastRtcPeriodicTick = lastToggleTime;
 
     InitializeCriticalSection(&logLock);
+    // Before createWindowThread: the window thread is the other producer for
+    // both PS/2 queues, so the lock has to exist before it can run.
+    InitializeCriticalSection(&ps2Lock);
     createWindowThread();
 
     g_font = CreateFontA(18, 9, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -9014,11 +9257,14 @@ int main(int argc, char *argv[]) {
             // the timer nothing: at worst a periodic tick is deferred by one pass
             // of this loop, and deliverRtcPeriodicIrq will simply deliver it next
             // time round.
-            if (kbHasData()) {
-                injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
-                injected = 1;
-            } else if (auxHasData()) {
-                injectDeviceIrq(partition, GSI_MOUSE, 0x74);
+            //
+            // Raised through the same one-interrupt-per-presented-byte rule the
+            // main loop uses (ps2ServiceOutputIrq). This used to re-inject on
+            // EVERY pass of this loop while a byte was pending, and it also
+            // always raised the KEYBOARD line even when the byte on offer came
+            // from the mouse -- so the guest's keyboard ISR was woken to read a
+            // byte that the status register was tagging as the mouse's.
+            if (ps2ServiceOutputIrq(partition)) {
                 injected = 1;
             } else if (pendingAtaIrq) {
                 injectDeviceIrq(partition, GSI_AHCI, 0x76); // U53: IRQ14/AHCI, routed
@@ -10229,6 +10475,11 @@ int main(int argc, char *argv[]) {
                             returnValue = auxDequeue();
                         }
                         else returnValue = 0x00;
+                        // The buffer just made room, so any motion held back
+                        // earlier can go out now. Driving this from the guest's
+                        // own reads is what paces the mouse to whatever rate it
+                        // is actually willing to consume.
+                        auxDrainPendingMotion();
                     }
                     else if (port == 0x61) {
                         LARGE_INTEGER now;
