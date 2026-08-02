@@ -981,6 +981,12 @@ long g_irqSlotBusy = 0;     // previous injection still pending -- guest has not
 long g_irqIfClear = 0;      // guest running with interrupts masked (EFLAGS.IF=0)
 long g_irqGetFail = 0;      // could not read the pending-interruption register
 UINT64 g_irqLastSlot = 0;   // raw slot value last time it was found occupied
+// WHvRequestInterrupt outcome tallies. Defined further down with injectInterrupt,
+// which is the other caller; declared here because drainInterruptQueue uses them
+// when IRQ_VIA_APIC is on.
+extern long g_reqIrqOk, g_reqIrqFail;
+extern HRESULT g_reqIrqLastHr;
+extern unsigned char g_reqIrqLastVector;
 
 // TPR gating, scoped to INPUT vectors only. Set to 0 to disable it entirely.
 //
@@ -999,6 +1005,40 @@ UINT64 g_irqLastSlot = 0;   // raw slot value last time it was found occupied
 // storage paths -- which demonstrably work -- exactly as they were.
 #define IRQ_RESPECT_TPR   1
 #define IRQ_COALESCE_IRR  1
+
+// Deliver queued interrupts through the virtual APIC (WHvRequestInterrupt)
+// instead of forcing them into the raw pending-interruption slot.
+//
+// The raw slot is ONE register with no priority, no queuing and no EOI
+// awareness, and it wedges: measured with vector 0xD1 (the RTC) pending in it
+// across 20560 consecutive samples, after which nothing was ever delivered to
+// the guest again and AHCI piled up behind it. The guest's ISR EOIs the
+// WHP-emulated LAPIC, but the LAPIC never had an in-service bit for a vector we
+// injected behind its back, so the two views of interrupt state drift apart
+// until delivery stops for good.
+//
+// The APIC has an IRR bit per vector, applies TPR/PPR priority itself and tracks
+// EOI -- all the bookkeeping the slot has no concept of. In this mode our queue
+// stops being a substitute for the APIC and becomes a short buffer in front of
+// it, so the slot-busy check and the TPR gate are both skipped: the APIC does
+// both, correctly, and holding a vector back here as well would only duplicate
+// what IRR already does.
+//
+// Vectors below 0x10 still take the raw path -- the APIC rejects them (0..15 are
+// CPU exception vectors) and firmware legitimately uses low PIC-remapped vectors
+// before the guest switches to APIC mode.
+//
+// SCOPED TO INPUT VECTORS, for the same reason the TPR gate is. Routing every
+// vector through the APIC triple faults the guest ~15s in -- reproduced here, and
+// matching an earlier attempt that died "immediately after the first RTC tick was
+// delivered through the APIC as vector 0xD1". The timer and storage paths work on
+// the raw slot and are left on it.
+//
+// Pairing the two is what makes this worth doing: the slot wedges on the RTC's
+// vector, but input delivered through the APIC does not touch the slot at all, so
+// the mouse and keyboard keep flowing across a jam that stops everything else.
+// Set to 0 to put input back on the raw slot.
+#define IRQ_VIA_APIC      1
 
 static void queueInterrupt(unsigned char vector, int prio) {
     int i;
@@ -1109,6 +1149,51 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
     WHV_REGISTER_NAME pendName = WHvRegisterPendingInterruption;
     WHV_REGISTER_VALUE existing = { 0 };
     unsigned tpr = 0;
+
+#if IRQ_VIA_APIC
+    // Hand the INPUT interrupts to the APIC, oldest first. No slot check and no
+    // TPR gate for these -- the APIC's IRR is a better place to hold a masked
+    // vector than our queue is, and it releases it at the right moment by itself.
+    {
+        int drained = 0;
+        while (g_irqQueueCount > 0 && drained < IRQ_QUEUE_MAX) {
+            int b = -1, k;
+            WHV_INTERRUPT_CONTROL ic;
+            HRESULT hr;
+            for (k = 0; k < g_irqQueueCount; k++) {
+                if (g_irqQueue[k].prio != IRQ_PRIO_INPUT) continue;
+                // The APIC rejects vectors below 0x10; those are firmware-era
+                // legacy PIC-remapped ones and keep the raw path they always had.
+                if (g_irqQueue[k].vector < 0x10) continue;
+                if (b < 0 || g_irqQueue[k].seq < g_irqQueue[b].seq) b = k;
+            }
+            if (b < 0) break;                       // nothing left for the APIC
+
+            memset(&ic, 0, sizeof(ic));
+            ic.Type = WHvX64InterruptTypeFixed;
+            ic.DestinationMode = WHvX64InterruptDestinationModePhysical;
+            ic.TriggerMode = WHvX64InterruptTriggerModeEdge;
+            ic.Destination = 0;                     // APIC ID of the single vCPU
+            ic.Vector = g_irqQueue[b].vector;
+            hr = WHvRequestInterrupt(partition, &ic, sizeof(ic));
+            if (FAILED(hr)) {
+                // Leave it queued and retry next pass rather than dropping it.
+                g_reqIrqFail++;
+                g_reqIrqLastHr = hr;
+                g_reqIrqLastVector = g_irqQueue[b].vector;
+                break;
+            }
+            g_reqIrqOk++;
+            for (k = b; k < g_irqQueueCount - 1; k++) g_irqQueue[k] = g_irqQueue[k + 1];
+            g_irqQueueCount--;
+            g_irqDelivered++;
+            drained++;
+        }
+        if (g_irqQueueCount == 0) return;
+        // Anything left is timer/storage, or a sub-0x10 legacy vector: raw slot.
+    }
+#endif
+
     if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &pendName, 1, &existing))) {
         g_irqGetFail++;
         return;
@@ -5240,9 +5325,10 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     lastDelivered = g_irqDelivered;
                     lastDeferred = g_irqDeferredTpr;
                     lastCoalesced = g_irqCoalesced;
-                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d%s\n",
+                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d apicOk=%ld apicFail=%ld(hr=0x%lX vec=0x%02X)%s\n",
                            g_irqQueued, g_irqDelivered, g_irqCoalesced, g_irqDeferredTpr,
                            g_irqTprReadFail, g_irqQueueFull, g_irqQueueCount,
+                           g_reqIrqOk, g_reqIrqFail, (unsigned long)g_reqIrqLastHr, g_reqIrqLastVector,
                            frozen ? "  *** DELIVERY FROZEN ***" : "");
                     // Why we are declining, and what is actually stuck in there.
                     if (frozen) {
