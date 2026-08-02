@@ -972,6 +972,15 @@ long g_irqQueued = 0, g_irqDelivered = 0, g_irqQueueFull = 0;
 long g_irqCoalesced = 0;    // already pending for that vector
 long g_irqDeferredTpr = 0;  // held back because the guest has that level masked
 long g_irqTprReadFail = 0;  // CR8 unreadable -- we deliver anyway, see drainInterruptQueue
+// WHY drainInterruptQueue declined to deliver. Delivery freezing solid while the
+// queue backs up is a state the counters could not previously distinguish: a
+// stuck injection slot, a guest running with IF=0, and a failed register read all
+// looked identical from outside (delivered simply stopped moving). Separated so
+// the next stall names its own cause instead of needing another run to guess.
+long g_irqSlotBusy = 0;     // previous injection still pending -- guest has not taken it
+long g_irqIfClear = 0;      // guest running with interrupts masked (EFLAGS.IF=0)
+long g_irqGetFail = 0;      // could not read the pending-interruption register
+UINT64 g_irqLastSlot = 0;   // raw slot value last time it was found occupied
 
 // TPR gating, scoped to INPUT vectors only. Set to 0 to disable it entirely.
 //
@@ -1100,9 +1109,16 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
     WHV_REGISTER_NAME pendName = WHvRegisterPendingInterruption;
     WHV_REGISTER_VALUE existing = { 0 };
     unsigned tpr = 0;
-    if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &pendName, 1, &existing))) return;
-    if (existing.Reg64 & 1ULL) return;              // guest has not taken the last one
-    if (!guestInterruptsEnabled(partition)) return;
+    if (FAILED(WHvGetVirtualProcessorRegisters(partition, 0, &pendName, 1, &existing))) {
+        g_irqGetFail++;
+        return;
+    }
+    if (existing.Reg64 & 1ULL) {                    // guest has not taken the last one
+        g_irqSlotBusy++;
+        g_irqLastSlot = existing.Reg64;
+        return;
+    }
+    if (!guestInterruptsEnabled(partition)) { g_irqIfClear++; return; }
 
     // Read CR8 in its OWN call, and treat a failure as "deliver anyway".
     //
@@ -5213,14 +5229,33 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                 // all -- print nothing at all, which is precisely how a bug that
                 // silently withheld every interrupt in the machine stayed invisible.
                 static long lastQueued = -1, lastDelivered = -1, lastDeferred = -1;
+                static long lastCoalesced = -1;
                 if (g_irqQueued != lastQueued || g_irqDelivered != lastDelivered ||
-                    g_irqDeferredTpr != lastDeferred) {
+                    g_irqDeferredTpr != lastDeferred || g_irqCoalesced != lastCoalesced) {
+                    // Delivery FROZEN while the queue backs up is the state worth
+                    // catching, so it is reported explicitly rather than left to be
+                    // inferred from two numbers that stopped moving.
+                    int frozen = (g_irqDelivered == lastDelivered) && g_irqQueueCount > 0;
                     lastQueued = g_irqQueued;
                     lastDelivered = g_irqDelivered;
                     lastDeferred = g_irqDeferredTpr;
-                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d\n",
+                    lastCoalesced = g_irqCoalesced;
+                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d%s\n",
                            g_irqQueued, g_irqDelivered, g_irqCoalesced, g_irqDeferredTpr,
-                           g_irqTprReadFail, g_irqQueueFull, g_irqQueueCount);
+                           g_irqTprReadFail, g_irqQueueFull, g_irqQueueCount,
+                           frozen ? "  *** DELIVERY FROZEN ***" : "");
+                    // Why we are declining, and what is actually stuck in there.
+                    if (frozen) {
+                        int qi;
+                        printf("[irq-stuck] slotBusy=%ld ifClear=%ld getFail=%ld lastSlot=0x%llX (pending=%d vector=0x%02X) queued:",
+                               g_irqSlotBusy, g_irqIfClear, g_irqGetFail,
+                               (unsigned long long)g_irqLastSlot,
+                               (int)(g_irqLastSlot & 1ULL),
+                               (unsigned)((g_irqLastSlot >> 16) & 0xFF));
+                        for (qi = 0; qi < g_irqQueueCount; qi++)
+                            printf(" 0x%02X(prio%d)", g_irqQueue[qi].vector, g_irqQueue[qi].prio);
+                        printf("\n");
+                    }
                     fflush(stdout);
                 }
             }
