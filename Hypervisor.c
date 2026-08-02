@@ -2213,7 +2213,16 @@ long g_kbEnqueuedTotal = 0, g_auxEnqueuedTotal = 0;
 // unexpected interrupt destabilised boot.
 volatile LONG g_kbUserBytes = 0, g_auxUserBytes = 0;
 
+// Arrival order across BOTH queues. A real i8042 has a SINGLE output buffer: one
+// byte at a time, from whichever device produced it, read first-come-first-served.
+// Modelling it as two independent queues with the keyboard always winning the
+// status register means one unread keyboard byte hides the mouse FOREVER -- and
+// that is exactly what happened. See the status-register read for the full story.
+unsigned long g_ps2Seq = 0;
+unsigned long kbSeqQ[64], auxSeqQ[64];
+
 void kbEnqueue(unsigned char b) {
+    kbSeqQ[kbTail] = g_ps2Seq++;
     kbQueue[kbTail] = b;
     kbTail = (kbTail + 1) % 64;
     g_kbEnqueuedTotal++;
@@ -2235,9 +2244,18 @@ unsigned char auxQueue[64];
 int auxHead = 0, auxTail = 0;
 
 void auxEnqueue(unsigned char b) {
+    auxSeqQ[auxTail] = g_ps2Seq++;
     auxQueue[auxTail] = b;
     auxTail = (auxTail + 1) % 64;
     g_auxEnqueuedTotal++;
+}
+
+// Which queue holds the OLDEST undelivered byte -- i.e. which one a real single
+// output buffer would be presenting right now. Returns 1 for aux, 0 for keyboard.
+int ps2AuxIsNext(void) {
+    if (!kbHasData()) return auxHasData();
+    if (!auxHasData()) return 0;
+    return (auxSeqQ[auxHead] < kbSeqQ[kbHead]) ? 1 : 0;
 }
 int auxHasData() { return auxHead != auxTail; }
 unsigned char auxDequeue() {
@@ -4790,10 +4808,25 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
         // by contrast, is unsolicited: an interrupt is the only way the guest can
         // learn about it, which is why input dies once Windows settles into
         // polling the PM timer and stops halting.
+        // Now keyed on EVERY byte that lands in an output buffer, not just user
+        // input -- including command responses.
+        //
+        // Command responses were deliberately excluded before, because injecting
+        // for them destabilised boot. That was measured BEFORE the priority
+        // interrupt queue existed: back then every injection could clobber another
+        // device's undelivered interrupt, so the extra traffic was actively
+        // harmful. With the queue, interrupts are queued and drained in priority
+        // order instead of overwriting one another, so the reason for excluding
+        // them is gone.
+        //
+        // And they are needed: the guest waits for an interrupt after each byte of
+        // a device reply. Without one it times out and retries -- measured as the
+        // mouse reading exactly 3 bytes of its reset reply and then re-issuing the
+        // reset three more times without reading anything.
         static long lastKbUser = -1, lastAuxUser = -1;
-        if (lastKbUser < 0) { lastKbUser = g_kbUserBytes; lastAuxUser = g_auxUserBytes; }
-        if (g_kbUserBytes != lastKbUser && kbHasData()) {
-            lastKbUser = g_kbUserBytes;
+        if (lastKbUser < 0) { lastKbUser = g_kbEnqueuedTotal; lastAuxUser = g_auxEnqueuedTotal; }
+        if (g_kbEnqueuedTotal != lastKbUser && kbHasData()) {
+            lastKbUser = g_kbEnqueuedTotal;
             // Counted, and the DELIVERY result kept, because "we injected" and
             // "the guest got it" are different claims -- injectDeviceIrq returns 0
             // when the GSI is masked. kbRead frozen while kbUser climbs means the
@@ -4817,12 +4850,12 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     dumpIdtGate(partition, 0xD1,  "RTC/ctrl");
                 }
             }
-        } else if (g_auxUserBytes != lastAuxUser && auxHasData()) {
-            lastAuxUser = g_auxUserBytes;
+        } else if (g_auxEnqueuedTotal != lastAuxUser && auxHasData()) {
+            lastAuxUser = g_auxEnqueuedTotal;
             injectDeviceIrq(partition, GSI_MOUSE, 0x74);
         } else {
-            lastKbUser = g_kbUserBytes;
-            lastAuxUser = g_auxUserBytes;
+            lastKbUser = g_kbEnqueuedTotal;
+            lastAuxUser = g_auxEnqueuedTotal;
         }
         // Historical note on what NOT to retry here:
         //
@@ -10152,12 +10185,31 @@ int main(int argc, char *argv[]) {
                         // data, matching the dequeue order below so a status
                         // read immediately followed by a data read always
                         // agree on the source.
-                        if (kbHasData()) returnValue = 0x01;
-                        else if (auxHasData()) returnValue = 0x21;
+                        // Serve whichever byte arrived FIRST, not the keyboard
+                        // unconditionally.
+                        //
+                        // The old "keyboard always wins" rule deadlocked the whole
+                        // controller. One unread keyboard byte (kbPending stuck at
+                        // 1) meant this register reported "keyboard data waiting"
+                        // forever, so the guest could never see the mouse's reply
+                        // to its reset -- it retried that reset endlessly, the
+                        // i8042 device stack never finished starting, and because
+                        // it never finished starting, i8042prt never connected the
+                        // keyboard ISR. Which meant the keyboard byte was never
+                        // read. Which kept the deadlock alive.
+                        if (ps2AuxIsNext()) returnValue = 0x21;   // OBF | AUXB
+                        else if (kbHasData()) returnValue = 0x01; // OBF
                         else returnValue = 0x00;
                     }
                     else if (port == 0x60) {
-                        if (kbHasData()) {
+                        // Must match the source the status register just reported,
+                        // or the guest reads a byte it will attribute to the wrong
+                        // device.
+                        if (ps2AuxIsNext()) {
+                            g_auxBytesToGuest++;
+                            returnValue = auxDequeue();
+                        }
+                        else if (kbHasData()) {
                             // Counted for the same reason as the aux side: whether
                             // the guest READS a keystroke is the only direct
                             // evidence the keyboard works. Inferring it from
