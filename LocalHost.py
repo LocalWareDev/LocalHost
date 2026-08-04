@@ -928,6 +928,64 @@ class _UsageMeter(QWidget):
         self.value_label.setText(text)
 
 
+class _ElidingLabel(QLabel):
+    """A QLabel that shrinks its TEXT rather than widening its container.
+
+    A plain QLabel reports the full width of its text as its minimum size hint,
+    so a single long value -- an ISO path is routinely 80+ characters -- widens
+    the whole Devices column, and that width comes straight out of the guest
+    display beside it. This reports a minimum width of zero and elides whatever
+    will not fit, so the display keeps its space and the path gives way instead.
+
+    The untruncated value stays available as a tooltip, so nothing is actually
+    lost by eliding it.
+    """
+
+    def __init__(self, text="", mode=Qt.ElideMiddle, parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self._mode = mode
+        self._eliding = False
+        # Ignored: the label accepts whatever width the row gives it instead of
+        # demanding enough for its text.
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = text or ""
+        # Only worth a tooltip when there is something hidden to reveal.
+        self.setToolTip("")
+        self._apply_elide()
+
+    def full_text(self):
+        return self._full_text
+
+    def minimumSizeHint(self):
+        # Height still matters; width must not, or the whole point is lost.
+        return QSize(0, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def _apply_elide(self):
+        # setText() below can trigger a relayout and re-enter through
+        # resizeEvent; without this guard that recurses.
+        if self._eliding:
+            return
+        self._eliding = True
+        try:
+            width = self.width()
+            if width <= 0:
+                QLabel.setText(self, self._full_text)
+                return
+            elided = self.fontMetrics().elidedText(self._full_text, self._mode, width)
+            QLabel.setText(self, elided)
+            self.setToolTip(self._full_text if elided != self._full_text else "")
+        finally:
+            self._eliding = False
+
+
 class _VMUsageRow(QWidget):
     """One running VM's slice of the App Utilisation panel.
 
@@ -2033,8 +2091,21 @@ class LocalHostWindow(QMainWindow):
         # lazily on first winId() call from inside a QTimer callback later.
         self.preview_frame.winId()
 
-        vm_page_layout.addWidget(detail_panel, 1)
-        vm_page_layout.addWidget(preview_panel, 2)
+        # THE GUEST DISPLAY GETS PRIORITY. Two separate things were letting the
+        # details column win width it does not need:
+        #
+        #  1. A long ISO path set the column's minimum width (fixed by
+        #     _ElidingLabel, which now gives way instead of pushing).
+        #  2. Stretch alone still handed the column a third of a wide window,
+        #     which is far more than eleven short rows need, and every pixel of
+        #     it came out of the display.
+        #
+        # Capping the column means extra window width goes to the display, which
+        # is the thing that actually benefits from it.
+        detail_panel.setMinimumWidth(260)
+        detail_panel.setMaximumWidth(440)
+        vm_page_layout.addWidget(detail_panel, 0)
+        vm_page_layout.addWidget(preview_panel, 1)
 
         # ---- Home page ----
         home_page = self._build_home_page()
@@ -2631,11 +2702,22 @@ class LocalHostWindow(QMainWindow):
             row_layout.setContentsMargins(0, 0, 0, 0)
             name_label = QLabel(label)
             name_label.setObjectName("DeviceLabel")
-            value_label = QLabel(value)
+            # The device NAME keeps its natural width -- it is short and fixed,
+            # and truncating "Trusted Platform Module" would help nobody.
+            name_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+            # Paths elide in the MIDDLE so both the drive and the filename stay
+            # readable -- the two ends of an ISO path are the informative parts,
+            # and eliding the tail would hide the .iso name itself.
+            value_label = _ElidingLabel(value, Qt.ElideMiddle)
             value_label.setObjectName("DeviceValue")
-            row_layout.addWidget(name_label)
-            row_layout.addStretch(1)
-            row_layout.addWidget(value_label)
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            row_layout.addWidget(name_label, 0)
+            # Takes the remaining width and elides within it, in place of the
+            # old stretch spacer -- with a spacer there was no bounded region
+            # for the value to elide into.
+            row_layout.addWidget(value_label, 1)
             self.devices_layout.addWidget(row)
 
     def on_tree_context_menu(self, pos):
