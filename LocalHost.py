@@ -3054,9 +3054,27 @@ class LocalHostWindow(QMainWindow):
         else:
             firmware_path = "bios.bin"
 
-        args = [vm.name, firmware_path]
-        if vm.disk_path and Path(vm.disk_path).exists():
-            args.append(vm.disk_path)
+        # Hypervisor.exe takes POSITIONAL arguments:
+        #   [1] window title  [2] firmware  [3] disk  [4] RAM in MB  [5] ISO
+        # so reaching the ISO means supplying the ones before it. Empty strings
+        # mean "not set" -- the hypervisor treats them as absent rather than as
+        # a path -- which is how a VM with no disk still gets its ISO through.
+        disk_arg = (vm.disk_path
+                    if vm.disk_path and Path(vm.disk_path).exists() else "")
+        iso_arg = (vm.iso_path
+                   if vm.iso_path and Path(vm.iso_path).is_file() else "")
+
+        args = [vm.name, firmware_path, disk_arg,
+                str(_parse_memory_to_mb(vm.memory)), iso_arg]
+
+        if iso_arg:
+            # Worth saying out loud, because it is the difference between
+            # "the installer booted" and "the installer can install": the
+            # hypervisor has ONE AHCI port, so an attached ISO takes it and the
+            # hard disk is not presented to the guest.
+            self.statusBar().showMessage(
+                f"Booting '{vm.name}' from {Path(iso_arg).name} "
+                "(hard disk not attached while an ISO is set).", 6000)
 
         # Detached, not owned: see the comment above _process_is_alive. A
         # normal QProcess would get killed the instant the manager exits,

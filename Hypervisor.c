@@ -8806,17 +8806,29 @@ int main(int argc, char *argv[]) {
     // argv[1]: VM name shown in the window title (defaults to "Guest Display")
     // argv[2]: path to the BIOS image to load (defaults to "bios.bin")
     // argv[3]: path to the raw disk image backing the primary ATA drive (optional)
+    // argv[4]: guest RAM in MB (optional)
+    // argv[5]: path to an ISO to boot from (optional) -- see the boot-device
+    //          selection below for what happens when both this and argv[3] are
+    //          supplied.
+    //
+    // Every one of these is positional and OPTIONAL, so an empty string means
+    // "not supplied". The manager passes placeholders to reach later arguments,
+    // and treating "" as a real path would make it try to open a file named "".
     const char *biosPath = "bios.bin";
     const char *diskPath = NULL;
+    const char *isoPath = NULL;
     if (argc > 1) {
         _snprintf_s(g_windowTitle, sizeof(g_windowTitle), _TRUNCATE,
                     "LocalHost Hypervisor -- %s", argv[1]);
     }
-    if (argc > 2) {
+    if (argc > 2 && argv[2][0]) {
         biosPath = argv[2];
     }
-    if (argc > 3) {
+    if (argc > 3 && argv[3][0]) {
         diskPath = argv[3];
+    }
+    if (argc > 5 && argv[5][0]) {
+        isoPath = argv[5];
     }
 
     // UEFI firmware (OVMF/edk2) is identified by a ".fd" extension on the
@@ -8898,7 +8910,37 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (diskPath) {
+    // --- BOOT DEVICE SELECTION -------------------------------------------
+    //
+    // An ISO, when supplied, takes the port and the guest boots from it.
+    //
+    // IMPORTANT LIMITATION, and it is a real one rather than an oversight: the
+    // AHCI controller here implements exactly ONE port (PI=0x1, see
+    // ahciInitAbarRegisters), so the ISO and the hard disk cannot both be
+    // attached. Booting Windows installer media therefore gets you as far as the
+    // installer, which then has no disk to install ONTO. Presenting both needs a
+    // second port with its own command engine, FIS receive area, signature and
+    // IDENTIFY -- a much larger change than this, and one that touches the AHCI
+    // paths that took U53-U62 to stabilise.
+    //
+    // Falls back to the disk if the ISO cannot be opened, so a stale ISO path in
+    // the manager degrades to "boots the hard disk" instead of "boots nothing".
+    const char *bootPath = isoPath ? isoPath : diskPath;
+    if (isoPath && diskPath) {
+        printf("[boot] ISO supplied -- booting from %s; the hard disk %s is NOT "
+               "attached (single AHCI port)\n", isoPath, diskPath);
+    }
+    if (bootPath && isoPath) {
+        FILE *probe = fopen(isoPath, "rb");
+        if (!probe) {
+            printf("[boot] cannot open ISO %s -- falling back to the hard disk\n", isoPath);
+            bootPath = diskPath;
+        } else {
+            fclose(probe);
+        }
+    }
+
+    if (bootPath) {
         // Open .iso images read-only: installer/boot media should never
         // legitimately be written to this early (UdfDxe + the boot
         // manager only need to read it), and opening read-write would
@@ -8907,10 +8949,13 @@ int main(int argc, char *argv[]) {
         // command against a read-only FILE* just fails harmlessly (we
         // don't check fwrite's return value on that path) rather than
         // touching the file.
-        size_t diskPathLen = strlen(diskPath);
-        int isIso = diskPathLen >= 4 && _stricmp(diskPath + diskPathLen - 4, ".iso") == 0;
+        //
+        // Keyed on the EXTENSION, not on which argument it arrived in, so an
+        // ISO passed the old way (as argv[3]) behaves exactly as it always has.
+        size_t bootPathLen = strlen(bootPath);
+        int isIso = bootPathLen >= 4 && _stricmp(bootPath + bootPathLen - 4, ".iso") == 0;
         ataSectorSize = isIso ? 2048 : 512;
-        ataDiskFile = fopen(diskPath, isIso ? "rb" : "r+b");
+        ataDiskFile = fopen(bootPath, isIso ? "rb" : "r+b");
         if (ataDiskFile) {
             _fseeki64(ataDiskFile, 0, SEEK_END);
             UINT64 fileSize = (UINT64)_ftelli64(ataDiskFile);
@@ -8935,9 +8980,11 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            printf("Attached disk %s (%llu sectors of %u bytes)\n", diskPath, (unsigned long long)ataDiskSectors, ataSectorSize);
+            printf("Attached %s %s (%llu sectors of %u bytes)\n",
+                   isIso ? "ISO" : "disk", bootPath,
+                   (unsigned long long)ataDiskSectors, ataSectorSize);
         } else {
-            printf("Failed to open disk image %s -- booting without a disk\n", diskPath);
+            printf("Failed to open %s -- booting without a disk\n", bootPath);
         }
     }
 
