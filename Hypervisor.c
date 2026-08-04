@@ -1038,6 +1038,28 @@ extern unsigned char g_reqIrqLastVector;
 // vector, but input delivered through the APIC does not touch the slot at all, so
 // the mouse and keyboard keep flowing across a jam that stops everything else.
 // Set to 0 to put input back on the raw slot.
+//
+// WHY THE RTC CANNOT JOIN THEM, established by measurement rather than caution:
+//
+//   1. The raw slot STOPS BEING HONOURED once the guest's APIC is fully active.
+//      Caught in the act: vector 0xD1 pending while the guest was provably able
+//      to take it -- IF=1, CR8=0, no interrupt shadow, no NMI mask -- and WHP
+//      never delivered it, for the rest of the run. Everything queued behind it
+//      stops too, storage included. See the [irq-stuck-why] diagnostic.
+//   2. But routing the RTC through the APIC instead kills the guest instantly.
+//      Reproduced three times, and the log pins it precisely: the guest triple
+//      faults on the very first tick that goes out that way, immediately after
+//      "[rtc-diag] tick #1 FIRED vector=0xD1".
+//   3. Gating on the kernel being up does NOT separate these. g_bpModuleBase is
+//      set during early kernel DISCOVERY -- "kernelFound=1" is printed before
+//      that first tick -- so the gate opens too early to help.
+//
+// So input goes through the APIC (which works, and which the i8042 needs for its
+// TPR handling), the timer stays on the raw slot (which eventually wedges), and
+// the wedge is still open. What it needs is a reason WHY 0xD1 specifically is
+// fatal through the APIC when 0x90/0xA0 are not -- double delivery from the
+// halted-loop RTC path and EOI/in-service bookkeeping are the two candidates
+// worth checking first.
 #define IRQ_VIA_APIC      1
 
 static void queueInterrupt(unsigned char vector, int prio) {
@@ -1161,10 +1183,12 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
             WHV_INTERRUPT_CONTROL ic;
             HRESULT hr;
             for (k = 0; k < g_irqQueueCount; k++) {
-                if (g_irqQueue[k].prio != IRQ_PRIO_INPUT) continue;
                 // The APIC rejects vectors below 0x10; those are firmware-era
                 // legacy PIC-remapped ones and keep the raw path they always had.
                 if (g_irqQueue[k].vector < 0x10) continue;
+                // INPUT VECTORS ONLY. Widening this has been tried twice and is
+                // fatal both times -- see the note below on the RTC.
+                if (g_irqQueue[k].prio != IRQ_PRIO_INPUT) continue;
                 if (b < 0 || g_irqQueue[k].seq < g_irqQueue[b].seq) b = k;
             }
             if (b < 0) break;                       // nothing left for the APIC
@@ -1201,6 +1225,29 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
     if (existing.Reg64 & 1ULL) {                    // guest has not taken the last one
         g_irqSlotBusy++;
         g_irqLastSlot = existing.Reg64;
+        // WHY is it stuck? The counters say a vector sits here forever, but not
+        // what is preventing WHP from injecting it. The candidates each imply a
+        // different fix, so read the vCPU's actual interruptibility rather than
+        // reasoning about it: RFLAGS.IF (guest ran into a long cli region), the
+        // interrupt shadow (a STI/MOV-SS window WHP will not inject into), and
+        // CR8/RIP for context. Sampled sparsely -- this fires tens of thousands
+        // of times and console output would distort the guest.
+        if ((g_irqSlotBusy % 20000) == 1) {
+            WHV_REGISTER_NAME dn[4] = { WHvX64RegisterRflags, WHvX64RegisterCr8,
+                                        WHvX64RegisterRip, WHvRegisterInterruptState };
+            WHV_REGISTER_VALUE dv[4] = { 0 };
+            if (SUCCEEDED(WHvGetVirtualProcessorRegisters(partition, 0, dn, 4, dv))) {
+                printf("[irq-stuck-why] slotBusy=%ld vector=0x%02X | IF=%d CR8=%u "
+                       "rip=0x%llX | shadow=%u nmiMasked=%u\n",
+                       g_irqSlotBusy, (unsigned)((existing.Reg64 >> 16) & 0xFF),
+                       (dv[0].Reg64 & (1ULL << 9)) ? 1 : 0,
+                       (unsigned)(dv[1].Reg64 & 0xF),
+                       (unsigned long long)dv[2].Reg64,
+                       (unsigned)dv[3].InterruptState.InterruptShadow,
+                       (unsigned)dv[3].InterruptState.NmiMasked);
+                fflush(stdout);
+            }
+        }
         return;
     }
     if (!guestInterruptsEnabled(partition)) { g_irqIfClear++; return; }
