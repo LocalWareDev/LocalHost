@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QMenuBar, QStatusBar, QStackedWidget,
     QDialog, QFormLayout, QLineEdit, QSpinBox, QComboBox, QMessageBox,
     QFileDialog, QDialogButtonBox, QMenu, QInputDialog, QAbstractItemView,
-    QListWidget, QListWidgetItem, QProgressBar
+    QListWidget, QListWidgetItem, QProgressBar, QScrollArea
 )
 from PySide6.QtGui import QAction, QIcon, QDesktopServices
 from PySide6.QtCore import Qt, QSize, QStandardPaths, QProcess, QTimer, Signal, QUrl
@@ -654,19 +654,25 @@ class _GpuUsageCounter:
         self.available = True
 
     def sample(self, pids):
-        """GPU percent attributable to `pids`, or None if unavailable.
+        """Returns (combined_percent, {pid: percent}).
 
-        Per engine type, usage is summed across the processes we care about;
-        the reported figure is then the MAX across engine types rather than
-        their sum. Summing 3D + Copy + VideoDecode routinely exceeds 100% while
-        the GPU is nowhere near saturated, because the engines run in parallel.
-        Max is what Task Manager shows and is the honest answer to "how busy is
-        the GPU on our behalf".
+        Per engine type, usage is summed across the processes asked about; the
+        reported figure is then the MAX across engine types rather than their
+        sum. Summing 3D + Copy + VideoDecode routinely exceeds 100% while the
+        GPU is nowhere near saturated, because the engines run in parallel. Max
+        is what Task Manager shows and is the honest answer to "how busy is the
+        GPU on our behalf".
+
+        The combined figure is computed from per-engine totals rather than by
+        adding up the per-process numbers -- two processes each maxing a
+        different engine is not 200% of a GPU.
         """
-        if not self.available or not pids:
-            return None if not self.available else 0.0
+        if not self.available:
+            return None, {}
+        if not pids:
+            return 0.0, {}
         if self._pdh.PdhCollectQueryData(self._query) != 0:
-            return None
+            return None, {}
 
         size = wintypes.DWORD(0)
         count = wintypes.DWORD(0)
@@ -674,33 +680,41 @@ class _GpuUsageCounter:
             self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
             ctypes.byref(count), None)
         if status != PDH_MORE_DATA or size.value == 0:
-            return 0.0        # no GPU engine instances at all right now
+            return 0.0, {}    # no GPU engine instances at all right now
 
         buf = ctypes.create_string_buffer(size.value)
         status = self._pdh.PdhGetFormattedCounterArrayW(
             self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
             ctypes.byref(count), buf)
         if status != 0:
-            return None
+            return None, {}
 
         items = ctypes.cast(
             buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W * count.value)).contents
-        wanted = {str(p) for p in pids}
-        per_engine = {}
+        by_pid_str = {str(p): p for p in pids}
+        combined_engine = {}
+        per_pid_engine = {}
         for item in items:
             if not item.szName:
                 continue
             m = _GPU_INSTANCE_RE.match(item.szName)
-            if not m or m.group(1) not in wanted:
+            if not m:
+                continue
+            pid = by_pid_str.get(m.group(1))
+            if pid is None:
                 continue
             value = item.FmtValue.doubleValue
             if value <= 0:
                 continue
             engine = m.group(2)
-            per_engine[engine] = per_engine.get(engine, 0.0) + value
-        if not per_engine:
-            return 0.0
-        return min(100.0, max(per_engine.values()))
+            combined_engine[engine] = combined_engine.get(engine, 0.0) + value
+            engines = per_pid_engine.setdefault(pid, {})
+            engines[engine] = engines.get(engine, 0.0) + value
+
+        per_pid = {pid: min(100.0, max(engines.values()))
+                   for pid, engines in per_pid_engine.items()}
+        combined = min(100.0, max(combined_engine.values())) if combined_engine else 0.0
+        return combined, per_pid
 
     def close(self):
         if self._query is not None:
@@ -720,8 +734,7 @@ class _AppUsageSampler:
     def __init__(self):
         self._procs = {}            # pid -> psutil.Process, kept alive between
                                     # samples so cpu_percent() has a baseline
-        self._last_io_bytes = None
-        self._last_io_time = None
+        self._last_io = {}          # pid -> (total_bytes, monotonic timestamp)
         self._disk_peak = 1.0       # bytes/sec, for auto-scaling the disk bar
         self.gpu = _GpuUsageCounter()
         self._cpu_count = (psutil.cpu_count(logical=True) or 1) if psutil else 1
@@ -739,61 +752,81 @@ class _AppUsageSampler:
         return proc
 
     def sample(self, vm_pids):
-        """Returns a dict of current usage. `vm_pids` is the running VMs'
-        Hypervisor.exe PIDs; this process is always included."""
+        """Returns a dict of current usage, aggregate plus a per-PID breakdown.
+        `vm_pids` is the running VMs' Hypervisor.exe PIDs; this process is
+        always included in the aggregate."""
         result = {"cpu": None, "ram_bytes": 0, "ram_percent": None,
                   "disk_bps": None, "gpu": None, "vm_count": len(vm_pids),
-                  "available": psutil is not None}
+                  "available": psutil is not None, "per_pid": {}}
         pids = list(dict.fromkeys([os.getpid()] + list(vm_pids)))
 
         # GPU is independent of psutil, so it is sampled even if psutil is gone.
-        result["gpu"] = self.gpu.sample(pids)
+        gpu_combined, gpu_by_pid = self.gpu.sample(pids)
+        result["gpu"] = gpu_combined
         if psutil is None:
             return result
 
-        # Drop processes that have exited, so their handles do not accumulate
-        # across a session of powering VMs on and off.
+        # Drop bookkeeping for processes that have exited, so neither the handle
+        # cache nor the IO baselines accumulate across a session of powering VMs
+        # on and off.
         for dead in [p for p in self._procs if p not in pids]:
             self._procs.pop(dead, None)
+        for dead in [p for p in self._last_io if p not in pids]:
+            self._last_io.pop(dead, None)
 
+        now = time.monotonic()
         cpu_total = 0.0
         ram_total = 0
-        io_total = 0
-        have_io = False
+        disk_total = 0.0
+        have_disk = False
+
         for pid in pids:
             proc = self._process_for(pid)
             if proc is None:
                 continue
             try:
-                cpu_total += proc.cpu_percent(None)
-                ram_total += proc.memory_info().rss
+                # psutil reports process CPU against ONE core, so a busy
+                # 4-thread VM reads 400%. Normalise to whole-machine percent,
+                # which is what the meter and Task Manager both mean by "CPU".
+                cpu = proc.cpu_percent(None) / self._cpu_count
+                ram = proc.memory_info().rss
                 io = proc.io_counters()
-                io_total += io.read_bytes + io.write_bytes
-                have_io = True
+                io_bytes = io.read_bytes + io.write_bytes
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 self._procs.pop(pid, None)
+                self._last_io.pop(pid, None)
+                continue
 
-        # psutil reports process CPU against ONE core, so a busy 4-thread VM
-        # reads 400%. Normalise to whole-machine percent, which is what the
-        # meter and Task Manager both mean by "CPU".
-        result["cpu"] = min(100.0, cpu_total / self._cpu_count)
+            # Per-process rates, so a VM's disk figure is its own and does not
+            # move when a different VM starts or stops.
+            disk_bps = None
+            previous = self._last_io.get(pid)
+            if previous is not None:
+                elapsed = now - previous[1]
+                if elapsed > 0:
+                    disk_bps = max(0, io_bytes - previous[0]) / elapsed
+            self._last_io[pid] = (io_bytes, now)
+
+            cpu_total += cpu
+            ram_total += ram
+            if disk_bps is not None:
+                disk_total += disk_bps
+                have_disk = True
+
+            result["per_pid"][pid] = {
+                "cpu": min(100.0, cpu),
+                "ram_bytes": ram,
+                "disk_bps": disk_bps,
+                "gpu": gpu_by_pid.get(pid, 0.0) if gpu_combined is not None else None,
+            }
+
+        result["cpu"] = min(100.0, cpu_total)
         result["ram_bytes"] = ram_total
         if self._total_ram:
             result["ram_percent"] = min(100.0, ram_total * 100.0 / self._total_ram)
-
-        if have_io:
-            now = time.monotonic()
-            if self._last_io_bytes is not None:
-                elapsed = now - self._last_io_time
-                # Counters are monotonic per process, but the SET of processes
-                # changes as VMs start and stop, so a total can legitimately go
-                # down. Clamp rather than report a negative rate.
-                delta = max(0, io_total - self._last_io_bytes)
-                if elapsed > 0:
-                    result["disk_bps"] = delta / elapsed
-                    self._disk_peak = max(self._disk_peak, result["disk_bps"])
-            self._last_io_bytes = io_total
-            self._last_io_time = now
+        if have_disk:
+            result["disk_bps"] = disk_total
+            self._disk_peak = max(self._disk_peak, disk_total)
         return result
 
     @property
@@ -842,6 +875,37 @@ class _UsageMeter(QWidget):
             return
         self.bar.setValue(int(max(0, min(100, round(percent)))))
         self.value_label.setText(text)
+
+
+class _VMUsageRow(QWidget):
+    """One running VM's slice of the App Utilisation panel.
+
+    Two stacked lines rather than a table: the sidebar is ~260px wide, and four
+    numeric columns plus a VM name do not fit legibly at that width.
+    """
+
+    def __init__(self, vm_name, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+
+        self.name_label = QLabel(vm_name)
+        self.name_label.setObjectName("UsageVMName")
+        layout.addWidget(self.name_label)
+
+        self.stats_label = QLabel("--")
+        self.stats_label.setObjectName("UsageVMStats")
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+    def set_stats(self, cpu, ram_bytes, disk_bps, gpu):
+        cpu_text = "--" if cpu is None else f"{cpu:.0f}%"
+        gpu_text = "n/a" if gpu is None else f"{gpu:.0f}%"
+        disk_text = "--" if disk_bps is None else f"{_format_bytes(disk_bps)}/s"
+        self.stats_label.setText(
+            f"CPU {cpu_text}   RAM {_format_bytes(ram_bytes)}\n"
+            f"Disk {disk_text}   GPU {gpu_text}")
 
 
 def _format_bytes(n):
@@ -1845,6 +1909,9 @@ class LocalHostWindow(QMainWindow):
         left_split.setCollapsible(0, False)
         left_split.setCollapsible(1, False)
         tree_frame.setMinimumHeight(120)
+        # Kept so the panel can re-divide the sidebar when the per-VM list
+        # appears or disappears (see _set_vm_usage_section_visible).
+        self._left_split = left_split
         library_layout.addWidget(left_split)
         # Sized after the widget is parented, so the splitter honours it against
         # real geometry rather than the pre-layout default.
@@ -1963,6 +2030,34 @@ class LocalHostWindow(QMainWindow):
         self.usage_scope_label.setObjectName("UsageScope")
         frame_layout.addWidget(self.usage_scope_label)
 
+        # Per-VM breakdown, under the aggregate. Inside a scroll area with a
+        # capped height so a machine running several VMs grows the list instead
+        # of forcing the whole panel taller and squeezing the library tree.
+        self.usage_vm_separator = QFrame()
+        self.usage_vm_separator.setObjectName("UsageSeparator")
+        self.usage_vm_separator.setFrameShape(QFrame.HLine)
+        self.usage_vm_separator.setFixedHeight(1)
+        frame_layout.addWidget(self.usage_vm_separator)
+
+        self.usage_vm_container = QWidget()
+        self.usage_vm_layout = QVBoxLayout(self.usage_vm_container)
+        self.usage_vm_layout.setContentsMargins(0, 0, 0, 0)
+        self.usage_vm_layout.setSpacing(6)
+
+        self.usage_vm_scroll = QScrollArea()
+        self.usage_vm_scroll.setObjectName("UsageVMScroll")
+        self.usage_vm_scroll.setWidget(self.usage_vm_container)
+        self.usage_vm_scroll.setWidgetResizable(True)
+        self.usage_vm_scroll.setFrameShape(QFrame.NoFrame)
+        self.usage_vm_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.usage_vm_scroll.setMinimumHeight(46)   # at least one row stays legible
+        self.usage_vm_scroll.setMaximumHeight(132)
+        frame_layout.addWidget(self.usage_vm_scroll)
+
+        # vm name -> _VMUsageRow, rebuilt as VMs start and stop
+        self._vm_usage_rows = {}
+        self._set_vm_usage_section_visible(False)
+
         layout.addWidget(frame)
         # Four meters plus the scope line have a real minimum size; without this
         # the splitter is free to squeeze the panel away to nothing.
@@ -1980,19 +2075,71 @@ class LocalHostWindow(QMainWindow):
         self._usage_timer.start(1000)
         return panel
 
+    def _set_vm_usage_section_visible(self, visible):
+        """Hide the separator and list entirely when nothing is running, rather
+        than leaving an empty box under the aggregate."""
+        if getattr(self, "_vm_usage_visible", None) == visible:
+            return
+        self._vm_usage_visible = visible
+        self.usage_vm_separator.setVisible(visible)
+        self.usage_vm_scroll.setVisible(visible)
+
+        # Showing the list changes how much height the panel needs, and a
+        # splitter does not re-divide its panes just because a child's size hint
+        # grew -- the list would be clipped. Re-divide ON THE TRANSITION ONLY,
+        # so a divider the user has dragged is not overridden every second.
+        split = getattr(self, "_left_split", None)
+        if split is None:
+            return
+        panel = split.widget(1)
+        total = sum(split.sizes())
+        if total <= 0:
+            return
+        want = min(panel.sizeHint().height(), max(120, total - 120))
+        split.setSizes([total - want, want])
+
+    def _sync_vm_usage_rows(self, per_vm):
+        """Add/remove per-VM rows so the list matches what is actually running.
+        `per_vm` is {vm_name: stats dict}."""
+        for name in [n for n in self._vm_usage_rows if n not in per_vm]:
+            row = self._vm_usage_rows.pop(name)
+            self.usage_vm_layout.removeWidget(row)
+            row.deleteLater()
+
+        for name in sorted(per_vm):
+            row = self._vm_usage_rows.get(name)
+            if row is None:
+                row = _VMUsageRow(name)
+                self._vm_usage_rows[name] = row
+                self.usage_vm_layout.addWidget(row)
+            stats = per_vm[name]
+            row.set_stats(stats["cpu"], stats["ram_bytes"],
+                          stats["disk_bps"], stats["gpu"])
+
+        self._set_vm_usage_section_visible(bool(per_vm))
+
     def _update_app_usage(self):
         # Skipped while the window is minimised or hidden: sampling costs a
         # handful of syscalls per VM per second, and nobody is reading it.
         if self.isMinimized() or not self.isVisible():
             return
+        # Snapshot the mapping: the poll timer can remove entries between the
+        # sample and the row update, and a VM vanishing mid-update should not
+        # raise inside a repeating timer.
+        vm_pids = dict(self.processes)
         try:
-            usage = self.usage_sampler.sample(list(self.processes.values()))
+            usage = self.usage_sampler.sample(list(vm_pids.values()))
         except Exception:
             # Monitoring must never be able to take the app down with it.
             return
 
         if not usage["available"]:
             return
+
+        per_pid = usage["per_pid"]
+        self._sync_vm_usage_rows({
+            name: per_pid[pid] for name, pid in vm_pids.items() if pid in per_pid
+        })
 
         cpu = usage["cpu"]
         self.usage_meters["cpu"].set_value(cpu, "--" if cpu is None else f"{cpu:.0f}%")
@@ -3288,6 +3435,11 @@ class LocalHostWindow(QMainWindow):
             QLabel#UsageName { color: #d0d0d0; font-size: 12px; }
             QLabel#UsageValue { color: #8ab4f8; font-size: 12px; font-weight: 600; }
             QLabel#UsageScope { color: #808080; font-size: 11px; padding-top: 2px; }
+            QLabel#UsageVMName { color: #d0d0d0; font-size: 12px; font-weight: 600; }
+            QLabel#UsageVMStats { color: #909090; font-size: 11px; }
+            QFrame#UsageSeparator { background-color: #3c3c3c; border: none; }
+            QScrollArea#UsageVMScroll { background: transparent; border: none; }
+            QScrollArea#UsageVMScroll > QWidget > QWidget { background: transparent; }
             QProgressBar#UsageBar {
                 background-color: #2a2a2a;
                 border: none;
