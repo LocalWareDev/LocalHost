@@ -981,6 +981,15 @@ long g_irqSlotBusy = 0;     // previous injection still pending -- guest has not
 long g_irqIfClear = 0;      // guest running with interrupts masked (EFLAGS.IF=0)
 long g_irqGetFail = 0;      // could not read the pending-interruption register
 UINT64 g_irqLastSlot = 0;   // raw slot value last time it was found occupied
+// Stuck-slot recovery. See the unwedge block in drainInterruptQueue: how many
+// consecutive passes the identical pending value has to persist before it is
+// treated as wedged rather than in flight. drainInterruptQueue runs every
+// run-loop pass, so this is a small fraction of a second of real time -- long
+// enough that an event WHP is about to inject is never touched.
+#define IRQ_STUCK_CLEAR_AFTER 200
+static UINT64 g_irqStuckLastValue = 0;
+static int g_irqStuckRepeats = 0;
+long g_irqSlotCleared = 0;  // wedged events we dropped to unblock the queue
 // WHvRequestInterrupt outcome tallies. Defined further down with injectInterrupt,
 // which is the other caller; declared here because drainInterruptQueue uses them
 // when IRQ_VIA_APIC is on.
@@ -1225,6 +1234,39 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
     if (existing.Reg64 & 1ULL) {                    // guest has not taken the last one
         g_irqSlotBusy++;
         g_irqLastSlot = existing.Reg64;
+        // UNWEDGE IT. The guest is demonstrably able to take an interrupt at this
+        // point -- IF=1, CR8=0, no shadow, no NMI mask, measured -- and WHP still
+        // never consumes what is sitting in the slot. Nothing arrives again for
+        // the rest of the run, storage included, so the pending event is worth
+        // nothing where it is: dropping it costs an interrupt that was never
+        // going to be delivered, and buys back every one behind it.
+        //
+        // Deliberately patient. It only fires after the same vector has been
+        // stuck across many consecutive passes, so a genuinely in-flight event
+        // -- one WHP is about to inject on the next entry -- is never disturbed.
+        if (existing.Reg64 == g_irqStuckLastValue) {
+            g_irqStuckRepeats++;
+        } else {
+            g_irqStuckLastValue = existing.Reg64;
+            g_irqStuckRepeats = 1;
+        }
+        if (g_irqStuckRepeats >= IRQ_STUCK_CLEAR_AFTER) {
+            WHV_REGISTER_VALUE clear = { 0 };
+            g_irqStuckRepeats = 0;
+            g_irqStuckLastValue = 0;
+            if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, &pendName, 1, &clear))) {
+                g_irqSlotCleared++;
+                if (g_irqSlotCleared <= 20) {
+                    printf("[irq-unwedge] cleared a stuck pending interruption "
+                           "(vector=0x%02X, stuck %d passes) -- cleared %ld so far\n",
+                           (unsigned)((existing.Reg64 >> 16) & 0xFF),
+                           IRQ_STUCK_CLEAR_AFTER, g_irqSlotCleared);
+                    fflush(stdout);
+                }
+            }
+            return;
+        }
+
         // WHY is it stuck? The counters say a vector sits here forever, but not
         // what is preventing WHP from injecting it. The candidates each imply a
         // different fix, so read the vCPU's actual interruptibility rather than
@@ -5451,8 +5493,8 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     // Why we are declining, and what is actually stuck in there.
                     if (frozen) {
                         int qi;
-                        printf("[irq-stuck] slotBusy=%ld ifClear=%ld getFail=%ld lastSlot=0x%llX (pending=%d vector=0x%02X) queued:",
-                               g_irqSlotBusy, g_irqIfClear, g_irqGetFail,
+                        printf("[irq-stuck] slotBusy=%ld cleared=%ld ifClear=%ld getFail=%ld lastSlot=0x%llX (pending=%d vector=0x%02X) queued:",
+                               g_irqSlotBusy, g_irqSlotCleared, g_irqIfClear, g_irqGetFail,
                                (unsigned long long)g_irqLastSlot,
                                (int)(g_irqLastSlot & 1ULL),
                                (unsigned)((g_irqLastSlot >> 16) & 0xFF));
@@ -6883,7 +6925,21 @@ int deliverPitTimerIrq(WHV_PARTITION_HANDLE partition) {
     if (elapsedMs < TIMER_TICK_INTERVAL_MS) return 0;
     lastTimerTick = now;
     if (!guestInterruptsEnabled(partition)) return 0;
-    injectInterrupt(partition, 0x08); // IRQ0 - timer
+    // STOPS once the guest is in APIC mode, and this is a real bug fix rather
+    // than tidying.
+    //
+    // Vector 0x08 is the PIC-remapped IRQ0 of real mode -- and it is also the
+    // DOUBLE FAULT exception vector. Firmware in PIC mode wants it; a Windows
+    // kernel in APIC mode does not, and cannot do anything sensible with it.
+    // ioapicResolveVector already refuses to hand out sub-0x10 vectors for
+    // exactly this reason, but this path predates the queue and writes the raw
+    // pending-interruption slot directly, bypassing that check entirely.
+    //
+    // Caught by the unwedge diagnostic: with the guest well into Windows, the
+    // permanently stuck pending event was "vector=0x08" -- this injection,
+    // sitting in the single slot that everything else has to pass through.
+    if (g_guestApicMode) return 0;
+    injectInterrupt(partition, 0x08); // IRQ0 - timer (PIC mode only)
     return 1;
 }
 
