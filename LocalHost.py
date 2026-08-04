@@ -36,9 +36,9 @@ from PySide6.QtWidgets import (
     QSizePolicy, QMenuBar, QStatusBar, QStackedWidget,
     QDialog, QFormLayout, QLineEdit, QSpinBox, QComboBox, QMessageBox,
     QFileDialog, QDialogButtonBox, QMenu, QInputDialog, QAbstractItemView,
-    QListWidget, QListWidgetItem, QProgressBar, QScrollArea
+    QListWidget, QListWidgetItem, QProgressBar, QScrollArea, QSplashScreen
 )
-from PySide6.QtGui import QAction, QIcon, QDesktopServices
+from PySide6.QtGui import QAction, QIcon, QDesktopServices, QPixmap
 from PySide6.QtCore import Qt, QSize, QStandardPaths, QProcess, QTimer, Signal, QUrl
 
 
@@ -47,6 +47,57 @@ from PySide6.QtCore import Qt, QSize, QStandardPaths, QProcess, QTimer, Signal, 
 APP_VERSION = "1.0.0"
 APP_RELEASE_TAG = "v1.0.0"
 APP_RELEASE_DATE = "July 13, 2026"
+
+# Startup splash. The artwork is 2000x2000, so it is scaled down hard -- shown
+# at source size it would blanket the entire screen.
+SPLASH_IMAGE_NAME = "LocalHost.png"
+SPLASH_SIZE = 420          # logical px, square (the source art is square)
+SPLASH_DURATION_MS = 2500
+
+
+def _app_dir():
+    """Directory the app is running from, whether run as a script or frozen by
+    PyInstaller (see LocalHost.spec)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _splash_image_path():
+    """Bundled copy first, then the original download location.
+
+    Bundled so a fresh clone -- or any machine that is not this one -- still
+    gets a splash. An absolute path into one user's Downloads folder is not
+    something the app should depend on to start up looking right, and Downloads
+    is exactly the folder people empty.
+    """
+    bundled = _app_dir() / SPLASH_IMAGE_NAME
+    if bundled.exists():
+        return bundled
+    fallback = Path.home() / "Downloads" / SPLASH_IMAGE_NAME
+    return fallback if fallback.exists() else None
+
+
+def _create_splash(app):
+    """Returns a shown QSplashScreen, or None if the image is unavailable --
+    a missing splash image must not stop the app from starting."""
+    path = _splash_image_path()
+    if path is None:
+        return None
+    pixmap = QPixmap(str(path))
+    if pixmap.isNull():
+        return None
+
+    # Scale in DEVICE pixels and tag the result, so the splash is crisp on a
+    # HiDPI display instead of being upscaled from a logical-size bitmap.
+    ratio = app.devicePixelRatio()
+    target = max(1, int(SPLASH_SIZE * ratio))
+    pixmap = pixmap.scaled(target, target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    pixmap.setDevicePixelRatio(ratio)
+
+    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash.show()
+    return splash
 
 
 def _create_sparse_disk_image(path, size_bytes):
@@ -2893,9 +2944,7 @@ class LocalHostWindow(QMainWindow):
     # ------------------------------------------------------------------
     @staticmethod
     def app_dir():
-        if getattr(sys, "frozen", False):
-            return Path(sys.executable).resolve().parent
-        return Path(__file__).resolve().parent
+        return _app_dir()
 
     def hypervisor_exe_path(self):
         return self.app_dir() / "Hypervisor.exe"
@@ -3475,8 +3524,34 @@ class LocalHostWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+
+    splash = _create_splash(app)
+    if splash is not None:
+        # Paint it now: building the window blocks this thread, and
+        # _reconnect_running_vms alone can spend up to half a second per VM
+        # probing for windows. Without this the splash would be an empty frame
+        # for exactly the stretch it is meant to cover.
+        app.processEvents()
+
+    started = time.monotonic()
     window = LocalHostWindow()
-    window.show()
+
+    if splash is None:
+        window.show()
+    else:
+        # Hold the splash for the REMAINDER of its duration, not the full
+        # duration on top of however long construction took -- otherwise a slow
+        # start is punished twice. If building already outlasted it, the window
+        # appears immediately.
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        remaining_ms = max(0, SPLASH_DURATION_MS - elapsed_ms)
+
+        def reveal():
+            window.show()
+            splash.finish(window)   # closes the splash once the window is up
+
+        QTimer.singleShot(remaining_ms, reveal)
+
     sys.exit(app.exec())
 
 
