@@ -63,6 +63,23 @@ def _app_dir():
     return Path(__file__).resolve().parent
 
 
+# The hypervisor refuses to start a guest the host cannot back with physical RAM
+# (see the [mem] block in Hypervisor.c) and wants this much left over for the
+# host. Mirrored here so the manager can explain the problem and offer a way
+# forward, instead of the guest exiting to a console nobody is reading.
+HOST_RAM_HEADROOM_MB = 512
+
+
+def _host_available_mb():
+    """Physical RAM currently available, in MB, or None if unknowable."""
+    if psutil is None:
+        return None
+    try:
+        return int(psutil.virtual_memory().available / (1024 * 1024))
+    except Exception:
+        return None
+
+
 def _find_ovmf_firmware():
     """Best-effort hunt for an OVMF .fd, so choosing UEFI does not dead-end on an
     empty path the user has to go and fill in by hand.
@@ -3153,8 +3170,49 @@ class LocalHostWindow(QMainWindow):
         iso_arg = (vm.iso_path
                    if vm.iso_path and Path(vm.iso_path).is_file() else "")
 
-        args = [vm.name, firmware_path, disk_arg,
-                str(_parse_memory_to_mb(vm.memory)), iso_arg]
+        # MEMORY PRE-CHECK, so a guest that cannot fit is explained here rather
+        # than exiting silently.
+        #
+        # The hypervisor refuses to start a guest larger than the host can back,
+        # which is correct -- but it says so on stdout, and these processes are
+        # launched detached with nowhere for that to go. From the user's side the
+        # VM simply never appeared, with no message anywhere. That is what this
+        # turns into a dialog with a way forward.
+        mem_mb = _parse_memory_to_mb(vm.memory)
+        available_mb = _host_available_mb()
+        if available_mb is not None and mem_mb + HOST_RAM_HEADROOM_MB > available_mb:
+            safe_mb = (available_mb - HOST_RAM_HEADROOM_MB) // 256 * 256
+            if safe_mb < 1024:
+                QMessageBox.warning(
+                    self, "Not enough free memory",
+                    f"'{vm.name}' is configured for {mem_mb} MB, but only "
+                    f"{available_mb} MB of physical RAM is free right now.\n\n"
+                    "Even a minimal guest needs about 1 GB on top of the "
+                    f"{HOST_RAM_HEADROOM_MB} MB the host has to keep. Close some "
+                    "applications and try again."
+                )
+                self.statusBar().showMessage(
+                    f"Not enough free RAM to start '{vm.name}' "
+                    f"({available_mb} MB free, {mem_mb} MB needed).", 8000)
+                return
+            answer = QMessageBox.question(
+                self, "Not enough free memory",
+                f"'{vm.name}' is configured for {mem_mb} MB, but only "
+                f"{available_mb} MB of physical RAM is free right now, and "
+                "starting it anyway would make the host page heavily.\n\n"
+                f"Start it with {safe_mb} MB instead?\n\n"
+                "(Windows Setup runs from a ~437 MB RAM disk, so below roughly "
+                "1.5 GB expect it to struggle.)",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if answer != QMessageBox.Yes:
+                self.statusBar().showMessage(
+                    f"'{vm.name}' not started -- needs {mem_mb} MB, "
+                    f"{available_mb} MB free.", 8000)
+                return
+            mem_mb = safe_mb
+
+        args = [vm.name, firmware_path, disk_arg, str(mem_mb), iso_arg]
 
         if iso_arg:
             # Worth saying out loud, because it is the difference between
