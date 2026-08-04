@@ -63,6 +63,33 @@ def _app_dir():
     return Path(__file__).resolve().parent
 
 
+def _find_ovmf_firmware():
+    """Best-effort hunt for an OVMF .fd, so choosing UEFI does not dead-end on an
+    empty path the user has to go and fill in by hand.
+
+    UEFI is not a preference here, it is the only mode that can boot a modern
+    OS: legacy BIOS gives the guest 1MB of RAM (see UEFI_GUEST_RAM_SIZE in
+    Hypervisor.c), which Windows cannot boot in at all. So making UEFI the easy
+    default matters more than it would elsewhere.
+    """
+    names = ("RELEASEX64_OVMF.fd", "OVMF.fd", "DEBUGX64_OVMF.fd")
+    roots = [_app_dir(), _app_dir() / "firmware", Path.home() / "Downloads"]
+    for root in roots:
+        for name in names:
+            candidate = root / name
+            if candidate.is_file():
+                return str(candidate)
+    # Anything OVMF-shaped, if the conventional names missed.
+    for root in roots:
+        try:
+            for candidate in sorted(root.glob("*OVMF*.fd")):
+                if candidate.is_file():
+                    return str(candidate)
+        except OSError:
+            continue
+    return ""
+
+
 def _splash_image_path():
     """Bundled copy first, then the original download location.
 
@@ -1033,7 +1060,7 @@ class VM:
                  sound="Auto detect", display="Auto detect", tpm="Present",
                  hypervisor="LocalHost Hypervisor", iso_path="", disk_path="",
                  snapshots=None, guest_os="Other / Unknown",
-                 firmware="Legacy BIOS", uefi_firmware_path=""):
+                 firmware="UEFI", uefi_firmware_path=""):
         self.name = name
         self.memory = memory
         self.processors = processors
@@ -1185,13 +1212,21 @@ class NewVMWizard(QDialog):
         # Firmware -- UEFI needs an OVMF.fd the user supplies (not bundled).
         # The path row only appears once UEFI is selected.
         self.firmware_combo = QComboBox()
-        self.firmware_combo.addItems(["Legacy BIOS (SeaBIOS)", "UEFI (OVMF)"])
+        self.firmware_combo.addItems(["UEFI (OVMF)", "Legacy BIOS (SeaBIOS)"])
+        # UEFI FIRST, and therefore the default. Legacy BIOS was the default and
+        # is close to useless here: it gives the guest 1MB of RAM, so no modern
+        # OS can boot in it. A new VM created with the defaults and pointed at a
+        # Windows ISO used to drop straight into SeaBIOS and stop, which is
+        # exactly the confusion this ordering removes.
         self.firmware_combo.currentTextChanged.connect(self.on_firmware_changed)
         form.addRow("Firmware:", self.firmware_combo)
 
         uefi_row = QHBoxLayout()
         self.uefi_path_edit = QLineEdit()
         self.uefi_path_edit.setPlaceholderText("Path to OVMF.fd (required for UEFI)")
+        # Prefilled when one can be found, so the default path through this
+        # dialog needs no extra work from the user.
+        self.uefi_path_edit.setText(_find_ovmf_firmware())
         uefi_browse_btn = QPushButton("Browse...")
         uefi_browse_btn.clicked.connect(self.on_browse_uefi_firmware)
         uefi_row.addWidget(self.uefi_path_edit)
@@ -1201,9 +1236,9 @@ class NewVMWizard(QDialog):
         uefi_container.setContentsMargins(0, 0, 0, 0)
         uefi_container.addLayout(uefi_row)
         uefi_hint = QLabel(
-            "Note: there's no installer/CD-ROM support yet -- the hard disk "
-            "image must already be bootable (e.g. a GPT/FAT ESP with "
-            "\\EFI\\BOOT\\BOOTX64.EFI)."
+            "UEFI is required to boot a modern OS -- Legacy BIOS gives the guest "
+            "only 1 MB of RAM. An ISO set below is booted as installer media; "
+            "while one is attached the hard disk is not (single controller port)."
         )
         uefi_hint.setWordWrap(True)
         uefi_hint.setStyleSheet("color: #888;")
@@ -1431,15 +1466,20 @@ class VMSettingsDialog(QDialog):
         # running, same rationale as the hard disk size: the hypervisor
         # process already has its firmware path fixed for this run.
         self.firmware_combo = QComboBox()
-        self.firmware_combo.addItems(["Legacy BIOS (SeaBIOS)", "UEFI (OVMF)"])
+        # UEFI first here too, matching the wizard -- and the fallback for an
+        # unrecognised stored value is now UEFI, since Legacy BIOS cannot boot
+        # anything modern (1MB of guest RAM).
+        self.firmware_combo.addItems(["UEFI (OVMF)", "Legacy BIOS (SeaBIOS)"])
         self._set_combo(self.firmware_combo, "UEFI (OVMF)" if vm.firmware == "UEFI" else "Legacy BIOS (SeaBIOS)",
-                         "Legacy BIOS (SeaBIOS)")
+                         "UEFI (OVMF)")
         self.firmware_combo.setEnabled(not is_running)
         self.firmware_combo.currentTextChanged.connect(self.on_firmware_changed)
         form.addRow("Firmware:", self.firmware_combo)
 
         uefi_row = QHBoxLayout()
-        self.uefi_path_edit = QLineEdit(vm.uefi_firmware_path)
+        # Prefilled when the VM has no path stored, so switching an existing
+        # Legacy BIOS VM to UEFI does not also require hunting for the .fd.
+        self.uefi_path_edit = QLineEdit(vm.uefi_firmware_path or _find_ovmf_firmware())
         self.uefi_path_edit.setPlaceholderText("Path to OVMF.fd (required for UEFI)")
         self.uefi_path_edit.setEnabled(not is_running)
         uefi_browse_btn = QPushButton("Browse...")
@@ -1452,9 +1492,9 @@ class VMSettingsDialog(QDialog):
         uefi_container.setContentsMargins(0, 0, 0, 0)
         uefi_container.addLayout(uefi_row)
         uefi_hint = QLabel(
-            "Note: there's no installer/CD-ROM support yet -- the hard disk "
-            "image must already be bootable (e.g. a GPT/FAT ESP with "
-            "\\EFI\\BOOT\\BOOTX64.EFI)."
+            "UEFI is required to boot a modern OS -- Legacy BIOS gives the guest "
+            "only 1 MB of RAM. An ISO set below is booted as installer media; "
+            "while one is attached the hard disk is not (single controller port)."
         )
         uefi_hint.setWordWrap(True)
         uefi_hint.setStyleSheet("color: #888;")
@@ -3044,15 +3084,64 @@ class LocalHostWindow(QMainWindow):
             return
 
         if vm.firmware == "UEFI":
-            if not vm.uefi_firmware_path or not Path(vm.uefi_firmware_path).is_file():
-                self.statusBar().showMessage(
-                    f"'{vm.name}' is set to UEFI firmware but no OVMF.fd path is "
-                    "configured -- edit VM settings to set one.", 6000
-                )
-                return
             firmware_path = vm.uefi_firmware_path
+            if not firmware_path or not Path(firmware_path).is_file():
+                # Try to recover before giving up -- the path may simply never
+                # have been filled in, and a findable OVMF is the common case.
+                firmware_path = _find_ovmf_firmware()
+                if firmware_path:
+                    vm.uefi_firmware_path = firmware_path
+                    self.save_library()
+                else:
+                    self.statusBar().showMessage(
+                        f"'{vm.name}' is set to UEFI but no OVMF.fd was found -- "
+                        "edit VM settings and set the UEFI firmware path.", 8000
+                    )
+                    return
         else:
-            firmware_path = "bios.bin"
+            # LEGACY BIOS CANNOT BOOT INSTALLER MEDIA HERE, so say so instead of
+            # starting SeaBIOS and leaving the user staring at it wondering why
+            # nothing happened. Legacy mode gives the guest 1MB of RAM (see
+            # UEFI_GUEST_RAM_SIZE in Hypervisor.c) -- enough for SeaBIOS itself
+            # and nothing else. Refusing here is far kinder than "it ran, and
+            # then sat at a BIOS prompt forever".
+            if vm.iso_path and Path(vm.iso_path).is_file():
+                ovmf = _find_ovmf_firmware()
+                if not ovmf:
+                    QMessageBox.warning(
+                        self, "Legacy BIOS cannot boot an ISO",
+                        f"'{vm.name}' is set to Legacy BIOS (SeaBIOS), which "
+                        "gives the guest only 1 MB of RAM -- not enough to boot "
+                        "Windows or any modern OS, so it would stop at the "
+                        "BIOS.\n\nSwitch it to UEFI in Edit virtual machine "
+                        "settings and supply an OVMF .fd firmware file."
+                    )
+                    self.statusBar().showMessage(
+                        f"'{vm.name}' needs UEFI firmware to boot an ISO.", 8000)
+                    return
+                # Offer the fix rather than just naming it. This is a one-line
+                # settings change that the user would otherwise have to go and
+                # make by hand, and there is no sensible reason to want SeaBIOS
+                # here -- but it is still their VM, so it is asked, not assumed.
+                answer = QMessageBox.question(
+                    self, "Switch to UEFI?",
+                    f"'{vm.name}' is set to Legacy BIOS (SeaBIOS), which gives "
+                    "the guest only 1 MB of RAM -- not enough to boot Windows "
+                    "or any modern OS, so it would stop at the BIOS.\n\n"
+                    f"Switch this VM to UEFI using:\n{ovmf}\n\nand power on?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if answer != QMessageBox.Yes:
+                    self.statusBar().showMessage(
+                        f"'{vm.name}' needs UEFI firmware to boot an ISO.", 8000)
+                    return
+                vm.firmware = "UEFI"
+                vm.uefi_firmware_path = ovmf
+                self.save_library()
+                self._refresh_device_rows()
+                firmware_path = ovmf
+            else:
+                firmware_path = "bios.bin"
 
         # Hypervisor.exe takes POSITIONAL arguments:
         #   [1] window title  [2] firmware  [3] disk  [4] RAM in MB  [5] ISO
