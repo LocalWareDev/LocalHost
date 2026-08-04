@@ -1286,6 +1286,20 @@ int pendingAtaIrq = 0;
 // its ISR is not flooded. Also maintains the global IS port bit, which the driver
 // reads to find which port raised the interrupt.
 extern void *ahciAbarMemory; // defined with the rest of the AHCI BAR5 state below
+
+// AHCI port table. Declared up here because ahciServiceLevelInterrupt below has
+// to scan every port to find which one is asserting; the definition and the full
+// explanation live with the rest of the disk state further down.
+#define AHCI_PORT_COUNT 2
+typedef struct {
+    FILE   *file;
+    UINT64  sectors;
+    UINT32  sectorSize;
+    int     present;
+    char    path[512];
+} AhciPortDevice;
+extern AhciPortDevice ahciPorts[AHCI_PORT_COUNT];
+static int ahciPortsImplemented(void);
 // U61: interrupt-handshake tracing -- injections we make vs acknowledgements the
 // driver writes back. Declared here because ahciServiceLevelInterrupt below is the
 // first user; ahciHandleAbarMmio (further down) logs the acknowledgement side.
@@ -1318,11 +1332,22 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     // already owns these registers, not in a concurrent poller. See U57.
     UINT32 ghc = *(UINT32 *)(ab + 0x04);
     if (!(ghc & 0x2)) return;                       // GHC.IE clear -- interrupts globally off
-    unsigned char *pt = ab + 0x100;
-    UINT32 pxis = *(UINT32 *)(pt + 0x10);
-    UINT32 pxie = *(UINT32 *)(pt + 0x14);
-    if ((pxis & pxie) == 0) return;                 // nothing the driver wants to hear about
-    *(UINT32 *)(ab + 0x08) |= 0x1;                  // global IS: port 0 is asserting
+    // Any implemented port can be the one asserting, and the global IS bit the
+    // driver reads to find out has to name the right one -- so scan them all and
+    // set a bit per asserting port rather than assuming port 0.
+    {
+        int p;
+        UINT32 asserting = 0;
+        for (p = 0; p < AHCI_PORT_COUNT; p++) {
+            unsigned char *pp;
+            if (!ahciPorts[p].present) continue;
+            pp = ab + 0x100 + (UINT32)p * 0x80;
+            if ((*(UINT32 *)(pp + 0x10) & *(UINT32 *)(pp + 0x14)) != 0)
+                asserting |= (1u << p);
+        }
+        if (asserting == 0) return;                 // nothing the driver wants to hear about
+        *(UINT32 *)(ab + 0x08) |= asserting;        // global IS
+    }
     if (exitCount - g_ahciLastIrqExit < 500) return; // throttle re-assertion
     if (!guestInterruptsEnabled(partition)) return;
     g_ahciLastIrqExit = exitCount;
@@ -1333,8 +1358,10 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     g_ahciIrqCount++; // uncapped -- the log below is capped and has misled me before
     if (LOCALHOST_VERBOSE_DIAG && g_bpModuleBase && g_ahciIrqLogged < U61_IRQ_LOG_MAX) {
         g_ahciIrqLogged++;
-        printf("[u61] inject #%d: PxIS=0x%08X PxIE=0x%08X IS=0x%08X GHC=0x%08X exit=%ld\n",
-               g_ahciIrqLogged, pxis, pxie, *(UINT32 *)(ab + 0x08), ghc, exitCount);
+        unsigned char *p0 = ab + 0x100;
+        printf("[u61] inject #%d: port0 PxIS=0x%08X PxIE=0x%08X IS=0x%08X GHC=0x%08X exit=%ld\n",
+               g_ahciIrqLogged, *(UINT32 *)(p0 + 0x10), *(UINT32 *)(p0 + 0x14),
+               *(UINT32 *)(ab + 0x08), ghc, exitCount);
         fflush(stdout);
     }
     injectDeviceIrq(partition, GSI_AHCI, 0x76);
@@ -2094,6 +2121,32 @@ UINT64 ataDiskSectors = 0;
 // started) fails with a generic Device Error, plausibly because it expects
 // the conventional El-Torito-mediated boot path.
 UINT32 ataSectorSize = 512;
+
+// --- AHCI: one entry per implemented port ---------------------------------
+//
+// The controller used to implement a single port, which meant an ISO and a hard
+// disk could not both be attached: booting installer media left the installer
+// with nothing to install ONTO. Two ports is the minimum that makes an OS
+// install possible -- boot the ISO on one, write to the disk on the other.
+//
+// Port 0 is the BOOT device (the ISO when one is configured, otherwise the hard
+// disk); port 1 carries the other one. Firmware enumerates in port order, so
+// putting the boot medium first is what makes an attached ISO take precedence
+// without needing a boot-order setting.
+//
+// ataDiskFile/ataDiskSectors/ataSectorSize above stay as they were and track
+// PORT 0. The legacy IDE path (ports 0x1F0-0x1F7) is a separate device model
+// that only ever exposes one drive, and rewiring it is not needed to install an
+// OS -- firmware and Windows both drive the AHCI controller.
+// (AHCI_PORT_COUNT and AhciPortDevice are declared near ahciServiceLevelInterrupt,
+// which needs them earlier in the file.)
+AhciPortDevice ahciPorts[AHCI_PORT_COUNT];
+
+static int ahciPortsImplemented(void) {
+    int i, n = 0;
+    for (i = 0; i < AHCI_PORT_COUNT; i++) if (ahciPorts[i].present) n++;
+    return n;
+}
 
 unsigned char ataFeatures = 0;
 unsigned char ataSectorCount = 1;
@@ -4290,23 +4343,41 @@ int pciRegisterIsReadOnly(UINT32 offset) {
 // to run a real COMRESET/link-training sequence, and PxTFD matching the
 // legacy ATA path's own idle status (DRDY|DSC, no error).
 void ahciInitAbarRegisters(unsigned char *abar) {
+    int p;
+    UINT32 pi = 0;
+    int implemented = ahciPortsImplemented();
     memset(abar, 0, AHCI_BAR_SIZE);
     // U59: CAP was 0x00200001, which did not match the comment or PI. CAP.NP
     // (bits 4:0) is 0-BASED, so the 1 in the low bits advertised TWO ports while
     // PI declared only port 0 -- an inconsistency storahci can see. CAP.NCS
     // (bits 12:8) is also 0-based and was 0, i.e. a single command slot, which is
     // legal but unlike any real controller and leaves a driver no room to queue.
-    // Now: ISS=2 (Gen2, bits 23:20), NCS=31 (32 slots), NP=0 (1 port, matching PI).
+    // ISS=2 (Gen2, bits 23:20), NCS=31 (32 slots), NP = implemented-1 (0-BASED,
+    // and it has to agree with PI or storahci can see the inconsistency).
     // The command-issue path already scans all 32 PxCI bits, so 32 slots is safe.
-    *(UINT32 *)(abar + 0x00) = 0x00201F00;
+    if (implemented < 1) implemented = 1;
+    *(UINT32 *)(abar + 0x00) = 0x00201F00 | (UINT32)(implemented - 1);
     *(UINT32 *)(abar + 0x04) = 0x00000000; // GHC: AE/HR/IE all clear until guest sets them
-    *(UINT32 *)(abar + 0x0C) = 0x00000001; // PI: port 0 implemented
     *(UINT32 *)(abar + 0x10) = 0x00010301; // VS: AHCI 1.3.1
 
-    unsigned char *port = abar + 0x100;
-    *(UINT32 *)(port + 0x20) = 0x00000050; // PxTFD: DRDY|DSC, no error
-    *(UINT32 *)(port + 0x24) = 0x00000101; // PxSIG: SATA (non-ATAPI) device
-    *(UINT32 *)(port + 0x28) = 0x00000123; // PxSSTS: DET=3(present), SPD=2(3Gbps), IPM=1(active)
+    // Only ports with a device behind them are advertised. Declaring a port
+    // implemented but empty makes the driver probe something that will never
+    // answer, and it would count toward NP above for no reason.
+    for (p = 0; p < AHCI_PORT_COUNT; p++) {
+        unsigned char *port;
+        if (!ahciPorts[p].present) continue;
+        pi |= (1u << p);
+        port = abar + 0x100 + (UINT32)p * 0x80;
+        *(UINT32 *)(port + 0x20) = 0x00000050; // PxTFD: DRDY|DSC, no error
+        // PxSIG stays the plain-SATA-disk signature even for an ISO: the ISO is
+        // presented as a block device with 2048-byte sectors rather than as an
+        // ATAPI packet device, which is what makes EDK2's El Torito parser pick
+        // it up. Reporting 0xEB140101 here would promise a packet interface this
+        // does not implement.
+        *(UINT32 *)(port + 0x24) = 0x00000101;
+        *(UINT32 *)(port + 0x28) = 0x00000123; // PxSSTS: DET=3(present), SPD=2(3Gbps), IPM=1(active)
+    }
+    *(UINT32 *)(abar + 0x0C) = pi ? pi : 0x00000001; // PI
 }
 
 // U58: trap the ABAR as real MMIO instead of leaving it as plain guest RAM.
@@ -5860,7 +5931,10 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
 // behavior since it currently works precisely because LBA48 isn't
 // advertised. This wrapper overlays only the extra capability words the
 // AHCI path needs, layered on top of the same shared base fields.
-void ahciFillIdentify(unsigned char *buf, UINT64 sectors) {
+// sectorSize is a PARAMETER rather than the ataSectorSize global: with two ports
+// the ISO (2048-byte sectors) and the hard disk (512) are attached at the same
+// time, so "the" sector size no longer exists.
+void ahciFillIdentify(unsigned char *buf, UINT64 sectors, UINT32 sectorSize) {
     ataFillIdentify(buf, sectors);
     UINT16 *id = (UINT16 *)buf;
     id[49] |= 0x0100;  // bit8: DMA supported (bit9 LBA already set by ataFillIdentify)
@@ -5884,8 +5958,8 @@ void ahciFillIdentify(unsigned char *buf, UINT64 sectors) {
     // BlockSize==2048 before it will even attempt to recognize a CD-ROM
     // boot catalog, which is how Windows installer media conventionally
     // gets consumed.
-    if (ataSectorSize != 512) {
-        UINT32 sectorSizeWords = ataSectorSize / 2;
+    if (sectorSize != 512) {
+        UINT32 sectorSizeWords = sectorSize / 2;
         id[106] = 0x4000 | 0x1000; // bit14 | bit12 (bit15 stays 0)
         id[117] = (UINT16)(sectorSizeWords & 0xFFFF);
         id[118] = (UINT16)((sectorSizeWords >> 16) & 0xFFFF);
@@ -5939,11 +6013,17 @@ UINT32 ahciGatherFromPrdt(unsigned char *prdt, UINT16 prdtl, unsigned char *dst,
 // with real RAM and polling it here instead works because EDK2's AHCI
 // driver itself polls PxCI/PxTFD for command completion during boot rather
 // than relying on interrupts.
-void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
-    if (!ahciAbarMapped || !ataDiskFile) return;
-    unsigned char *abar = (unsigned char *)ahciAbarMemory;
+static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
+                            int portIndex, AhciPortDevice *dev);
 
-    UINT32 ghc = *(UINT32 *)(abar + 0x04);
+void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
+    int p;
+    unsigned char *abar;
+    UINT32 ghc;
+    if (!ahciAbarMapped || ahciPortsImplemented() == 0) return;
+    abar = (unsigned char *)ahciAbarMemory;
+
+    ghc = *(UINT32 *)(abar + 0x04);
     if (ghc & 0x1) { // GHC.HR: HBA reset requested -- completes instantly
         ahciInitAbarRegisters(abar);
         return;
@@ -5954,7 +6034,19 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
         if (!aeLogged) { aeLogged = 1; printf("[ahci] GHC.AE set -- controller enabled\n"); fflush(stdout); }
     }
 
-    unsigned char *port = abar + 0x100; // port 0 register block
+    // Every implemented port is serviced on each pass. Each has its own command
+    // list, FIS receive area and backing file, so they are entirely independent
+    // -- the guest can have a read outstanding on the ISO and a write on the
+    // disk at the same time, which is exactly what an install does.
+    for (p = 0; p < AHCI_PORT_COUNT; p++) {
+        if (!ahciPorts[p].present) continue;
+        ahciServicePort(partition, abar, p, &ahciPorts[p]);
+    }
+}
+
+static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
+                            int portIndex, AhciPortDevice *dev) {
+    unsigned char *port = abar + 0x100 + (UINT32)portIndex * 0x80;
     UINT32 cmd = *(UINT32 *)(port + 0x18); // PxCMD
 
     // Mirror ST<->CR and FRE<->FR in both directions so "wait for engine
@@ -6021,15 +6113,30 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
             rfis[12] = 0x01; // Sector count low -> signature byte
             *(UINT32 *)(port + 0x20) = 0x00000050; // PxTFD reflects the FIS status
             *(UINT32 *)(port + 0x10) |= 0x1;       // PxIS.DHRS -- D2H FIS received
-            printf("[ahci] posted initial D2H Register FIS to PxFB=0x%X (signature 0x00000101)\n", fb);
-            fflush(stdout);
+            // BOUNDED. The driver stops and restarts a port around every
+            // command, so this fires constantly -- and when stdout is a console
+            // each printf blocks the VM thread on console rendering, which is
+            // enough to distort the very boot being measured. A handful per port
+            // is all that is needed to confirm the device was announced.
+            static int d2hLogged[AHCI_PORT_COUNT];
+            if (d2hLogged[portIndex] < 3) {
+                d2hLogged[portIndex]++;
+                printf("[ahci] port %d: posted initial D2H Register FIS to PxFB=0x%X "
+                       "(signature 0x00000101)\n", portIndex, fb);
+                fflush(stdout);
+            }
         }
     }
 
     if (!(cmd & 0x1)) return; // ST not set, port not started
     {
-        static int stLogged = 0;
-        if (!stLogged) { stLogged = 1; printf("[ahci] PxCMD.ST set -- port 0 started\n"); fflush(stdout); }
+        static int stLogged = 0;      // bitmask, one bit per port
+        if (!(stLogged & (1 << portIndex))) {
+            stLogged |= (1 << portIndex);
+            printf("[ahci] PxCMD.ST set -- port %d started (%s)\n",
+                   portIndex, dev->path);
+            fflush(stdout);
+        }
     }
 
     UINT32 ci = *(UINT32 *)(port + 0x38); // PxCI
@@ -6117,7 +6224,7 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
 
     if (ataCmd == 0xEC) { // IDENTIFY DEVICE
         unsigned char idBuf[512];
-        ahciFillIdentify(idBuf, ataDiskSectors);
+        ahciFillIdentify(idBuf, dev->sectors, dev->sectorSize);
         bytesTransferred = ahciScatterToPrdt(prdt, prdtl, idBuf, 512);
     } else if (ataCmd == 0x25 || ataCmd == 0xC8 || ataCmd == 0x20 || ataCmd == 0x24) {
         // READ DMA EXT / READ DMA / READ SECTORS / READ SECTORS EXT -- AHCI
@@ -6129,28 +6236,33 @@ void ahciProcessPendingCommands(WHV_PARTITION_HANDLE partition) {
         // own device probing/mode negotiation -- confirmed via trace after
         // fixing the DHRS staleness bug: without this, those reads
         // silently returned no data at all.
-        if ((lba + sectorCount) > ataDiskSectors || (UINT64)sectorCount * ataSectorSize > ATA_MAX_TRANSFER) {
+        if ((lba + sectorCount) > dev->sectors || (UINT64)sectorCount * dev->sectorSize > ATA_MAX_TRANSFER) {
             ok = 0;
         } else {
-            _fseeki64(ataDiskFile, (long long)lba * ataSectorSize, SEEK_SET);
-            fread(ataDataBuffer, 1, (size_t)sectorCount * ataSectorSize, ataDiskFile);
-            bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, sectorCount * ataSectorSize);
+            _fseeki64(dev->file, (long long)lba * dev->sectorSize, SEEK_SET);
+            fread(ataDataBuffer, 1, (size_t)sectorCount * dev->sectorSize, dev->file);
+            bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, sectorCount * dev->sectorSize);
         }
     } else if (ataCmd == 0x35 || ataCmd == 0xCA || ataCmd == 0x30 || ataCmd == 0x34) {
         // WRITE DMA EXT / WRITE DMA / WRITE SECTORS / WRITE SECTORS EXT -- see
         // the read-side comment above for why the PIO opcodes need the same
         // handling as their DMA counterparts here.
-        if ((lba + sectorCount) > ataDiskSectors || (UINT64)sectorCount * ataSectorSize > ATA_MAX_TRANSFER) {
+        if ((lba + sectorCount) > dev->sectors || (UINT64)sectorCount * dev->sectorSize > ATA_MAX_TRANSFER) {
+            ok = 0;
+        } else if (dev->sectorSize != 512) {
+            // Read-only medium: an ISO is opened "rb" and must never be written.
+            // Reported as an ABRT rather than silently succeeding, so a driver
+            // that tries gets a real error instead of believing the write landed.
             ok = 0;
         } else {
-            UINT32 gathered = ahciGatherFromPrdt(prdt, prdtl, ataDataBuffer, sectorCount * ataSectorSize);
-            _fseeki64(ataDiskFile, (long long)lba * ataSectorSize, SEEK_SET);
-            fwrite(ataDataBuffer, 1, gathered, ataDiskFile);
-            fflush(ataDiskFile);
+            UINT32 gathered = ahciGatherFromPrdt(prdt, prdtl, ataDataBuffer, sectorCount * dev->sectorSize);
+            _fseeki64(dev->file, (long long)lba * dev->sectorSize, SEEK_SET);
+            fwrite(ataDataBuffer, 1, gathered, dev->file);
+            fflush(dev->file);
             bytesTransferred = gathered;
         }
     } else if (ataCmd == 0xEA || ataCmd == 0xE7) { // FLUSH CACHE EXT / FLUSH CACHE
-        fflush(ataDiskFile);
+        fflush(dev->file);
     }
     // Other commands (e.g. SET FEATURES) are silently accepted as no-ops --
     // matches how the boot-time driver doesn't strictly need them to succeed.
@@ -8912,24 +9024,15 @@ int main(int argc, char *argv[]) {
 
     // --- BOOT DEVICE SELECTION -------------------------------------------
     //
-    // An ISO, when supplied, takes the port and the guest boots from it.
-    //
-    // IMPORTANT LIMITATION, and it is a real one rather than an oversight: the
-    // AHCI controller here implements exactly ONE port (PI=0x1, see
-    // ahciInitAbarRegisters), so the ISO and the hard disk cannot both be
-    // attached. Booting Windows installer media therefore gets you as far as the
-    // installer, which then has no disk to install ONTO. Presenting both needs a
-    // second port with its own command engine, FIS receive area, signature and
-    // IDENTIFY -- a much larger change than this, and one that touches the AHCI
-    // paths that took U53-U62 to stabilise.
+    // Both media are attached when both are configured: the ISO on port 0 (which
+    // firmware enumerates first, so it boots) and the hard disk on port 1 as
+    // somewhere to install TO. That combination is the whole point -- with one
+    // port, booting installer media left the installer with no target disk.
     //
     // Falls back to the disk if the ISO cannot be opened, so a stale ISO path in
     // the manager degrades to "boots the hard disk" instead of "boots nothing".
     const char *bootPath = isoPath ? isoPath : diskPath;
-    if (isoPath && diskPath) {
-        printf("[boot] ISO supplied -- booting from %s; the hard disk %s is NOT "
-               "attached (single AHCI port)\n", isoPath, diskPath);
-    }
+    const char *secondPath = NULL;
     if (bootPath && isoPath) {
         FILE *probe = fopen(isoPath, "rb");
         if (!probe) {
@@ -8937,55 +9040,76 @@ int main(int argc, char *argv[]) {
             bootPath = diskPath;
         } else {
             fclose(probe);
+            // BOTH get attached now: the ISO boots on port 0, the hard disk
+            // rides along on port 1 as somewhere to install TO. Firmware
+            // enumerates in port order, so the ISO is tried first without
+            // needing a boot-order setting anywhere.
+            secondPath = diskPath;
         }
     }
 
-    if (bootPath) {
-        // Open .iso images read-only: installer/boot media should never
-        // legitimately be written to this early (UdfDxe + the boot
-        // manager only need to read it), and opening read-write would
-        // risk actually corrupting a multi-GB source ISO if anything
-        // upstream ever issues an unexpected write. Any real write
-        // command against a read-only FILE* just fails harmlessly (we
-        // don't check fwrite's return value on that path) rather than
-        // touching the file.
-        //
-        // Keyed on the EXTENSION, not on which argument it arrived in, so an
-        // ISO passed the old way (as argv[3]) behaves exactly as it always has.
-        size_t bootPathLen = strlen(bootPath);
-        int isIso = bootPathLen >= 4 && _stricmp(bootPath + bootPathLen - 4, ".iso") == 0;
-        ataSectorSize = isIso ? 2048 : 512;
-        ataDiskFile = fopen(bootPath, isIso ? "rb" : "r+b");
-        if (ataDiskFile) {
-            _fseeki64(ataDiskFile, 0, SEEK_END);
-            UINT64 fileSize = (UINT64)_ftelli64(ataDiskFile);
-            ataDiskSectors = fileSize / ataSectorSize;
+    {
+        const char *slots[AHCI_PORT_COUNT] = { bootPath, secondPath };
+        int slot;
+        for (slot = 0; slot < AHCI_PORT_COUNT; slot++) {
+            const char *path = slots[slot];
+            AhciPortDevice *dev = &ahciPorts[slot];
+            size_t pathLen;
+            int isIso;
+            UINT64 fileSize;
 
-            // Fixed-format VHDs append a 512-byte "conectix" footer after
-            // the real disk data. We do no VHD-format parsing elsewhere --
-            // disk I/O is plain fseek+fread at lba*ataSectorSize -- so
-            // without this check that footer gets presented to the guest
-            // as one extra, bogus final sector: IDENTIFY would report a
-            // capacity one sector too large, and any guest read of the
-            // true last LBA would return VHD metadata instead of real (or
-            // absent) disk content, rather than the disk's actual last
-            // data sector. Not applicable to ISOs (they're never VHDs).
+            if (!path) continue;
+            pathLen = strlen(path);
+            // Keyed on the EXTENSION, not on which argument it arrived in, so an
+            // ISO passed the old way (as argv[3]) behaves exactly as it always has.
+            isIso = pathLen >= 4 && _stricmp(path + pathLen - 4, ".iso") == 0;
+
+            // Open .iso images read-only: installer/boot media should never
+            // legitimately be written to (UdfDxe and the boot manager only read
+            // it), and opening read-write would risk corrupting a multi-GB
+            // source ISO if anything upstream ever issued a write.
+            dev->file = fopen(path, isIso ? "rb" : "r+b");
+            if (!dev->file) {
+                printf("Failed to open %s -- port %d left empty\n", path, slot);
+                continue;
+            }
+            _fseeki64(dev->file, 0, SEEK_END);
+            fileSize = (UINT64)_ftelli64(dev->file);
+            dev->sectorSize = isIso ? 2048 : 512;
+            dev->sectors = fileSize / dev->sectorSize;
+            dev->present = 1;
+            _snprintf_s(dev->path, sizeof(dev->path), _TRUNCATE, "%s", path);
+
+            // Fixed-format VHDs append a 512-byte "conectix" footer after the
+            // real disk data. No VHD parsing happens anywhere else -- disk I/O
+            // is plain fseek+fread at lba*sectorSize -- so without this check
+            // that footer is presented to the guest as one extra, bogus final
+            // sector: IDENTIFY would report a capacity one sector too large, and
+            // a read of the true last LBA would return VHD metadata instead of
+            // disk content. Not applicable to ISOs (they're never VHDs).
             if (!isIso && fileSize >= 512) {
                 unsigned char footerCookie[8];
-                _fseeki64(ataDiskFile, -512, SEEK_END);
-                if (fread(footerCookie, 1, 8, ataDiskFile) == 8 &&
+                _fseeki64(dev->file, -512, SEEK_END);
+                if (fread(footerCookie, 1, 8, dev->file) == 8 &&
                     memcmp(footerCookie, "conectix", 8) == 0) {
-                    ataDiskSectors -= 1;
+                    dev->sectors -= 1;
                     printf("Detected Fixed VHD footer -- excluding it from disk geometry\n");
                 }
             }
 
-            printf("Attached %s %s (%llu sectors of %u bytes)\n",
-                   isIso ? "ISO" : "disk", bootPath,
-                   (unsigned long long)ataDiskSectors, ataSectorSize);
-        } else {
-            printf("Failed to open %s -- booting without a disk\n", bootPath);
+            printf("Attached %s to AHCI port %d: %s (%llu sectors of %u bytes)\n",
+                   isIso ? "ISO" : "disk", slot, path,
+                   (unsigned long long)dev->sectors, dev->sectorSize);
+
+            // Port 0 also backs the legacy IDE path and the existing globals.
+            if (slot == 0) {
+                ataDiskFile = dev->file;
+                ataDiskSectors = dev->sectors;
+                ataSectorSize = dev->sectorSize;
+            }
         }
+        if (ahciPortsImplemented() == 0)
+            printf("No bootable media attached -- starting without a disk\n");
     }
 
     QueryPerformanceFrequency(&perfFrequency);
