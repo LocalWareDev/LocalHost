@@ -20,6 +20,15 @@ import ctypes
 import ctypes.wintypes as wintypes
 import threading
 from pathlib import Path
+
+# Optional: powers the App Utilisation panel's CPU/RAM/Disk figures. The panel
+# degrades to "unavailable" rather than the app failing to start, since resource
+# monitoring is a convenience and running VMs is not.
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 import PySide6
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
@@ -27,7 +36,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QMenuBar, QStatusBar, QStackedWidget,
     QDialog, QFormLayout, QLineEdit, QSpinBox, QComboBox, QMessageBox,
     QFileDialog, QDialogButtonBox, QMenu, QInputDialog, QAbstractItemView,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QProgressBar
 )
 from PySide6.QtGui import QAction, QIcon, QDesktopServices
 from PySide6.QtCore import Qt, QSize, QStandardPaths, QProcess, QTimer, Signal, QUrl
@@ -568,6 +577,283 @@ def _terminate_process(pid):
 # ---------------------------------------------------------------------------
 # Dummy VM data model — swap this out for your real vmrun/Hyper-V backend
 # ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# App Utilisation sampling
+# ----------------------------------------------------------------------
+# GPU usage per process, read the same way Task Manager reads it: the PDH
+# "GPU Engine" counter set, whose instance names embed the owning PID.
+#
+# psutil has no GPU support at all, and the vendor tools are no use here --
+# nvidia-smi is NVIDIA-only and generally cannot attribute usage to a process
+# on consumer drivers. PDH is the only source that is both vendor-neutral and
+# per-process, which is exactly what an "App Utilisation" panel needs.
+#
+# An instance name looks like:
+#   pid_1234_luid_0x00000000_0x0000ABCD_phys_0_eng_0_engtype_3D
+# so the PID is matched from the front and the engine type from the back.
+PDH_FMT_DOUBLE = 0x00000200
+PDH_MORE_DATA = 0x800007D2
+_GPU_COUNTER_PATH = r"\GPU Engine(*)\Utilization Percentage"
+_GPU_INSTANCE_RE = re.compile(r"^pid_(\d+)_.*_engtype_(.+)$", re.IGNORECASE)
+
+
+class PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+class PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", PDH_FMT_COUNTERVALUE)]
+
+
+class _GpuUsageCounter:
+    """Per-process GPU utilisation via PDH. Unavailable is a normal outcome
+    (no GPU counters on older Windows, or in some remote sessions) -- callers
+    get None and show a dash rather than a wrong number."""
+
+    def __init__(self):
+        self.available = False
+        self._query = None
+        self._counter = None
+        try:
+            self._pdh = ctypes.WinDLL("pdh.dll")
+        except OSError:
+            return
+        # PDH_STATUS must be read as UNSIGNED. The status codes are defined as
+        # 0x8000xxxx, and under ctypes' default signed-int return type
+        # PDH_MORE_DATA comes back as -2147481646 -- so the "buffer too small"
+        # check silently never matches and the counter array is never fetched.
+        for fn in ("PdhOpenQueryW", "PdhAddEnglishCounterW", "PdhCollectQueryData",
+                   "PdhGetFormattedCounterArrayW", "PdhCloseQuery"):
+            getattr(self._pdh, fn).restype = wintypes.DWORD
+        self._pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p,
+                                            ctypes.POINTER(ctypes.c_void_p)]
+        self._pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                                    ctypes.c_void_p,
+                                                    ctypes.POINTER(ctypes.c_void_p)]
+        self._pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        self._pdh.PdhGetFormattedCounterArrayW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        self._pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+
+        query = ctypes.c_void_p()
+        if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(query)) != 0:
+            return
+        counter = ctypes.c_void_p()
+        # The *English* variant so this keeps working on localised Windows,
+        # where the display name of the counter is translated.
+        if self._pdh.PdhAddEnglishCounterW(query, _GPU_COUNTER_PATH, 0,
+                                           ctypes.byref(counter)) != 0:
+            self._pdh.PdhCloseQuery(query)
+            return
+        self._query = query
+        self._counter = counter
+        # Utilisation is a rate, so the first collection only establishes a
+        # baseline -- a single sample can never produce a value.
+        self._pdh.PdhCollectQueryData(query)
+        self.available = True
+
+    def sample(self, pids):
+        """GPU percent attributable to `pids`, or None if unavailable.
+
+        Per engine type, usage is summed across the processes we care about;
+        the reported figure is then the MAX across engine types rather than
+        their sum. Summing 3D + Copy + VideoDecode routinely exceeds 100% while
+        the GPU is nowhere near saturated, because the engines run in parallel.
+        Max is what Task Manager shows and is the honest answer to "how busy is
+        the GPU on our behalf".
+        """
+        if not self.available or not pids:
+            return None if not self.available else 0.0
+        if self._pdh.PdhCollectQueryData(self._query) != 0:
+            return None
+
+        size = wintypes.DWORD(0)
+        count = wintypes.DWORD(0)
+        status = self._pdh.PdhGetFormattedCounterArrayW(
+            self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), None)
+        if status != PDH_MORE_DATA or size.value == 0:
+            return 0.0        # no GPU engine instances at all right now
+
+        buf = ctypes.create_string_buffer(size.value)
+        status = self._pdh.PdhGetFormattedCounterArrayW(
+            self._counter, PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), buf)
+        if status != 0:
+            return None
+
+        items = ctypes.cast(
+            buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W * count.value)).contents
+        wanted = {str(p) for p in pids}
+        per_engine = {}
+        for item in items:
+            if not item.szName:
+                continue
+            m = _GPU_INSTANCE_RE.match(item.szName)
+            if not m or m.group(1) not in wanted:
+                continue
+            value = item.FmtValue.doubleValue
+            if value <= 0:
+                continue
+            engine = m.group(2)
+            per_engine[engine] = per_engine.get(engine, 0.0) + value
+        if not per_engine:
+            return 0.0
+        return min(100.0, max(per_engine.values()))
+
+    def close(self):
+        if self._query is not None:
+            self._pdh.PdhCloseQuery(self._query)
+            self._query = None
+            self.available = False
+
+
+class _AppUsageSampler:
+    """Aggregate CPU/RAM/Disk/GPU across this app and every VM it launched.
+
+    Deliberately aggregate: the question the panel answers is "what is LocalHost
+    costing my machine right now", so the GUI process is counted alongside the
+    hypervisors rather than pretending the VMs are the whole cost.
+    """
+
+    def __init__(self):
+        self._procs = {}            # pid -> psutil.Process, kept alive between
+                                    # samples so cpu_percent() has a baseline
+        self._last_io_bytes = None
+        self._last_io_time = None
+        self._disk_peak = 1.0       # bytes/sec, for auto-scaling the disk bar
+        self.gpu = _GpuUsageCounter()
+        self._cpu_count = (psutil.cpu_count(logical=True) or 1) if psutil else 1
+        self._total_ram = psutil.virtual_memory().total if psutil else 0
+
+    def _process_for(self, pid):
+        proc = self._procs.get(pid)
+        if proc is None:
+            try:
+                proc = psutil.Process(pid)
+                proc.cpu_percent(None)   # prime the baseline; first read is 0.0
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                return None
+            self._procs[pid] = proc
+        return proc
+
+    def sample(self, vm_pids):
+        """Returns a dict of current usage. `vm_pids` is the running VMs'
+        Hypervisor.exe PIDs; this process is always included."""
+        result = {"cpu": None, "ram_bytes": 0, "ram_percent": None,
+                  "disk_bps": None, "gpu": None, "vm_count": len(vm_pids),
+                  "available": psutil is not None}
+        pids = list(dict.fromkeys([os.getpid()] + list(vm_pids)))
+
+        # GPU is independent of psutil, so it is sampled even if psutil is gone.
+        result["gpu"] = self.gpu.sample(pids)
+        if psutil is None:
+            return result
+
+        # Drop processes that have exited, so their handles do not accumulate
+        # across a session of powering VMs on and off.
+        for dead in [p for p in self._procs if p not in pids]:
+            self._procs.pop(dead, None)
+
+        cpu_total = 0.0
+        ram_total = 0
+        io_total = 0
+        have_io = False
+        for pid in pids:
+            proc = self._process_for(pid)
+            if proc is None:
+                continue
+            try:
+                cpu_total += proc.cpu_percent(None)
+                ram_total += proc.memory_info().rss
+                io = proc.io_counters()
+                io_total += io.read_bytes + io.write_bytes
+                have_io = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                self._procs.pop(pid, None)
+
+        # psutil reports process CPU against ONE core, so a busy 4-thread VM
+        # reads 400%. Normalise to whole-machine percent, which is what the
+        # meter and Task Manager both mean by "CPU".
+        result["cpu"] = min(100.0, cpu_total / self._cpu_count)
+        result["ram_bytes"] = ram_total
+        if self._total_ram:
+            result["ram_percent"] = min(100.0, ram_total * 100.0 / self._total_ram)
+
+        if have_io:
+            now = time.monotonic()
+            if self._last_io_bytes is not None:
+                elapsed = now - self._last_io_time
+                # Counters are monotonic per process, but the SET of processes
+                # changes as VMs start and stop, so a total can legitimately go
+                # down. Clamp rather than report a negative rate.
+                delta = max(0, io_total - self._last_io_bytes)
+                if elapsed > 0:
+                    result["disk_bps"] = delta / elapsed
+                    self._disk_peak = max(self._disk_peak, result["disk_bps"])
+            self._last_io_bytes = io_total
+            self._last_io_time = now
+        return result
+
+    @property
+    def disk_peak(self):
+        return self._disk_peak
+
+    def close(self):
+        self.gpu.close()
+
+
+class _UsageMeter(QWidget):
+    """One labelled row of the App Utilisation panel: name, current value, bar."""
+
+    def __init__(self, name, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        self.name_label = QLabel(name)
+        self.name_label.setObjectName("UsageName")
+        self.value_label = QLabel("--")
+        self.value_label.setObjectName("UsageValue")
+        self.value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        top.addWidget(self.name_label)
+        top.addStretch(1)
+        top.addWidget(self.value_label)
+        layout.addLayout(top)
+
+        self.bar = QProgressBar()
+        self.bar.setObjectName("UsageBar")
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(6)
+        layout.addWidget(self.bar)
+
+    def set_value(self, percent, text):
+        """percent may be None -- the bar empties and the value shows a dash,
+        which is how 'not measurable' is distinguished from a genuine zero."""
+        if percent is None:
+            self.bar.setValue(0)
+            self.value_label.setText(text or "--")
+            return
+        self.bar.setValue(int(max(0, min(100, round(percent)))))
+        self.value_label.setText(text)
+
+
+def _format_bytes(n):
+    if n is None:
+        return "--"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TB"
+
+
 class VM:
     def __init__(self, name, memory="4 GB", processors=2, hard_disk="60 GB",
                  cdrom="Auto detect", network="NAT", usb="Present",
@@ -1541,7 +1827,28 @@ class LocalHostWindow(QMainWindow):
         tree_frame_layout = QVBoxLayout(tree_frame)
         tree_frame_layout.setContentsMargins(0, 0, 0, 0)
         tree_frame_layout.addWidget(self.vm_tree)
-        library_layout.addWidget(tree_frame)
+
+        # The tree and the usage panel share the sidebar through a splitter, so
+        # the divider can be dragged instead of the panel permanently costing
+        # the library a fixed slice of height.
+        usage_panel = self._build_usage_panel()
+        left_split = QSplitter(Qt.Vertical)
+        left_split.addWidget(tree_frame)
+        left_split.addWidget(usage_panel)
+        left_split.setStretchFactor(0, 1)   # the tree absorbs new space
+        left_split.setStretchFactor(1, 0)
+        # NEITHER pane may collapse. Marking only the tree non-collapsible left
+        # the panel collapsible, and on a display where DPI scaling makes the
+        # logical sidebar short, the splitter duly collapsed it to zero height --
+        # the panel was built, laid out and "visible", just squeezed out of
+        # existence. The minimum height is what actually guarantees it a slice.
+        left_split.setCollapsible(0, False)
+        left_split.setCollapsible(1, False)
+        tree_frame.setMinimumHeight(120)
+        library_layout.addWidget(left_split)
+        # Sized after the widget is parented, so the splitter honours it against
+        # real geometry rather than the pre-layout default.
+        left_split.setSizes([420, usage_panel.sizeHint().height()])
 
         library_panel.setMinimumWidth(220)
         library_panel.setMaximumWidth(320)
@@ -1624,6 +1931,96 @@ class LocalHostWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         self.setCentralWidget(splitter)
+
+    def _build_usage_panel(self):
+        """The App Utilisation panel: what LocalHost and its running VMs are
+        costing the machine, so the answer doesn't require Task Manager."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(4)
+
+        header = QLabel("App Utilisation")
+        header.setObjectName("PanelHeader")
+        layout.addWidget(header)
+
+        frame = QFrame()
+        frame.setObjectName("UsageFrame")
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(10, 8, 10, 8)
+        frame_layout.setSpacing(7)
+
+        self.usage_meters = {
+            "cpu": _UsageMeter("CPU"),
+            "ram": _UsageMeter("RAM"),
+            "disk": _UsageMeter("Disk"),
+            "gpu": _UsageMeter("GPU"),
+        }
+        for key in ("cpu", "ram", "disk", "gpu"):
+            frame_layout.addWidget(self.usage_meters[key])
+
+        self.usage_scope_label = QLabel("No VMs running")
+        self.usage_scope_label.setObjectName("UsageScope")
+        frame_layout.addWidget(self.usage_scope_label)
+
+        layout.addWidget(frame)
+        # Four meters plus the scope line have a real minimum size; without this
+        # the splitter is free to squeeze the panel away to nothing.
+        panel.setMinimumHeight(frame.sizeHint().height() + header.sizeHint().height() + 12)
+
+        self.usage_sampler = _AppUsageSampler()
+        if psutil is None:
+            self.usage_scope_label.setText("psutil not installed")
+        elif not self.usage_sampler.gpu.available:
+            # Say so rather than showing a permanent 0% that looks like a bug.
+            self.usage_meters["gpu"].set_value(None, "n/a")
+
+        self._usage_timer = QTimer(self)
+        self._usage_timer.timeout.connect(self._update_app_usage)
+        self._usage_timer.start(1000)
+        return panel
+
+    def _update_app_usage(self):
+        # Skipped while the window is minimised or hidden: sampling costs a
+        # handful of syscalls per VM per second, and nobody is reading it.
+        if self.isMinimized() or not self.isVisible():
+            return
+        try:
+            usage = self.usage_sampler.sample(list(self.processes.values()))
+        except Exception:
+            # Monitoring must never be able to take the app down with it.
+            return
+
+        if not usage["available"]:
+            return
+
+        cpu = usage["cpu"]
+        self.usage_meters["cpu"].set_value(cpu, "--" if cpu is None else f"{cpu:.0f}%")
+
+        ram_pct = usage["ram_percent"]
+        self.usage_meters["ram"].set_value(ram_pct, _format_bytes(usage["ram_bytes"]))
+
+        disk = usage["disk_bps"]
+        if disk is None:
+            self.usage_meters["disk"].set_value(None, "--")
+        else:
+            # No fixed ceiling exists for disk throughput, so the bar is scaled
+            # against the highest rate seen this session -- it shows relative
+            # activity, while the figure beside it stays absolute.
+            peak = max(self.usage_sampler.disk_peak, 1.0)
+            self.usage_meters["disk"].set_value(
+                disk * 100.0 / peak, f"{_format_bytes(disk)}/s")
+
+        gpu = usage["gpu"]
+        if gpu is None:
+            self.usage_meters["gpu"].set_value(None, "n/a")
+        else:
+            self.usage_meters["gpu"].set_value(gpu, f"{gpu:.0f}%")
+
+        n = usage["vm_count"]
+        self.usage_scope_label.setText(
+            "LocalHost only" if n == 0 else
+            f"LocalHost + {n} VM" if n == 1 else f"LocalHost + {n} VMs")
 
     def _build_home_page(self):
         home_page = QWidget()
@@ -1851,6 +2248,7 @@ class LocalHostWindow(QMainWindow):
             if choice == "cancel":
                 event.ignore()
                 return
+
             if choice in ("background", "suspend"):
                 # Pop every embedded VM window out of the preview pane and
                 # hide it -- otherwise it would either get destroyed along
@@ -1889,6 +2287,14 @@ class LocalHostWindow(QMainWindow):
                 # choice == "shutdown"
                 for pid in list(self.processes.values()):
                     _terminate_process(pid)
+
+        # Past the point of no return -- a cancelled close returns above, so
+        # reaching here means the window really is going away. Stop sampling and
+        # release the PDH query handle.
+        if hasattr(self, "_usage_timer"):
+            self._usage_timer.stop()
+        if hasattr(self, "usage_sampler"):
+            self.usage_sampler.close()
 
         self.save_library()
         if getattr(self, "_keyboard_hook", None):
@@ -2873,6 +3279,23 @@ class LocalHostWindow(QMainWindow):
             QFrame#DevicesFrame {
                 border: 1px solid #3c3c3c;
                 border-radius: 2px;
+            }
+
+            QFrame#UsageFrame {
+                border: 1px solid #3c3c3c;
+                border-radius: 2px;
+            }
+            QLabel#UsageName { color: #d0d0d0; font-size: 12px; }
+            QLabel#UsageValue { color: #8ab4f8; font-size: 12px; font-weight: 600; }
+            QLabel#UsageScope { color: #808080; font-size: 11px; padding-top: 2px; }
+            QProgressBar#UsageBar {
+                background-color: #2a2a2a;
+                border: none;
+                border-radius: 3px;
+            }
+            QProgressBar#UsageBar::chunk {
+                background-color: #4fa3ff;
+                border-radius: 3px;
             }
 
             QLabel#HomeTitle { font-size: 28px; font-weight: 600; color: #f0f0f0; }
