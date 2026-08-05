@@ -813,6 +813,17 @@ static void u40Dump(int pass, const char *why) {
                     printf(" %s", leaf);
                 }
                 printf("]");
+                // Sixteen bytes of the image at this page. A RELEASE OVMF strips
+                // the CodeView record, so there is no name to read -- but the FV
+                // still holds every module's PE32, and these bytes identify which
+                // one this is by matching at the same RVA. Twenty different 16KB
+                // drivers ship in this firmware, so size alone settles nothing.
+                if (guestMemory && va + 16 <= guestMemSize) {
+                    const unsigned char *b = (const unsigned char *)guestMemory + va;
+                    int bi;
+                    printf(" rva=0x%llX bytes=", (unsigned long long)(va - imgBase));
+                    for (bi = 0; bi < 16; bi++) printf("%02X", b[bi]);
+                }
             }
         }
         printf("\n");
