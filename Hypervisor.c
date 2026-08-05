@@ -1407,6 +1407,7 @@ static int ahciPortsImplemented(void);
 #define U61_IRQ_LOG_MAX 40
 int g_ahciIrqLogged = 0, g_ahciAckLogged = 0;
 long g_ahciIrqCount = 0; // U61: uncapped injection count, reported in the heartbeat
+long g_ahciRejected = 0; // commands we answered with ERR|ABRT -- see the reject log
 static long g_ahciLastIrqExit = 0;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
     if (!ahciAbarMemory) return;
@@ -5437,14 +5438,27 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                 // mouse stopped moving, and a stale "reporting=0" printed BEFORE
                 // the guest sent 0xF4 read exactly like the enable had never
                 // happened.
+                // KEYBOARD COUNTERS ARE IN THE TRIGGER TOO. They were not, and
+                // the line is the only place they are reported -- so a run where
+                // keystrokes flowed but no mouse activity happened printed a
+                // STALE line reading kbUser=0, which reads exactly like "the
+                // keyboard is dead". That cost a wrong conclusion during the
+                // firmware key-prompt test: the keys had in fact landed and
+                // opened the Boot Manager.
                 static long lastAux = -1, lastAuxGated = -1, lastAuxRead = -1;
+                static long lastKbUser = -1, lastKbRead = -1, lastKbIrq = -1;
                 static int lastReporting = -1, lastPortEnabled = -1;
                 if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated ||
                     g_auxBytesToGuest != lastAuxRead ||
+                    (long)g_kbUserBytes != lastKbUser || g_kbBytesToGuest != lastKbRead ||
+                    g_kbIrqSent != lastKbIrq ||
                     auxReportingEnabled != lastReporting || auxPortEnabled != lastPortEnabled) {
                     lastAux = g_auxPackets;
                     lastAuxGated = g_auxPacketsGated;
                     lastAuxRead = g_auxBytesToGuest;
+                    lastKbUser = (long)g_kbUserBytes;
+                    lastKbRead = g_kbBytesToGuest;
+                    lastKbIrq = g_kbIrqSent;
                     lastReporting = auxReportingEnabled;
                     lastPortEnabled = auxPortEnabled;
                     // kbPending is here because the status register gives the
@@ -6355,6 +6369,23 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
     }
     // Other commands (e.g. SET FEATURES) are silently accepted as no-ops --
     // matches how the boot-time driver doesn't strictly need them to succeed.
+
+    // A command we ABORT is invisible otherwise, and the failure mode it causes
+    // is indistinguishable from a hang: the firmware retries, gets ERR|ABRT
+    // again, and eventually reports a timeout with no indication that WE
+    // refused it. A 1.1MB EFI binary was once lost to exactly this (silently
+    // rejected for exceeding the transfer cap), so count and name it.
+    if (!ok) {
+        g_ahciRejected++;
+        if (g_ahciRejected <= 12) {
+            printf("[ahci-reject] port %d cmd=0x%02X lba=%llu count=%u (sectorSize=%u, "
+                   "bytes=%llu, cap=%u, devSectors=%llu) -- answered ERR|ABRT\n",
+                   portIndex, ataCmd, (unsigned long long)lba, sectorCount,
+                   dev->sectorSize, (unsigned long long)sectorCount * dev->sectorSize,
+                   ATA_MAX_TRANSFER, (unsigned long long)dev->sectors);
+            fflush(stdout);
+        }
+    }
 
     *(UINT32 *)(cmdHeader + 0x04) = bytesTransferred; // PRDBC: bytes actually transferred
     *(UINT32 *)(port + 0x38) &= ~(1u << slot);         // PxCI: clear -- command complete
