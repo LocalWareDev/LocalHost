@@ -706,6 +706,18 @@ static void u40Sample(UINT64 rip, int pass, long ec) {
     /* Table full: drop the sample rather than evict, so counts stay truthful. */
 }
 
+// Clears a pass's histogram so the next dump covers only what happened since.
+// Used to bracket the boot image's execution: reset when BDS says it is starting
+// one, dump when BDS says it failed, and the profile in between is that image
+// alone rather than the whole firmware phase averaged together.
+static void u40Reset(int pass) {
+    memset(g_ripHist[pass], 0, sizeof(g_ripHist[pass]));
+    memset(g_ripRing[pass], 0, sizeof(g_ripRing[pass]));
+    memset(g_ripRingEC[pass], 0, sizeof(g_ripRingEC[pass]));
+    g_ripRingPos[pass] = 0;
+    g_ripSamples[pass] = 0;
+}
+
 static void u40Dump(int pass, const char *why) {
     UINT64 base = g_passModuleBase[pass];
     int shown, k;
@@ -3036,6 +3048,8 @@ CRITICAL_SECTION logLock;
 // catches the first attempt even when that attempt isn't the one that
 // matters. The main loop re-installs hooks on every new occurrence.
 int efiHookStartingBoot0002Count = 0;
+// Incremented when BDS prints "failed to start Boot..." -- see appendToLog.
+int g_bdsBootFailed = 0;
 
 void appendToLog(char c) {
     EnterCriticalSection(&logLock);
@@ -3055,6 +3069,24 @@ void appendToLog(char c) {
             if (needle[matchPos] == '\0') { efiHookStartingBoot0002Count++; matchPos = 0; }
         } else {
             matchPos = (c == needle[0]) ? 1 : 0;
+        }
+    }
+
+    // BDS announcing a failed boot attempt is the ONE moment worth profiling.
+    // StartImage returns the booted image's own status, so "failed to start"
+    // carrying "Time out" means the Windows Boot Manager ran and gave up -- and
+    // the RIP histogram collected up to this instant says where it was spending
+    // that time. Sampled from the firmware's own serial output because there is
+    // no other signal for it: no debugger is attached, and kd could not see a
+    // UEFI application anyway.
+    {
+        static const char failNeedle[] = "failed to start Boot";
+        static int failPos = 0;
+        if (c == failNeedle[failPos]) {
+            failPos++;
+            if (failNeedle[failPos] == '\0') { g_bdsBootFailed++; failPos = 0; }
+        } else {
+            failPos = (c == failNeedle[0]) ? 1 : 0;
         }
     }
 }
@@ -10027,6 +10059,26 @@ int main(int argc, char *argv[]) {
             if (exitCount >= g_nextRipDump) {
                 g_nextRipDump = exitCount + U40_DUMP_INTERVAL;
                 u40Dump(u40pass, "periodic");
+            }
+            // Dump the instant BDS reports a failed boot. The periodic cadence
+            // is 250000 exits and a firmware-only boot produces roughly 135000,
+            // so without this the histogram is never printed for the phase we
+            // actually need to see.
+            {
+                static int lastBdsStart = 0, lastBdsFail = 0;
+                // Bracket the boot image: clear on "starting", dump on "failed".
+                // Without the reset the histogram is dominated by the firmware's
+                // own console and PCI enumeration work from before the image ran.
+                if (efiHookStartingBoot0002Count != lastBdsStart) {
+                    lastBdsStart = efiHookStartingBoot0002Count;
+                    u40Reset(u40pass);
+                    printf("[u40] histogram reset -- profiling the boot image from here\n");
+                    fflush(stdout);
+                }
+                if (g_bdsBootFailed != lastBdsFail) {
+                    lastBdsFail = g_bdsBootFailed;
+                    u40Dump(u40pass, "BDS reported a failed boot");
+                }
             }
         }
 
