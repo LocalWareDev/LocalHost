@@ -1510,6 +1510,13 @@ int a20Enabled = 0;        // matches real hardware's power-on default (off)
 int a20RemapCount = 0;
 int memAccessFaultCount = 0;
 int ahciCmdLogCount = 0;
+// Raised from 200. Firmware spends every one of the first couple of hundred on
+// ISO9660 volume-descriptor and directory reads, so the END of the conversation
+// -- what the boot manager asked for immediately before giving up -- was never
+// visible, and reading only the tail of a capped log produced a wrong conclusion
+// about which sectors were being fetched. A firmware-only boot issues ~530
+// commands, so this covers it whole.
+#define AHCI_CMD_LOG_MAX 2000
 int g_ahciReads = 0, g_ahciWrites = 0, g_ahciOther = 0; // U55: uncapped per-opcode tallies
 long g_ahciFwSectors = 0, g_ahciGuestSectors = 0; // U62: sectors moved, firmware vs guest
 // U60: separate budget for commands issued after the kernel loaded, i.e. Windows'
@@ -5438,27 +5445,14 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                 // mouse stopped moving, and a stale "reporting=0" printed BEFORE
                 // the guest sent 0xF4 read exactly like the enable had never
                 // happened.
-                // KEYBOARD COUNTERS ARE IN THE TRIGGER TOO. They were not, and
-                // the line is the only place they are reported -- so a run where
-                // keystrokes flowed but no mouse activity happened printed a
-                // STALE line reading kbUser=0, which reads exactly like "the
-                // keyboard is dead". That cost a wrong conclusion during the
-                // firmware key-prompt test: the keys had in fact landed and
-                // opened the Boot Manager.
                 static long lastAux = -1, lastAuxGated = -1, lastAuxRead = -1;
-                static long lastKbUser = -1, lastKbRead = -1, lastKbIrq = -1;
                 static int lastReporting = -1, lastPortEnabled = -1;
                 if (g_auxPackets != lastAux || g_auxPacketsGated != lastAuxGated ||
                     g_auxBytesToGuest != lastAuxRead ||
-                    (long)g_kbUserBytes != lastKbUser || g_kbBytesToGuest != lastKbRead ||
-                    g_kbIrqSent != lastKbIrq ||
                     auxReportingEnabled != lastReporting || auxPortEnabled != lastPortEnabled) {
                     lastAux = g_auxPackets;
                     lastAuxGated = g_auxPacketsGated;
                     lastAuxRead = g_auxBytesToGuest;
-                    lastKbUser = (long)g_kbUserBytes;
-                    lastKbRead = g_kbBytesToGuest;
-                    lastKbIrq = g_kbIrqSent;
                     lastReporting = auxReportingEnabled;
                     lastPortEnabled = auxPortEnabled;
                     // kbPending is here because the status register gives the
@@ -6066,6 +6060,15 @@ void ahciFillIdentify(unsigned char *buf, UINT64 sectors, UINT32 sectorSize) {
         id[106] = 0x4000 | 0x1000; // bit14 | bit12 (bit15 stays 0)
         id[117] = (UINT16)(sectorSizeWords & 0xFFFF);
         id[118] = (UINT16)((sectorSizeWords >> 16) & 0xFFFF);
+
+        // REMOVABLE MEDIA (word 0, bit 7), so BlockIo->Media->RemovableMedia
+        // comes out TRUE and an ISO presents as optical rather than as a fixed
+        // disk. Correct modelling -- an ISO IS removable -- but recorded here as
+        // MEASURED-NO-EFFECT so nobody re-runs the experiment: with and without
+        // this bit the boot is byte-for-byte identical (531 AHCI commands, 54
+        // reads of LBA 1407, 4 of LBA 1409, same failure). It is not the reason
+        // the ISO will not boot.
+        id[0] |= 0x0080;
     }
 }
 
@@ -6306,7 +6309,13 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
         if (ataCmd == 0x20 || ataCmd == 0x24 || ataCmd == 0xC8 || ataCmd == 0x25) g_ahciReads++;
         else if (ataCmd == 0x30 || ataCmd == 0x34 || ataCmd == 0xCA || ataCmd == 0x35) g_ahciWrites++;
         else g_ahciOther++;
-        if (ahciCmdLogCount < 200) {
+        // Cap raised from 200. Firmware consumes every one of the first couple
+        // of hundred on ISO9660 volume-descriptor and directory reads, so the
+        // END of the conversation -- what the boot manager asked for immediately
+        // before returning EFI_TIMEOUT -- has never been visible. Safe to raise
+        // because stdout here is redirected to a file, not a console; it is
+        // console rendering that blocks the VM thread, not the printf itself.
+        if (ahciCmdLogCount < AHCI_CMD_LOG_MAX) {
             printf("[ahci] cmd #%d: ataCmd=0x%02X lba=%llu count=%u prdtl=%u\n",
                    ahciCmdLogCount, ataCmd, (unsigned long long)lba, sectorCount, prdtl);
             fflush(stdout);
