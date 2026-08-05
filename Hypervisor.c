@@ -718,6 +718,69 @@ static void u40Reset(int pass) {
     g_ripSamples[pass] = 0;
 }
 
+// Names the PE image a guest address falls inside, by walking back to its
+// MZ/PE header and reading the PDB path out of the CodeView debug record.
+//
+// This is what makes the RIP histogram usable during the firmware phase. The
+// addresses there are all in the same range -- OVMF's own DXE code and every
+// image it loads live in the top of low RAM -- so "0x4F1A7000 is hot" cannot be
+// read as firmware or as the booted image without this. UEFI identity-maps, so
+// a guest virtual address indexes guest RAM directly.
+//
+// Returns 1 and fills name[] if an image was identified.
+extern void *guestMemory;      // defined with the rest of the VM state further down
+extern SIZE_T guestMemSize;
+static int u40IdentifyImage(UINT64 addr, UINT64 *outBase, UINT32 *outSize,
+                            char *name, size_t nameLen) {
+    UINT64 page;
+    if (!guestMemory || addr >= guestMemSize) return 0;
+    name[0] = '\0';
+    // Images are page-aligned; walk back a bounded distance rather than the
+    // whole of RAM so a miss costs nothing.
+    for (page = addr & ~0xFFFULL; page + 0x1000 <= guestMemSize; page -= 0x1000) {
+        const unsigned char *p = (const unsigned char *)guestMemory + page;
+        UINT32 lfanew, sig;
+        if (p[0] != 'M' || p[1] != 'Z') { if (page < 0x1000 || (addr - page) > 0x4000000ULL) break; continue; }
+        lfanew = *(const UINT32 *)(p + 0x3C);
+        if (lfanew < 0x40 || page + lfanew + 0x108 > guestMemSize) { if (page == 0) break; continue; }
+        sig = *(const UINT32 *)(p + lfanew);
+        if (sig != 0x00004550) { if (page == 0) break; continue; }   // "PE\0\0"
+        {
+            const unsigned char *opt = p + lfanew + 0x18;
+            UINT16 magic = *(const UINT16 *)opt;
+            UINT32 sizeOfImage = *(const UINT32 *)(opt + 0x38);
+            UINT32 ddOff = (magic == 0x20B) ? 0x70 : 0x60;           // PE32+ vs PE32
+            UINT32 dbgRva, dbgSize;
+            if (addr - page >= sizeOfImage) { if (page == 0) break; continue; }
+            *outBase = page;
+            // SizeOfImage separates a small OVMF DXE driver (tens of KB) from a
+            // loaded boot application like bootmgfw.efi (megabytes), which is the
+            // whole question this instrument exists to answer.
+            *outSize = sizeOfImage;
+            dbgRva  = *(const UINT32 *)(opt + ddOff + 6 * 8);        // debug dir = index 6
+            dbgSize = *(const UINT32 *)(opt + ddOff + 6 * 8 + 4);
+            if (dbgRva && dbgSize >= 28 && page + dbgRva + 28 <= guestMemSize) {
+                const unsigned char *dd = (const unsigned char *)guestMemory + page + dbgRva;
+                UINT32 type = *(const UINT32 *)(dd + 12);
+                UINT32 raw  = *(const UINT32 *)(dd + 20);            // AddressOfRawData (RVA)
+                if (type == 2 && raw && page + raw + 24 < guestMemSize) {
+                    const unsigned char *cv = (const unsigned char *)guestMemory + page + raw;
+                    if (*(const UINT32 *)cv == 0x53445352) {         // "RSDS"
+                        const char *pdb = (const char *)(cv + 24);
+                        size_t i = 0;
+                        while (i < nameLen - 1 && pdb[i] && (UINT64)(page + raw + 24 + i) < guestMemSize) {
+                            name[i] = pdb[i]; i++;
+                        }
+                        name[i] = '\0';
+                    }
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void u40Dump(int pass, const char *why) {
     UINT64 base = g_passModuleBase[pass];
     int shown, k;
@@ -735,6 +798,23 @@ static void u40Dump(int pass, const char *why) {
         printf("[u40]   %6ld  page 0x%llX", bestCount, (unsigned long long)va);
         if (base && va >= base && va - base < 0x2000000ULL)
             printf("  = base+0x%llX", (unsigned long long)(va - base));
+        // Which PE image is this inside? Without it the firmware's own code and
+        // the image it booted are indistinguishable -- they share an address range.
+        {
+            UINT64 imgBase = 0;
+            UINT32 imgSize = 0;
+            char imgName[128];
+            if (u40IdentifyImage(va, &imgBase, &imgSize, imgName, sizeof(imgName))) {
+                printf("  [img 0x%llX+0x%llX size=%uKB", (unsigned long long)imgBase,
+                       (unsigned long long)(va - imgBase), imgSize / 1024);
+                if (imgName[0]) {
+                    const char *leaf = imgName, *s;
+                    for (s = imgName; *s; s++) if (*s == '\\' || *s == '/') leaf = s + 1;
+                    printf(" %s", leaf);
+                }
+                printf("]");
+            }
+        }
         printf("\n");
         g_ripHist[pass][best].count = -bestCount;   /* mark as reported */
     }
