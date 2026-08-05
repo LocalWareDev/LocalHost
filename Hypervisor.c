@@ -1408,6 +1408,7 @@ static int ahciPortsImplemented(void);
 int g_ahciIrqLogged = 0, g_ahciAckLogged = 0;
 long g_ahciIrqCount = 0; // U61: uncapped injection count, reported in the heartbeat
 long g_ahciRejected = 0; // commands we answered with ERR|ABRT -- see the reject log
+long g_pitTicksDelivered = 0; // firmware-era timer ticks (see deliverPitTimerIrq)
 static long g_ahciLastIrqExit = 0;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
     if (!ahciAbarMemory) return;
@@ -5493,7 +5494,8 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                     lastDelivered = g_irqDelivered;
                     lastDeferred = g_irqDeferredTpr;
                     lastCoalesced = g_irqCoalesced;
-                    printf("[irq-queue] queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d apicOk=%ld apicFail=%ld(hr=0x%lX vec=0x%02X)%s\n",
+                    printf("[irq-queue] pitTicks=%ld queued=%ld delivered=%ld coalesced=%ld deferredTpr=%ld tprReadFail=%ld full=%ld depth=%d apicOk=%ld apicFail=%ld(hr=0x%lX vec=0x%02X)%s\n",
+                           g_pitTicksDelivered,
                            g_irqQueued, g_irqDelivered, g_irqCoalesced, g_irqDeferredTpr,
                            g_irqTprReadFail, g_irqQueueFull, g_irqQueueCount,
                            g_reqIrqOk, g_reqIrqFail, (unsigned long)g_reqIrqLastHr, g_reqIrqLastVector,
@@ -6958,6 +6960,26 @@ int deliverRtcPeriodicIrq(WHV_PARTITION_HANDLE partition) {
 // periodic-interrupt-enable bit, which isn't set this early in POST --
 // broadened below to fire unconditionally so this function actually gets
 // invoked during a plain PIT-based spin too.
+// THE ONLY PLACE vector 0x08 is injected. There were two, with different rules:
+// this function (gated) and a copy in the halted loop (not gated at all), and
+// they share lastTimerTick -- so whichever ran first suppressed the other. That
+// made the gate ineffective (0x08 still reached a running Windows, which is the
+// wedge it was added to prevent) and made the tick counter read zero while ticks
+// were in fact being delivered by the other path. One entry point so the gate
+// and the accounting cannot drift apart again.
+static int deliverLegacyTimerTick(WHV_PARTITION_HANDLE partition) {
+    // 0x08 is the PIC-remapped IRQ0 firmware expects, and also the double-fault
+    // exception vector. Firmware needs it for its entire life; a Windows kernel
+    // in APIC mode cannot use it and it wedges the raw injection slot. Gated on
+    // the kernel being up rather than on g_guestApicMode, which flips as soon as
+    // the guest programs any IOAPIC entry -- something OVMF does during its own
+    // init, while still driving its timer from the 8259/8254.
+    if (g_bpModuleBase) return 0;
+    g_pitTicksDelivered++;
+    injectInterrupt(partition, 0x08);
+    return 1;
+}
+
 int deliverPitTimerIrq(WHV_PARTITION_HANDLE partition) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -6965,22 +6987,26 @@ int deliverPitTimerIrq(WHV_PARTITION_HANDLE partition) {
     if (elapsedMs < TIMER_TICK_INTERVAL_MS) return 0;
     lastTimerTick = now;
     if (!guestInterruptsEnabled(partition)) return 0;
-    // STOPS once the guest is in APIC mode, and this is a real bug fix rather
-    // than tidying.
+    // STOPS once the WINDOWS KERNEL is up, not once the guest touches an IOAPIC.
     //
     // Vector 0x08 is the PIC-remapped IRQ0 of real mode -- and it is also the
-    // DOUBLE FAULT exception vector. Firmware in PIC mode wants it; a Windows
-    // kernel in APIC mode does not, and cannot do anything sensible with it.
-    // ioapicResolveVector already refuses to hand out sub-0x10 vectors for
-    // exactly this reason, but this path predates the queue and writes the raw
-    // pending-interruption slot directly, bypassing that check entirely.
+    // DOUBLE FAULT exception vector. A Windows kernel in APIC mode cannot do
+    // anything sensible with it, and it was found permanently wedged in the raw
+    // pending-interruption slot, blocking every other interrupt in the machine.
+    // This path predates the interrupt queue and writes that slot directly,
+    // bypassing ioapicResolveVector's refusal to hand out sub-0x10 vectors.
     //
-    // Caught by the unwedge diagnostic: with the guest well into Windows, the
-    // permanently stuck pending event was "vector=0x08" -- this injection,
-    // sitting in the single slot that everything else has to pass through.
-    if (g_guestApicMode) return 0;
-    injectInterrupt(partition, 0x08); // IRQ0 - timer (PIC mode only)
-    return 1;
+    // The first attempt gated on g_guestApicMode, and that was WRONG: that flag
+    // is set the moment the guest programs ANY IOAPIC redirection entry, which
+    // OVMF does during firmware init. It therefore killed the firmware's only
+    // timer -- measured, pitTicks=0 across a whole 43s firmware boot -- while
+    // OVMF was still using the 8259/8254 for its own timer tick. Everything
+    // time-based in BDS then has no clock to run on.
+    //
+    // g_bpModuleBase is the right gate here: firmware keeps its timer for the
+    // whole of its life, and injection stops once Windows is actually running,
+    // which is when the wedge was observed.
+    return deliverLegacyTimerTick(partition);
 }
 
 // x86-64 GPR encoding order (as used by ModRM.reg/rm, REX-extended 0-15).
@@ -9727,7 +9753,7 @@ int main(int argc, char *argv[]) {
                 QueryPerformanceCounter(&now);
                 double elapsedMs = (double)(now.QuadPart - lastTimerTick.QuadPart) * 1000.0 / perfFrequency.QuadPart;
                 if (elapsedMs >= TIMER_TICK_INTERVAL_MS) {
-                    injectInterrupt(partition, 0x08); // IRQ0 - timer
+                    deliverLegacyTimerTick(partition); // IRQ0 - timer, gated+counted
                     lastTimerTick = now;
                     injected = 1;
                 }
@@ -9756,6 +9782,16 @@ int main(int argc, char *argv[]) {
         // backlog forming behind the RTC.
         drainInterruptQueue(partition);
 
+        // DO NOT deliver the legacy timer tick from here. Tried and reverted:
+        // the firmware genuinely receives no 0x08 ticks (measured pitTicks=0
+        // across a whole boot, because the two existing sites only fire when the
+        // guest HALTS or on a cancelled exit, and OVMF's firmware phase is
+        // CPU-busy) -- but supplying them from the main loop wedges the guest
+        // almost immediately: exit count frozen at 8571 for 280s, spinning at
+        // PASSIVE_LEVEL with rcx=0x3F8 in serial output. That matches every
+        // previous attempt at main-loop timer injection during the firmware
+        // phase. OVMF drives its own waits off the ACPI PM timer, which is why
+        // boot works without a PIT tick at all.
         ahciServiceLevelInterrupt(partition, exitCount);
 
         // Run the USB async schedule. A real host controller executes its
