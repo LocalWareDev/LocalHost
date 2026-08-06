@@ -794,6 +794,29 @@ static int u40IdentifyImage(UINT64 addr, UINT64 *outBase, UINT32 *outSize,
 UINT64 g_bootImgBase = 0, g_bootImgEntry = 0;
 UINT32 g_bootImgSize = 0;
 int g_bootImgBpArmed = 0, g_bootImgBpHits = 0;
+UINT64 g_bootImgRetAddr = 0;   // where the image returns to; DR3 moves here
+long g_bootImgEntryExit = 0;   // exit count at entry, to measure how long it ran
+
+// EFI_STATUS names, so a returned code reads as itself instead of as a constant
+// nobody remembers. The high bit marks an error; the low bits are the code.
+static const char *efiStatusName(UINT64 s) {
+    static const char *errs[] = {
+        "SUCCESS", "LOAD_ERROR", "INVALID_PARAMETER", "UNSUPPORTED",
+        "BAD_BUFFER_SIZE", "BUFFER_TOO_SMALL", "NOT_READY", "DEVICE_ERROR",
+        "WRITE_PROTECTED", "OUT_OF_RESOURCES", "VOLUME_CORRUPTED", "VOLUME_FULL",
+        "NO_MEDIA", "MEDIA_CHANGED", "NOT_FOUND", "ACCESS_DENIED",
+        "NO_RESPONSE", "NO_MAPPING", "TIMEOUT", "NOT_STARTED",
+        "ALREADY_STARTED", "ABORTED", "ICMP_ERROR", "TFTP_ERROR",
+        "PROTOCOL_ERROR", "INCOMPATIBLE_VERSION", "SECURITY_VIOLATION", "CRC_ERROR",
+        "END_OF_MEDIA", "", "", "END_OF_FILE", "INVALID_LANGUAGE",
+        "COMPROMISED_DATA", "IP_ADDRESS_CONFLICT", "HTTP_ERROR"
+    };
+    UINT64 code = s & ~(1ULL << 63);
+    if (s == 0) return "EFI_SUCCESS";
+    if (!(s >> 63)) return "(warning or non-error value)";
+    if (code < sizeof(errs) / sizeof(errs[0]) && errs[code][0]) return errs[code];
+    return "(unknown EFI_STATUS)";
+}
 
 static void u40ScanLargeImages(const char *why) {
     UINT64 page;
@@ -11424,6 +11447,7 @@ int main(int argc, char *argv[]) {
                                                 WHvX64RegisterCr3, WHvX64RegisterDr7 };
                     WHV_REGISTER_VALUE rv[6] = { 0 };
                     g_bootImgBpHits++;
+                    g_bootImgEntryExit = exitCount;
                     WHvGetVirtualProcessorRegisters(partition, 0, rn, 6, rv);
                     printf("[bootimg] *** ENTRY POINT REACHED *** hit #%d at 0x%llX (exit %ld)\n",
                            g_bootImgBpHits, (unsigned long long)exitContext.VpContext.Rip, exitCount);
@@ -11433,12 +11457,61 @@ int main(int argc, char *argv[]) {
                            (unsigned long long)rv[0].Reg64, (unsigned long long)rv[1].Reg64,
                            (unsigned long long)rv[2].Reg64, (unsigned long long)rv[3].Reg64,
                            (unsigned long long)rv[4].Reg64);
+                    // MOVE THE BREAKPOINT TO THE RETURN ADDRESS.
+                    //
+                    // At an entry point RSP points at the return address the
+                    // caller pushed, so [rsp] is where DxeCore's StartImage
+                    // resumes. Trapping there catches the exact instant the boot
+                    // manager gives up, with RAX holding the status it returned
+                    // -- which settles whether EFI_TIMEOUT comes from this image
+                    // or from the firmware around it, and dates the return to an
+                    // exact exit count for bisecting the window.
+                    {
+                        UINT64 rsp = rv[2].Reg64;
+                        UINT64 retAddr = 0;
+                        if (guestMemory && rsp + 8 <= guestMemSize)
+                            retAddr = *(UINT64 *)((unsigned char *)guestMemory + rsp);
+                        if (retAddr && retAddr < guestMemSize) {
+                            WHV_REGISTER_NAME rbn[2] = { WHvX64RegisterDr3, WHvX64RegisterDr7 };
+                            WHV_REGISTER_VALUE rbv[2] = { 0 };
+                            rbv[0].Reg64 = retAddr;
+                            rbv[1].Reg64 = rv[5].Reg64 | 0x40ULL;   // keep L3 set
+                            g_bootImgRetAddr = retAddr;
+                            WHvSetVirtualProcessorRegisters(partition, 0, rbn, 2, rbv);
+                            printf("[bootimg]   return address [rsp]=0x%llX -- DR3 moved there\n",
+                                   (unsigned long long)retAddr);
+                        } else {
+                            // Could not read it: disarm rather than leave DR3 on
+                            // an address that will never be reached.
+                            WHV_REGISTER_NAME dn = WHvX64RegisterDr7;
+                            WHV_REGISTER_VALUE dv = { 0 };
+                            dv.Reg64 = rv[5].Reg64 & ~0x40ULL;
+                            WHvSetVirtualProcessorRegisters(partition, 0, &dn, 1, &dv);
+                            g_bootImgBpArmed = 0;
+                            printf("[bootimg]   could not read return address at rsp=0x%llX\n",
+                                   (unsigned long long)rsp);
+                        }
+                        fflush(stdout);
+                    }
+                    break;
+                }
+                // The boot application returning -- RAX is its status.
+                if (exitContext.VpException.ExceptionType == WHvX64ExceptionTypeDebugTrapOrFault &&
+                    g_bootImgBpArmed && g_bootImgRetAddr &&
+                    exitContext.VpContext.Rip == g_bootImgRetAddr) {
+                    WHV_REGISTER_NAME rn2[2] = { WHvX64RegisterRax, WHvX64RegisterDr7 };
+                    WHV_REGISTER_VALUE rv2[2] = { 0 };
+                    WHvGetVirtualProcessorRegisters(partition, 0, rn2, 2, rv2);
+                    printf("[bootimg] *** RETURNED *** at 0x%llX (exit %ld, %ld exits after entry)\n",
+                           (unsigned long long)exitContext.VpContext.Rip, exitCount,
+                           exitCount - g_bootImgEntryExit);
+                    printf("[bootimg]   RAX = 0x%llX  (%s)\n", (unsigned long long)rv2[0].Reg64,
+                           efiStatusName(rv2[0].Reg64));
                     fflush(stdout);
-                    // One-shot: clear only L3 so the ntoskrnl breakpoints stay armed.
                     {
                         WHV_REGISTER_NAME dn = WHvX64RegisterDr7;
                         WHV_REGISTER_VALUE dv = { 0 };
-                        dv.Reg64 = rv[5].Reg64 & ~0x40ULL;
+                        dv.Reg64 = rv2[1].Reg64 & ~0x40ULL;
                         WHvSetVirtualProcessorRegisters(partition, 0, &dn, 1, &dv);
                         g_bootImgBpArmed = 0;
                     }
