@@ -796,6 +796,56 @@ UINT32 g_bootImgSize = 0;
 int g_bootImgBpArmed = 0, g_bootImgBpHits = 0;
 UINT64 g_bootImgRetAddr = 0;   // where the image returns to; DR3 moves here
 long g_bootImgEntryExit = 0;   // exit count at entry, to measure how long it ran
+// Set while the boot application is executing -- between its entry point and its
+// return. Used to log ONLY what it touches: 2960 exits is small enough to read in
+// full, where logging the whole boot is not.
+int g_bootImgRunning = 0;
+long g_bootImgIoLogged = 0;
+long g_bootImgCmosLogged = 0;
+long g_bootImgMmioLogged = 0;
+// UNCAPPED per-port tally for the boot application's window. The logged trace
+// above stops at 400 entries, which only shows the START of a ~3000-exit window
+// -- and reading the beginning of a truncated log has already produced one wrong
+// conclusion in this investigation. Counting every access costs an increment.
+#define BOOTIMG_PORTS_MAX 24
+UINT16 g_bootImgPortNum[BOOTIMG_PORTS_MAX];
+long   g_bootImgPortCount[BOOTIMG_PORTS_MAX];
+int    g_bootImgPortsSeen = 0;
+long   g_bootImgIoTotal = 0, g_bootImgMmioTotal = 0;
+
+UINT64 g_bootImgMmioPage[BOOTIMG_PORTS_MAX];
+long   g_bootImgMmioCount[BOOTIMG_PORTS_MAX];
+int    g_bootImgMmioSeen = 0;
+
+// MMIO is counted by 4KB page, which is the granularity that distinguishes one
+// device's register block from another's.
+static void bootImgCountMmio(UINT64 gpa) {
+    UINT64 page = gpa & ~0xFFFULL;
+    int i;
+    g_bootImgMmioTotal++;
+    for (i = 0; i < g_bootImgMmioSeen; i++) {
+        if (g_bootImgMmioPage[i] == page) { g_bootImgMmioCount[i]++; return; }
+    }
+    if (g_bootImgMmioSeen < BOOTIMG_PORTS_MAX) {
+        g_bootImgMmioPage[g_bootImgMmioSeen] = page;
+        g_bootImgMmioCount[g_bootImgMmioSeen] = 1;
+        g_bootImgMmioSeen++;
+    }
+}
+
+static void bootImgCountPort(UINT16 port) {
+    int i;
+    g_bootImgIoTotal++;
+    for (i = 0; i < g_bootImgPortsSeen; i++) {
+        if (g_bootImgPortNum[i] == port) { g_bootImgPortCount[i]++; return; }
+    }
+    if (g_bootImgPortsSeen < BOOTIMG_PORTS_MAX) {
+        g_bootImgPortNum[g_bootImgPortsSeen] = port;
+        g_bootImgPortCount[g_bootImgPortsSeen] = 1;
+        g_bootImgPortsSeen++;
+    }
+}
+#define BOOTIMG_IO_LOG_MAX 400
 
 // EFI_STATUS names, so a returned code reads as itself instead of as a constant
 // nobody remembers. The high bit marks an error; the low bits are the code.
@@ -10614,6 +10664,22 @@ int main(int argc, char *argv[]) {
                                (unsigned long long)exitContext.IoPortAccess.Rax);
                 }
 
+                // Everything the BOOT APPLICATION touches, and nothing else. The
+                // window between its entry point and its return is ~2960 exits,
+                // small enough to read in full -- where logging a whole boot is
+                // not. Serial output (0x3F8-0x3FF) is skipped: it is the image
+                // and firmware printing, which says nothing about what it wants.
+                if (g_bootImgRunning) bootImgCountPort(port);
+                if (g_bootImgRunning && g_bootImgIoLogged < BOOTIMG_IO_LOG_MAX &&
+                    !(port >= 0x3F8 && port <= 0x3FF)) {
+                    g_bootImgIoLogged++;
+                    printf("[bootimg-io] %s port=0x%03X size=%u val=0x%llX rip=0x%llX\n",
+                           isWrite ? "OUT" : "IN ", port,
+                           exitContext.IoPortAccess.AccessInfo.AccessSize,
+                           (unsigned long long)exitContext.IoPortAccess.Rax,
+                           (unsigned long long)exitContext.VpContext.Rip);
+                }
+
                 if (port == 0x1F0) {
                     ataHandlePioDataPort(partition, &exitContext, guestMemory);
                     break;
@@ -11224,6 +11290,22 @@ int main(int argc, char *argv[]) {
                         }
                         else returnValue = cmosRegisters[cmosSelectedReg];
                         if (rtcDiagLoadBaseKnown) rtcDiagLogAccess(partition, exitContext.VpContext.Rip, cmosSelectedReg, 0);
+                        // What the boot application is actually TOLD. The generic
+                        // port trace cannot show this: on an IN, Rax still holds
+                        // the guest's pre-read value, not our answer. Named
+                        // registers, because a wrong or non-advancing clock is
+                        // exactly the kind of thing it would retry over.
+                        if (g_bootImgRunning && g_bootImgCmosLogged < 80) {
+                            static const char *rn[] = {
+                                "sec","secAlarm","min","minAlarm","hour","hourAlarm",
+                                "dayOfWeek","dayOfMonth","month","year",
+                                "regA","regB","regC","regD" };
+                            g_bootImgCmosLogged++;
+                            printf("[bootimg-cmos] reg 0x%02X %-10s -> 0x%02X (%u)\n",
+                                   cmosSelectedReg,
+                                   cmosSelectedReg < 14 ? rn[cmosSelectedReg] : "?",
+                                   (unsigned)(returnValue & 0xFF), (unsigned)(returnValue & 0xFF));
+                        }
                     }
                     else if (port == 0x92) returnValue = port92Value;
                     else if (port == 0x402) {
@@ -11375,6 +11457,44 @@ int main(int argc, char *argv[]) {
                 if (g_bpPatched) {
                     logBpEvent("memaccess gpa=0x%llX", (unsigned long long)exitContext.MemoryAccess.Gpa);
                 }
+                // MMIO the boot application touches -- device registers it is
+                // probing. Same window and budget as the port log above.
+                // Its OWN budget: sharing one with the port log meant the port
+                // traffic consumed it all and not a single MMIO line was ever
+                // emitted, while MMIO turned out to be half the window.
+                if (g_bootImgRunning) {
+                    bootImgCountMmio(exitContext.MemoryAccess.Gpa);
+                    if (g_bootImgMmioLogged < 60) {
+                        UINT64 gpa = exitContext.MemoryAccess.Gpa;
+                        g_bootImgMmioLogged++;
+                        // Decode the AHCI register, which is the only MMIO block
+                        // this window touches.
+                        if (gpa >= 0x80000100 && gpa < 0x80001000) {
+                            UINT64 off = gpa - 0x80000100;
+                            unsigned reg = (unsigned)(off % 0x80);
+                            // The register's CURRENT value from our own ABAR
+                            // buffer -- what the driver is seeing. Which bits are
+                            // set is the whole question for PxCMD (ST/CR/FRE/FR).
+                            UINT32 cur = 0;
+                            if (ahciAbarMemory && gpa - 0x80000000 + 4 <= AHCI_BAR_SIZE)
+                                cur = *(UINT32 *)((unsigned char *)ahciAbarMemory + (gpa - 0x80000000));
+                            printf("[bootimg-mmio] AHCI port%u %-5s %s val=0x%08X%s\n",
+                                   (unsigned)(off / 0x80),
+                                   reg == 0x10 ? "PxIS" : reg == 0x14 ? "PxIE" :
+                                   reg == 0x18 ? "PxCMD" : reg == 0x20 ? "PxTFD" :
+                                   reg == 0x28 ? "PxSSTS" : reg == 0x30 ? "PxSERR" :
+                                   reg == 0x38 ? "PxCI" : "?",
+                                   exitContext.MemoryAccess.AccessInfo.AccessType == WHvMemoryAccessWrite ? "W" : "R",
+                                   cur,
+                                   reg == 0x18 ? (cur & 0x1 ? " ST" : " st") : "");
+                        } else {
+                            printf("[bootimg-mmio] gpa=0x%llX %s rip=0x%llX\n",
+                                   (unsigned long long)gpa,
+                                   exitContext.MemoryAccess.AccessInfo.AccessType == WHvMemoryAccessWrite ? "W" : "R",
+                                   (unsigned long long)exitContext.VpContext.Rip);
+                        }
+                    }
+                }
                 if (ioapicHandleMmioAccess(partition, &exitContext)) {
                     break;
                 }
@@ -11477,6 +11597,7 @@ int main(int argc, char *argv[]) {
                             rbv[0].Reg64 = retAddr;
                             rbv[1].Reg64 = rv[5].Reg64 | 0x40ULL;   // keep L3 set
                             g_bootImgRetAddr = retAddr;
+                            g_bootImgRunning = 1;   // start logging its I/O
                             WHvSetVirtualProcessorRegisters(partition, 0, rbn, 2, rbv);
                             printf("[bootimg]   return address [rsp]=0x%llX -- DR3 moved there\n",
                                    (unsigned long long)retAddr);
@@ -11507,6 +11628,23 @@ int main(int argc, char *argv[]) {
                            exitCount - g_bootImgEntryExit);
                     printf("[bootimg]   RAX = 0x%llX  (%s)\n", (unsigned long long)rv2[0].Reg64,
                            efiStatusName(rv2[0].Reg64));
+                    printf("[bootimg]   TOTAL while it ran: %ld port accesses, %ld MMIO\n",
+                           g_bootImgIoTotal, g_bootImgMmioTotal);
+                    {
+                        int pi;
+                        for (pi = 0; pi < g_bootImgPortsSeen; pi++)
+                            printf("[bootimg]     port 0x%03X : %ld\n",
+                                   g_bootImgPortNum[pi], g_bootImgPortCount[pi]);
+                        if (g_bootImgPortsSeen >= BOOTIMG_PORTS_MAX)
+                            printf("[bootimg]     (port table full -- more distinct ports exist)\n");
+                        for (pi = 0; pi < g_bootImgMmioSeen; pi++)
+                            printf("[bootimg]     mmio 0x%llX : %ld\n",
+                                   (unsigned long long)g_bootImgMmioPage[pi],
+                                   g_bootImgMmioCount[pi]);
+                        if (g_bootImgMmioSeen >= BOOTIMG_PORTS_MAX)
+                            printf("[bootimg]     (mmio table full -- more distinct pages exist)\n");
+                    }
+                    g_bootImgRunning = 0;
                     fflush(stdout);
                     {
                         WHV_REGISTER_NAME dn = WHvX64RegisterDr7;
