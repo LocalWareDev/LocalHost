@@ -2325,6 +2325,25 @@ int cpuHalted = 0;
 LARGE_INTEGER lastTimerTick;
 #define TIMER_TICK_INTERVAL_MS 54.925 // ~18.2 Hz, classic PC/PIT default rate
 
+// --- Enough 8259 and PIT channel 0 state to know when the guest wants ticks ---
+//
+// NOT a PIC emulation: no priority, no IRR/ISR, no EOI. The only question being
+// answered is whether the firmware has said it is ready for timer interrupts,
+// because injecting IRQ0 before that wedges it -- measured, exit count frozen at
+// 8571 for 280s when the tick was delivered unconditionally from the main loop.
+//
+// Two conditions say "ready": PIT channel 0 has been programmed with a count,
+// and the master PIC has IRQ0 unmasked. Neither was visible before -- ports
+// 0x20/0x21 were not decoded at all, and port 0x43 only handled channel 2 -- so
+// there was no way to tell readiness from a guest that had not touched either.
+unsigned char pic1Mask = 0xFF;        // OCW1; everything masked at power-on
+unsigned char pic1VectorBase = 0x08;  // ICW2; OVMF remaps IRQ0-7 here
+unsigned char pic1InitStage = 0;      // 0=operational, 1=ICW2, 2=ICW3, 3=ICW4
+unsigned char pic1Icw1 = 0;
+int pitChannel0Programmed = 0;        // channel 0 has been given a reload count
+unsigned char pitChannel0AccessMode = 0;
+int pitChannel0WritePhase = 0;
+
 // --- RTC (MC146818) periodic interrupt emulation ---
 // We already emulate CMOS/RTC time/date register reads (see
 // cmosReadRtcField), but never generated the periodic interrupt on IRQ8
@@ -7140,8 +7159,14 @@ static int deliverLegacyTimerTick(WHV_PARTITION_HANDLE partition) {
     // the guest programs any IOAPIC entry -- something OVMF does during its own
     // init, while still driving its timer from the 8259/8254.
     if (g_bpModuleBase) return 0;
+    // ONLY once the guest has said it wants them. Delivering IRQ0 before the
+    // firmware has armed its own timer wedged the guest solid (exit count frozen
+    // at 8571 for 280s), which is why every previous attempt at this failed.
+    if (!pitChannel0Programmed) return 0;   // channel 0 not set up yet
+    if (pic1Mask & 0x01) return 0;          // guest has IRQ0 masked
     g_pitTicksDelivered++;
-    injectInterrupt(partition, 0x08);
+    // The guest's OWN remapped vector, not a hardcoded 0x08 -- read from ICW2.
+    injectInterrupt(partition, pic1VectorBase);
     return 1;
 }
 
@@ -9947,16 +9972,17 @@ int main(int argc, char *argv[]) {
         // backlog forming behind the RTC.
         drainInterruptQueue(partition);
 
-        // DO NOT deliver the legacy timer tick from here. Tried and reverted:
-        // the firmware genuinely receives no 0x08 ticks (measured pitTicks=0
-        // across a whole boot, because the two existing sites only fire when the
-        // guest HALTS or on a cancelled exit, and OVMF's firmware phase is
-        // CPU-busy) -- but supplying them from the main loop wedges the guest
-        // almost immediately: exit count frozen at 8571 for 280s, spinning at
-        // PASSIVE_LEVEL with rcx=0x3F8 in serial output. That matches every
-        // previous attempt at main-loop timer injection during the firmware
-        // phase. OVMF drives its own waits off the ACPI PM timer, which is why
-        // boot works without a PIT tick at all.
+        // Firmware timer tick. The two other call sites only fire when the guest
+        // HALTS or on a cancelled exit, and OVMF's firmware phase is CPU-busy and
+        // does neither -- so without this the firmware gets no periodic timer at
+        // all (measured: pitTicks=0 across a whole boot).
+        //
+        // An earlier version of this line wedged the guest at exit 8571, because
+        // it injected unconditionally. deliverLegacyTimerTick now refuses until
+        // PIT channel 0 is programmed AND the PIC has IRQ0 unmasked, so nothing
+        // is delivered before the firmware has asked for it.
+        deliverPitTimerIrq(partition);
+
         ahciServiceLevelInterrupt(partition, exitCount);
 
         // Run the USB async schedule. A real host controller executes its
@@ -10993,13 +11019,68 @@ int main(int argc, char *argv[]) {
                             printf("[port 0x92 hot reset -- exitCount=%ld]\n", exitCount); fflush(stdout);
                         }
                     }
+                    // Master 8259: track the ICW init sequence far enough to know
+                    // which writes to 0x21 are the MASK, and what vector base the
+                    // guest remapped IRQ0-7 to. See pic1Mask's comment -- this is
+                    // readiness detection, not a PIC.
+                    else if (port == 0x20) {
+                        if (val & 0x10) {            // ICW1 -- init sequence begins
+                            pic1Icw1 = val;
+                            pic1InitStage = 1;       // next 0x21 write is ICW2
+                        }
+                        // Otherwise OCW2/OCW3 (EOI, read register select): ignored,
+                        // since no in-service state is modelled.
+                    }
+                    else if (port == 0x21) {
+                        if (pic1InitStage == 1) {
+                            pic1VectorBase = val;    // ICW2: IRQ0 lands on this vector
+                            // ICW3 present only when cascaded (ICW1 bit1 clear)
+                            pic1InitStage = (pic1Icw1 & 0x02) ? ((pic1Icw1 & 0x01) ? 3 : 0) : 2;
+                            printf("[pic] master remapped: IRQ0 -> vector 0x%02X\n", pic1VectorBase);
+                            fflush(stdout);
+                        } else if (pic1InitStage == 2) {
+                            pic1InitStage = (pic1Icw1 & 0x01) ? 3 : 0;   // ICW3
+                        } else if (pic1InitStage == 3) {
+                            pic1InitStage = 0;                          // ICW4
+                        } else {
+                            unsigned char was = pic1Mask;
+                            pic1Mask = val;                             // OCW1
+                            if ((was & 0x01) != (val & 0x01)) {
+                                printf("[pic] IRQ0 %s (mask=0x%02X)\n",
+                                       (val & 0x01) ? "MASKED" : "UNMASKED", val);
+                                fflush(stdout);
+                            }
+                        }
+                    }
                     else if (port == 0x43) {
-                        // PIT mode/command register. Only channel 2 (bits 7-6 == 10)
-                        // is emulated -- that's the one BIOS timer calibration uses.
-                        if (((val >> 6) & 0x3) == 2) {
+                        // PIT mode/command register.
+                        unsigned int chan = (val >> 6) & 0x3;
+                        if (chan == 2) {
                             pitChannel2AccessMode = (val >> 4) & 0x3;
                             pitChannel2WritePhase = 0;
                             pitChannel2Loaded = 0;
+                        } else if (chan == 0) {
+                            // Channel 0 IS the system timer -- the one whose output
+                            // drives IRQ0. Previously undecoded, so the firmware
+                            // programming its own tick rate was invisible.
+                            pitChannel0AccessMode = (val >> 4) & 0x3;
+                            pitChannel0WritePhase = 0;
+                        }
+                    }
+                    else if (port == 0x40) {
+                        // Channel 0 reload value. The count itself is not used --
+                        // ticks are paced off host time at the classic 18.2Hz --
+                        // but the WRITE is the signal that the firmware has set its
+                        // timer up and is expecting interrupts from it.
+                        if (pitChannel0AccessMode == 3 && pitChannel0WritePhase == 0) {
+                            pitChannel0WritePhase = 1;   // lobyte of a 2-byte load
+                        } else {
+                            pitChannel0WritePhase = 0;
+                            if (!pitChannel0Programmed) {
+                                pitChannel0Programmed = 1;
+                                printf("[pit] channel 0 programmed -- system timer armed\n");
+                                fflush(stdout);
+                            }
                         }
                     }
                     else if (port == 0x42) {
