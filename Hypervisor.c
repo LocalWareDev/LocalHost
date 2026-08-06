@@ -781,6 +781,48 @@ static int u40IdentifyImage(UINT64 addr, UINT64 *outBase, UINT32 *outSize,
     return 0;
 }
 
+// Sweeps guest RAM for LARGE PE images -- the ones a boot application would be,
+// as opposed to the 12-28KB DXE drivers the firmware is made of.
+//
+// This answers a question the RIP profile cannot: that profile samples on VM
+// EXITS, so an image that runs without touching I/O is invisible to it, and
+// "no samples in a large image" does not mean no large image ran. Whether
+// LoadImage succeeded is visible in memory regardless of what executed --
+// bootmgfw.efi is ~1.6MB, so if it was loaded it is sitting there to be found.
+static void u40ScanLargeImages(const char *why) {
+    UINT64 page;
+    int found = 0;
+    if (!guestMemory || guestMemSize < 0x1000) return;
+    printf("[u40-img] large PE images in guest RAM (%s):\n", why);
+    for (page = 0; page + 0x1000 <= guestMemSize; page += 0x1000) {
+        const unsigned char *p = (const unsigned char *)guestMemory + page;
+        UINT32 lfanew, sizeOfImage, entry;
+        const unsigned char *opt;
+        UINT16 magic;
+        if (p[0] != 'M' || p[1] != 'Z') continue;
+        lfanew = *(const UINT32 *)(p + 0x3C);
+        if (lfanew < 0x40 || lfanew > 0x1000 || page + lfanew + 0x108 > guestMemSize) continue;
+        if (*(const UINT32 *)(p + lfanew) != 0x00004550) continue;   // "PE\0\0"
+        opt = p + lfanew + 0x18;
+        magic = *(const UINT16 *)opt;
+        if (magic != 0x10B && magic != 0x20B) continue;
+        sizeOfImage = *(const UINT32 *)(opt + 0x38);
+        entry       = *(const UINT32 *)(opt + 0x10);
+        // 256KB filter: every firmware module here is under 64KB, so anything
+        // this large is a loaded application rather than part of OVMF.
+        if (sizeOfImage < 256 * 1024 || sizeOfImage > 64 * 1024 * 1024) continue;
+        if (page + sizeOfImage > guestMemSize) continue;
+        found++;
+        printf("[u40-img]   base=0x%llX size=%uKB entryPoint=0x%llX (rva 0x%X) machine=%s\n",
+               (unsigned long long)page, sizeOfImage / 1024,
+               (unsigned long long)(page + entry), entry,
+               magic == 0x20B ? "x64" : "x86");
+        if (found >= 12) break;
+    }
+    if (!found) printf("[u40-img]   none found -- no boot application is resident\n");
+    fflush(stdout);
+}
+
 static void u40Dump(int pass, const char *why) {
     UINT64 base = g_passModuleBase[pass];
     int shown, k;
@@ -10165,10 +10207,20 @@ int main(int argc, char *argv[]) {
                     u40Reset(u40pass);
                     printf("[u40] histogram reset -- profiling the boot image from here\n");
                     fflush(stdout);
+                    // Scan BEFORE the image runs as well as after it fails.
+                    // EDK2 unloads an image whose StartImage returned an error,
+                    // so finding it absent at the failure proves nothing on its
+                    // own -- present here but gone there means it WAS loaded and
+                    // did run; absent in both means LoadImage never produced it.
+                    u40ScanLargeImages("at BDS start, before StartImage");
                 }
                 if (g_bdsBootFailed != lastBdsFail) {
                     lastBdsFail = g_bdsBootFailed;
                     u40Dump(u40pass, "BDS reported a failed boot");
+                    // Was the boot application even loaded? Independent of the
+                    // exit-sampled profile above, which cannot see code that
+                    // does no I/O.
+                    u40ScanLargeImages("at BDS failure");
                 }
             }
         }
