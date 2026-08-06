@@ -789,6 +789,12 @@ static int u40IdentifyImage(UINT64 addr, UINT64 *outBase, UINT32 *outSize,
 // "no samples in a large image" does not mean no large image ran. Whether
 // LoadImage succeeded is visible in memory regardless of what executed --
 // bootmgfw.efi is ~1.6MB, so if it was loaded it is sitting there to be found.
+// Set by u40ScanLargeImages when it finds a boot application (>=1MB): where it
+// was loaded and where its entry point is, so execution can be trapped there.
+UINT64 g_bootImgBase = 0, g_bootImgEntry = 0;
+UINT32 g_bootImgSize = 0;
+int g_bootImgBpArmed = 0, g_bootImgBpHits = 0;
+
 static void u40ScanLargeImages(const char *why) {
     UINT64 page;
     int found = 0;
@@ -817,6 +823,14 @@ static void u40ScanLargeImages(const char *why) {
                (unsigned long long)page, sizeOfImage / 1024,
                (unsigned long long)(page + entry), entry,
                magic == 0x20B ? "x64" : "x86");
+        // The boot application, as opposed to the firmware's own big modules:
+        // everything OVMF loads for itself here is under 1MB, and bootmgfw.efi
+        // is 1404KB. Remembered so its entry point can be trapped.
+        if (sizeOfImage >= 1024 * 1024 && sizeOfImage > g_bootImgSize) {
+            g_bootImgBase = page;
+            g_bootImgEntry = page + entry;
+            g_bootImgSize = sizeOfImage;
+        }
         if (found >= 12) break;
     }
     if (!found) printf("[u40-img]   none found -- no boot application is resident\n");
@@ -10239,6 +10253,33 @@ int main(int argc, char *argv[]) {
                     // own -- present here but gone there means it WAS loaded and
                     // did run; absent in both means LoadImage never produced it.
                     u40ScanLargeImages("at BDS start, before StartImage");
+
+                    // TRAP THE BOOT APPLICATION AT ITS ENTRY POINT.
+                    //
+                    // The RIP profile cannot see this image: it samples on VM
+                    // exits and bootmgfw.efi does almost no I/O before returning
+                    // EFI_TIMEOUT. A hardware execution breakpoint does not care
+                    // about exits, so it catches the entry regardless -- and its
+                    // absence would be just as informative.
+                    //
+                    // DR3 because DR0-DR2 are already spoken for by the ntoskrnl
+                    // work; L3 is bit 6 of DR7.
+                    if (g_bootImgEntry && !g_bootImgBpArmed) {
+                        WHV_REGISTER_NAME bpn[2] = { WHvX64RegisterDr3, WHvX64RegisterDr7 };
+                        WHV_REGISTER_VALUE bpv[2] = { 0 };
+                        WHV_REGISTER_NAME dr7n = WHvX64RegisterDr7;
+                        WHV_REGISTER_VALUE dr7v = { 0 };
+                        WHvGetVirtualProcessorRegisters(partition, 0, &dr7n, 1, &dr7v);
+                        bpv[0].Reg64 = g_bootImgEntry;
+                        bpv[1].Reg64 = dr7v.Reg64 | 0x40ULL;   // L3
+                        if (SUCCEEDED(WHvSetVirtualProcessorRegisters(partition, 0, bpn, 2, bpv))) {
+                            g_bootImgBpArmed = 1;
+                            printf("[bootimg] armed DR3 at entry 0x%llX (image 0x%llX, %uKB)\n",
+                                   (unsigned long long)g_bootImgEntry,
+                                   (unsigned long long)g_bootImgBase, g_bootImgSize / 1024);
+                            fflush(stdout);
+                        }
+                    }
                 }
                 if (g_bdsBootFailed != lastBdsFail) {
                     lastBdsFail = g_bdsBootFailed;
@@ -11373,6 +11414,36 @@ int main(int argc, char *argv[]) {
                 // once identified, only ITS DR7 L-bit is cleared, leaving
                 // the other two still armed so a single pass can capture
                 // all three events.
+                // Boot application entry point (DR3). Checked before the ntoskrnl
+                // sites below because it is a different investigation entirely and
+                // g_wpArmed is not set during the firmware phase.
+                if (exitContext.VpException.ExceptionType == WHvX64ExceptionTypeDebugTrapOrFault &&
+                    g_bootImgBpArmed && exitContext.VpContext.Rip == g_bootImgEntry) {
+                    WHV_REGISTER_NAME rn[6] = { WHvX64RegisterRcx, WHvX64RegisterRdx,
+                                                WHvX64RegisterRsp, WHvX64RegisterRflags,
+                                                WHvX64RegisterCr3, WHvX64RegisterDr7 };
+                    WHV_REGISTER_VALUE rv[6] = { 0 };
+                    g_bootImgBpHits++;
+                    WHvGetVirtualProcessorRegisters(partition, 0, rn, 6, rv);
+                    printf("[bootimg] *** ENTRY POINT REACHED *** hit #%d at 0x%llX (exit %ld)\n",
+                           g_bootImgBpHits, (unsigned long long)exitContext.VpContext.Rip, exitCount);
+                    // UEFI entry is (ImageHandle, SystemTable) in RCX/RDX.
+                    printf("[bootimg]   ImageHandle=0x%llX SystemTable=0x%llX rsp=0x%llX "
+                           "rflags=0x%llX cr3=0x%llX\n",
+                           (unsigned long long)rv[0].Reg64, (unsigned long long)rv[1].Reg64,
+                           (unsigned long long)rv[2].Reg64, (unsigned long long)rv[3].Reg64,
+                           (unsigned long long)rv[4].Reg64);
+                    fflush(stdout);
+                    // One-shot: clear only L3 so the ntoskrnl breakpoints stay armed.
+                    {
+                        WHV_REGISTER_NAME dn = WHvX64RegisterDr7;
+                        WHV_REGISTER_VALUE dv = { 0 };
+                        dv.Reg64 = rv[5].Reg64 & ~0x40ULL;
+                        WHvSetVirtualProcessorRegisters(partition, 0, &dn, 1, &dv);
+                        g_bootImgBpArmed = 0;
+                    }
+                    break;
+                }
                 if (exitContext.VpException.ExceptionType == WHvX64ExceptionTypeDebugTrapOrFault && g_wpArmed) {
                     UINT64 wpRip = exitContext.VpContext.Rip;
 
