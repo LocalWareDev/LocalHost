@@ -801,6 +801,8 @@ long g_bootImgEntryExit = 0;   // exit count at entry, to measure how long it ra
 // full, where logging the whole boot is not.
 int g_bootImgRunning = 0;
 long g_bootImgIoLogged = 0;
+long g_bootImgReadLogged = 0;
+long g_ahciShortReads = 0;
 long g_bootImgCmosLogged = 0;
 long g_bootImgMmioLogged = 0;
 long g_bootImgWriteLogged = 0;
@@ -817,6 +819,95 @@ long   g_bootImgIoTotal = 0, g_bootImgMmioTotal = 0;
 UINT64 g_bootImgMmioPage[BOOTIMG_PORTS_MAX];
 long   g_bootImgMmioCount[BOOTIMG_PORTS_MAX];
 int    g_bootImgMmioSeen = 0;
+
+// A RING of the boot application's most recent exits, dumped when it returns.
+//
+// Every other instrument aimed at this window is capped from its START -- the
+// I/O trace at 400 entries, [ahci-svc] at 40, the AHCI command log at its own
+// max -- so all of them show bootmgfw.efi's first moments, over and over, and
+// not one has ever shown its last. But the status it returns is decided at the
+// END of the window. That is the only part that matters and the only part never
+// captured, and raising a cap does not fix it: the head is not where the answer
+// is. A ring keeps the tail instead, at a fixed cost, however long the window
+// turns out to be.
+//
+// Recorded for EVERY exit, not just the interesting-looking ones, because
+// "which exits are interesting" is precisely what is not yet known here.
+// Sized to hold the WHOLE window (~2500 exits) rather than a tail of it. The
+// window turned out to be small enough to read end to end, and every previous
+// cap in this investigation has hidden the part that mattered.
+#define BOOTIMG_RING_MAX 4096
+typedef struct {
+    long   exitIndex;
+    UINT32 reason;
+    UINT64 rip;
+    UINT64 addr;    // I/O port number, or MMIO guest-physical address
+    UINT64 value;   // RAX for port I/O
+    UINT8  isWrite;
+    UINT8  size;
+    UINT8  kind;    // 0 = other, 1 = port I/O, 2 = MMIO
+} BootImgRingEntry;
+BootImgRingEntry g_bootImgRing[BOOTIMG_RING_MAX];
+long g_bootImgRingCount = 0;  // total recorded; slot = count % BOOTIMG_RING_MAX
+
+static const char *exitReasonName(UINT32 r) {
+    switch (r) {
+        case WHvRunVpExitReasonMemoryAccess:     return "MemoryAccess";
+        case WHvRunVpExitReasonX64IoPortAccess:  return "IoPort";
+        case WHvRunVpExitReasonX64Halt:          return "Halt";
+        case WHvRunVpExitReasonX64Cpuid:         return "Cpuid";
+        case WHvRunVpExitReasonException:        return "Exception";
+        case WHvRunVpExitReasonCanceled:         return "Canceled";
+        default:                                 return "other";
+    }
+}
+
+static void bootImgRingRecord(WHV_RUN_VP_EXIT_CONTEXT *ec, long exitIndex) {
+    BootImgRingEntry *e = &g_bootImgRing[g_bootImgRingCount % BOOTIMG_RING_MAX];
+    memset(e, 0, sizeof(*e));
+    e->exitIndex = exitIndex;
+    e->reason = (UINT32)ec->ExitReason;
+    e->rip = ec->VpContext.Rip;
+    if (ec->ExitReason == WHvRunVpExitReasonX64IoPortAccess) {
+        e->kind = 1;
+        e->addr = ec->IoPortAccess.PortNumber;
+        e->value = ec->IoPortAccess.Rax;
+        e->isWrite = (UINT8)ec->IoPortAccess.AccessInfo.IsWrite;
+        e->size = (UINT8)ec->IoPortAccess.AccessInfo.AccessSize;
+    } else if (ec->ExitReason == WHvRunVpExitReasonMemoryAccess) {
+        e->kind = 2;
+        e->addr = ec->MemoryAccess.Gpa;
+        e->isWrite = (ec->MemoryAccess.AccessInfo.AccessType == WHvMemoryAccessWrite) ? 1 : 0;
+    }
+    g_bootImgRingCount++;
+}
+
+static void bootImgRingDump(long lines) {
+    long total = g_bootImgRingCount;
+    long have  = total < BOOTIMG_RING_MAX ? total : BOOTIMG_RING_MAX;
+    long show  = have < lines ? have : lines;
+    long start = total - show;
+    long i;
+    printf("[bootimg-ring] the LAST %ld of %ld exits, ending at the return:\n", show, total);
+    for (i = start; i < total; i++) {
+        BootImgRingEntry *e = &g_bootImgRing[i % BOOTIMG_RING_MAX];
+        if (e->kind == 1) {
+            printf("[bootimg-ring] %6ld rip=0x%08llX  %s port=0x%03llX size=%u rax=0x%llX\n",
+                   e->exitIndex, (unsigned long long)e->rip,
+                   e->isWrite ? "OUT" : "IN ", (unsigned long long)e->addr,
+                   e->size, (unsigned long long)e->value);
+        } else if (e->kind == 2) {
+            printf("[bootimg-ring] %6ld rip=0x%08llX  %s mmio gpa=0x%llX\n",
+                   e->exitIndex, (unsigned long long)e->rip,
+                   e->isWrite ? "W  " : "R  ", (unsigned long long)e->addr);
+        } else {
+            printf("[bootimg-ring] %6ld rip=0x%08llX  %s (reason %u)\n",
+                   e->exitIndex, (unsigned long long)e->rip,
+                   exitReasonName(e->reason), e->reason);
+        }
+    }
+    fflush(stdout);
+}
 
 // MMIO is counted by 4KB page, which is the granularity that distinguishes one
 // device's register block from another's.
@@ -6648,8 +6739,13 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
         // because stdout here is redirected to a file, not a console; it is
         // console rendering that blocks the VM thread, not the printf itself.
         if (ahciCmdLogCount < AHCI_CMD_LOG_MAX) {
-            printf("[ahci] cmd #%d: ataCmd=0x%02X lba=%llu count=%u prdtl=%u\n",
-                   ahciCmdLogCount, ataCmd, (unsigned long long)lba, sectorCount, prdtl);
+            // The port index was missing here, which made every LBA in this log
+            // ambiguous: the same number means a different byte offset on the
+            // 2048-byte ISO than on the 512-byte disk, and there was no way to
+            // tell which device a read belonged to at all.
+            printf("[ahci] cmd #%d: port %d (%u-byte) ataCmd=0x%02X lba=%llu count=%u prdtl=%u\n",
+                   ahciCmdLogCount, portIndex, dev->sectorSize, ataCmd,
+                   (unsigned long long)lba, sectorCount, prdtl);
             fflush(stdout);
         }
         // U60: the log above is capped at 200 and firmware consumes every slot, so
@@ -6683,9 +6779,43 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
         if ((lba + sectorCount) > dev->sectors || (UINT64)sectorCount * dev->sectorSize > ATA_MAX_TRANSFER) {
             ok = 0;
         } else {
+            UINT32 want = sectorCount * dev->sectorSize;
+            size_t got;
             _fseeki64(dev->file, (long long)lba * dev->sectorSize, SEEK_SET);
-            fread(ataDataBuffer, 1, (size_t)sectorCount * dev->sectorSize, dev->file);
-            bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, sectorCount * dev->sectorSize);
+            got = fread(ataDataBuffer, 1, (size_t)want, dev->file);
+            // fread's result used to be discarded. A short read leaves the tail of
+            // ataDataBuffer holding the PREVIOUS command's bytes, and we would
+            // scatter all of it anyway -- handing the guest a buffer that is part
+            // fresh data and part stale, with nothing anywhere reporting a problem.
+            // Zero the shortfall so the failure is at least honest, and say so.
+            if (got < want) {
+                memset(ataDataBuffer + got, 0, want - got);
+                g_ahciShortReads++;
+                if (g_ahciShortReads <= 10) {
+                    printf("[ahci-short] port %d lba=%llu count=%u: wanted %u bytes, file gave %llu\n",
+                           portIndex, (unsigned long long)lba, sectorCount, want,
+                           (unsigned long long)got);
+                    fflush(stdout);
+                }
+            }
+            bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, want);
+            // Does what the guest ASKED for (the PRDT's own byte count) match what
+            // we actually delivered? A read that "succeeds" while moving the wrong
+            // number of bytes is exactly the failure that makes a caller retry the
+            // identical run and then give up, which is what this window does.
+            if (g_bootImgRunning && g_bootImgReadLogged < 80) {
+                UINT32 prdtBytes = 0;
+                UINT16 pi2;
+                for (pi2 = 0; pi2 < prdtl; pi2++) {
+                    unsigned char *e2 = prdt + (UINT64)pi2 * 16;
+                    prdtBytes += (*(UINT32 *)(e2 + 0x0C) & 0x3FFFFF) + 1;
+                }
+                g_bootImgReadLogged++;
+                printf("[bootimg-read] lba=%-7llu count=%-3u want=%-6u prdt=%-6u delivered=%-6u %s\n",
+                       (unsigned long long)lba, sectorCount, want, prdtBytes, bytesTransferred,
+                       (prdtBytes == bytesTransferred && bytesTransferred == want) ? "" : "<-- MISMATCH");
+                fflush(stdout);
+            }
         }
     } else if (ataCmd == 0x35 || ataCmd == 0xCA || ataCmd == 0x30 || ataCmd == 0x34) {
         // WRITE DMA EXT / WRITE DMA / WRITE SECTORS / WRITE SECTORS EXT -- see
@@ -10349,6 +10479,11 @@ int main(int argc, char *argv[]) {
         hr = WHvRunVirtualProcessor(partition, 0, &exitContext, sizeof(exitContext));
         if (FAILED(hr)) { printf("Failed to run vCPU. HRESULT: 0x%lx\n", hr); break; }
 
+        // Recorded here, before any handler runs, so the ring holds what the
+        // guest ASKED for rather than what we did about it -- and so nothing can
+        // be missed by a handler that returns early.
+        if (g_bootImgRunning) bootImgRingRecord(&exitContext, exitCount);
+
         // U40: sample RIP. Free -- VpContext.Rip is already populated by the exit
         // above, so no extra WHP register read. Needs no arming, so unlike a
         // breakpoint it is valid from the first exit of each pass, which is the
@@ -11703,6 +11838,8 @@ int main(int argc, char *argv[]) {
                         if (g_bootImgMmioSeen >= BOOTIMG_PORTS_MAX)
                             printf("[bootimg]     (mmio table full -- more distinct pages exist)\n");
                     }
+                    // The tail of the window -- what it was doing as it gave up.
+                    bootImgRingDump(BOOTIMG_RING_MAX);
                     g_bootImgRunning = 0;
                     fflush(stdout);
                     {
