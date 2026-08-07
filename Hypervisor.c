@@ -2888,6 +2888,10 @@ CRITICAL_SECTION ps2Lock;
 // One slot is always left empty so head==tail unambiguously means "empty".
 #define PS2_QUEUE_SIZE 64
 
+// How long to wait before re-asserting the i8042 interrupt for a byte the guest
+// has not read yet. See the re-assert comment in ps2ServiceOutputIrq.
+#define PS2_REASSERT_MS 50.0
+
 unsigned char kbQueue[PS2_QUEUE_SIZE];
 int kbHead = 0, kbTail = 0;
 
@@ -3238,13 +3242,19 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
         // controller holds its line asserted until the byte is read, so going
         // permanently silent after a single edge means one missed interrupt
         // wedges the ENTIRE controller -- there is only one output buffer, so an
-        // unread byte blocks the other device too. Twice a second is two orders
-        // of magnitude below the 20ms re-assert that destabilised boot before,
-        // and cannot storm anything.
+        // unread byte blocks the other device too.
+        //
+        // This was 500ms, which silently capped the drain rate at TWO BYTES A
+        // SECOND whenever a byte went unread -- one keystroke is two bytes, so
+        // typing outran the controller and the queue backed up until it dropped
+        // everything, which is what "the input is slow and unreliable" actually
+        // was. 500ms was picked when a 20ms re-assert destabilised boot, but that
+        // measurement predates the priority interrupt queue; 50ms is still 2.5x
+        // more conservative than the value that caused trouble.
         double sinceMs = perfFrequency.QuadPart
             ? (double)(now.QuadPart - g_ps2AnnouncedAt.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
             : 0.0;
-        if (sinceMs < 500.0) return 0;
+        if (sinceMs < PS2_REASSERT_MS) return 0;
     }
 
     if (isAux) {
@@ -3449,6 +3459,11 @@ CRITICAL_SECTION logLock;
 int efiHookStartingBoot0002Count = 0;
 // Incremented when BDS prints "failed to start Boot..." -- see appendToLog.
 int g_bdsBootFailed = 0;
+// Bumped by appendToLog when the boot application prints its CD/DVD prompt;
+// the main loop presses a key once per bump. Set LOCALHOST_NO_AUTO_BOOT_KEY=1
+// to leave the prompt to the user.
+long g_autoBootKeyWanted = 0, g_autoBootKeySent = 0;
+int g_noAutoBootKey = 0;
 
 void appendToLog(char c) {
     EnterCriticalSection(&logLock);
@@ -3466,6 +3481,29 @@ void appendToLog(char c) {
         if (c == needle[matchPos]) {
             matchPos++;
             if (needle[matchPos] == '\0') { efiHookStartingBoot0002Count++; matchPos = 0; }
+        } else {
+            matchPos = (c == needle[0]) ? 1 : 0;
+        }
+    }
+
+    // Answer "Press any key to boot from CD or DVD" automatically.
+    //
+    // Windows install media prints this, polls the i8042 for about five seconds,
+    // and on getting nothing returns EFI_TIMEOUT -- after which the firmware
+    // reports "No bootable option or device was found" and the ISO looks broken.
+    // It is not broken; nobody answered. Making the user win a five-second race
+    // every boot is not a reasonable way to start a VM.
+    //
+    // Triggered on the guest's OWN prompt text rather than on a timer or a
+    // breakpoint: the boot application writes it to COM1, which we already
+    // capture here, so this fires exactly when the prompt is on screen and at no
+    // other time. Re-arms per occurrence because BdsDxe retries the boot.
+    {
+        static const char needle[] = "Press any key to boot";
+        static int matchPos = 0;
+        if (c == needle[matchPos]) {
+            matchPos++;
+            if (needle[matchPos] == '\0') { g_autoBootKeyWanted++; matchPos = 0; }
         } else {
             matchPos = (c == needle[0]) ? 1 : 0;
         }
@@ -10171,6 +10209,13 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *noAutoKey = getenv("LOCALHOST_NO_AUTO_BOOT_KEY");
+                g_noAutoBootKey = (noAutoKey && atol(noAutoKey) != 0) ? 1 : 0;
+                printf("[autokey] \"Press any key to boot from CD or DVD\" will be "
+                       "answered automatically: %s\n", g_noAutoBootKey ? "NO (disabled)" : "yes");
+                fflush(stdout);
+            }
             const char *tabletEnv = getenv("LOCALHOST_USB_TABLET");
             if (tabletEnv && atol(tabletEnv) != 0) {
                 g_tabletEnabled = 1;
@@ -10627,6 +10672,20 @@ int main(int argc, char *argv[]) {
         // be missed by a handler that returns early.
         g_exitCountForDiag = exitCount;
         if (g_bootImgRunning) bootImgRingRecord(&exitContext, exitCount);
+
+        // The CD/DVD prompt is up (appendToLog saw the guest print it) -- press a
+        // key. SPACE, as a make/break pair, because the boot application polls the
+        // i8042 output buffer directly and a make with no break leaves the key
+        // stuck down for whatever reads it next.
+        if (g_autoBootKeySent < g_autoBootKeyWanted && !g_noAutoBootKey) {
+            g_autoBootKeySent++;
+            kbEnqueue(0x39);
+            kbEnqueue(0xB9);
+            printf("[autokey] answered \"Press any key to boot from CD or DVD\" "
+                   "(press %ld). Set LOCALHOST_NO_AUTO_BOOT_KEY=1 to disable.\n",
+                   g_autoBootKeySent);
+            fflush(stdout);
+        }
 
         // U40: sample RIP. Free -- VpContext.Rip is already populated by the exit
         // above, so no extra WHP register read. Needs no arming, so unlike a
