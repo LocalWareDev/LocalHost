@@ -803,6 +803,7 @@ int g_bootImgRunning = 0;
 long g_bootImgIoLogged = 0;
 long g_bootImgCmosLogged = 0;
 long g_bootImgMmioLogged = 0;
+long g_bootImgWriteLogged = 0;
 // UNCAPPED per-port tally for the boot application's window. The logged trace
 // above stops at 400 entries, which only shows the START of a ~3000-exit window
 // -- and reading the beginning of a truncated log has already produced one wrong
@@ -1640,6 +1641,8 @@ static int ahciPortsImplemented(void);
 int g_ahciIrqLogged = 0, g_ahciAckLogged = 0;
 long g_ahciIrqCount = 0; // U61: uncapped injection count, reported in the heartbeat
 long g_ahciRejected = 0; // commands we answered with ERR|ABRT -- see the reject log
+long g_ahciDropped = 0;  // commands discarded for an unusable PxCLB/CTBA
+long g_bootImgSvcLogged = 0;
 long g_pitTicksDelivered = 0; // firmware-era timer ticks (see deliverPitTimerIrq)
 static long g_ahciLastIrqExit = 0;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
@@ -4849,6 +4852,14 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
             value = (UINT32)regVal.Reg64;
         }
         UINT32 aligned = off & ~3u;
+        // PORT-RELATIVE, not hardcoded to port 0. Every case below was written
+        // when one port existed, so it matched only 0x1xx -- port 0's block.
+        // With a second port implemented, port 1's registers (0x180-0x1FF) fell
+        // through to the plain-store default: no write-1-to-clear on its PxIS and
+        // PxSERR, and its read-only status registers writable by the driver.
+        // Normalising the offset applies the same rules to every port.
+        if (aligned >= 0x100 && aligned < 0x100 + AHCI_PORT_COUNT * 0x80)
+            aligned = 0x100 + ((aligned - 0x100) % 0x80);
         switch (aligned) {
             // Read-only: capabilities, version, ports-implemented, and the port
             // status registers the device owns. Writes are silently dropped, as
@@ -4898,6 +4909,18 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
             g_ahciMmioLogged++;
             printf("[u59] WRITE %-10s (0x%03X) value=0x%08X -> now 0x%08X\n",
                    ahciRegName(off & ~3u), off & ~3u, value, *reg);
+            fflush(stdout);
+        }
+        // The DECODED WRITE VALUE, during the boot application's window. The
+        // generic MMIO trace logs the register's content BEFORE the write lands,
+        // because it runs ahead of this handler -- so it cannot answer the one
+        // question that matters here: is the driver actually setting a PxCI bit
+        // (a command being issued) or writing zero?
+        if (g_bootImgRunning && g_bootImgWriteLogged < 60) {
+            UINT32 rawOff = off & ~3u;
+            g_bootImgWriteLogged++;
+            printf("[bootimg-w] AHCI %-6s (0x%03X) wrote=0x%08X -> now 0x%08X\n",
+                   ahciRegName(rawOff), rawOff, value, *reg);
             fflush(stdout);
         }
     } else {
@@ -6519,6 +6542,16 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
     }
 
     UINT32 ci = *(UINT32 *)(port + 0x38); // PxCI
+    // What the engine SEES each pass while the boot application is running. The
+    // driver demonstrably writes PxCI=1, yet no command is ever processed and
+    // nothing is dropped -- so the engine must be returning before that point,
+    // and this says with which values.
+    if (g_bootImgRunning && g_bootImgSvcLogged < 40) {
+        g_bootImgSvcLogged++;
+        printf("[ahci-svc] port %d: PxCMD=0x%08X (ST=%d) PxCI=0x%08X\n",
+               portIndex, cmd, (int)(cmd & 1), ci);
+        fflush(stdout);
+    }
     if (ci == 0) return;
 
     int slot = -1, i;
@@ -6530,14 +6563,40 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
     // function for why this replaced the old "pulse" approach.
     *(UINT32 *)(port + 0x10) = 0;
 
+    // These two bail-outs used to be SILENT: they clear PxCI and return without
+    // counting or logging anything, so a command dropped here is indistinguishable
+    // from one that was never issued. That is exactly the state the boot
+    // application's failure presents as -- PxCI written with a slot bit, and our
+    // command total not moving. Say so.
     UINT32 clb = *(UINT32 *)(port + 0x00); // PxCLB (32-bit only -- CAP.S64A=0)
-    if (clb == 0 || clb >= guestMemSize) { *(UINT32 *)(port + 0x38) &= ~(1u << slot); return; }
+    if (clb == 0 || clb >= guestMemSize) {
+        UINT32 clbu = *(UINT32 *)(port + 0x04);
+        g_ahciDropped++;
+        if (g_ahciDropped <= 10) {
+            printf("[ahci-drop] port %d slot %d: PxCLB=0x%08X PxCLBU=0x%08X out of range "
+                   "(guest RAM %lluMB) -- command discarded\n",
+                   portIndex, slot, clb, clbu, (unsigned long long)(guestMemSize / (1024 * 1024)));
+            fflush(stdout);
+        }
+        *(UINT32 *)(port + 0x38) &= ~(1u << slot);
+        return;
+    }
 
     unsigned char *cmdHeader = (unsigned char *)guestMemory + clb + (UINT64)slot * 32;
     UINT16 prdtl = *(UINT16 *)(cmdHeader + 0x02);
     UINT32 ctba = *(UINT32 *)(cmdHeader + 0x08);
 
-    if (ctba == 0 || ctba >= guestMemSize) { *(UINT32 *)(port + 0x38) &= ~(1u << slot); return; }
+    if (ctba == 0 || ctba >= guestMemSize) {
+        g_ahciDropped++;
+        if (g_ahciDropped <= 10) {
+            printf("[ahci-drop] port %d slot %d: CTBA=0x%08X out of range (PxCLB=0x%08X, "
+                   "guest RAM %lluMB) -- command discarded\n",
+                   portIndex, slot, ctba, clb, (unsigned long long)(guestMemSize / (1024 * 1024)));
+            fflush(stdout);
+        }
+        *(UINT32 *)(port + 0x38) &= ~(1u << slot);
+        return;
+    }
     unsigned char *cmdTable = (unsigned char *)guestMemory + ctba;
     unsigned char *cfis = cmdTable; // Register H2D FIS at command table offset 0
     unsigned char ataCmd = cfis[2]; // byte 2 of a Register H2D FIS: the ATA command
