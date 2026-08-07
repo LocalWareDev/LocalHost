@@ -61,9 +61,58 @@ unsigned char cmosEncodeRtcField(unsigned char decimalValue, int useBcd) {
     return (unsigned char)(((decimalValue / 10) << 4) | (decimalValue % 10));
 }
 
+extern LARGE_INTEGER perfFrequency;  // defined just below; needed by the latch
+
 unsigned char cmosReadRtcField(unsigned char reg) {
+    // LATCHED, not sampled per register.
+    //
+    // This used to call GetLocalTime() fresh on every single register read, so a
+    // guest reading the time as a sequence -- seconds, minutes, hours, day,
+    // month, year, which is how every RTC driver does it -- could have the clock
+    // tick between two of those reads and get an inconsistent time (23:59:59
+    // followed by an hour of 00). Windows validates the sequence and RETRIES when
+    // it disagrees, so it can spin re-reading the CMOS. Measured: 95% of all
+    // sampled guest RIPs (11503 of 12055) sat in one page hammering ports
+    // 0x70/0x71, with the index values showing repeated time-register sweeps.
+    //
+    // Real hardware holds the time registers stable between update cycles and
+    // signals updates via UIP; since we always report UIP=0, we must present a
+    // consistent snapshot instead. Latch one and reuse it for the whole burst: a
+    // read sequence takes microseconds, so a gap of more than a few milliseconds
+    // means a NEW sequence, which is when it is safe to re-sample. Between bursts
+    // the clock still tracks real time exactly.
+    //
+    // Also removes a GetLocalTime syscall per register read.
+    // The staleness bound is NOT optional: latching purely on "same burst" would
+    // freeze the clock for any guest that polls the seconds register in a tight
+    // loop waiting for it to tick -- a calibration loop would then spin forever,
+    // which is worse than the bug being fixed. So re-sample either when a new
+    // burst starts (a gap, meaning the previous sequence finished) or whenever the
+    // snapshot is older than 250ms, whichever comes first. A read sequence lasts
+    // microseconds, so the residual chance of a refresh landing mid-sequence is
+    // negligible, and the clock can never drift more than a quarter second.
+    static SYSTEMTIME cachedSt;
+    static LARGE_INTEGER lastReadTick, lastRefreshTick;
+    static int haveCache = 0;
     SYSTEMTIME st;
-    GetLocalTime(&st);
+    {
+        LARGE_INTEGER now;
+        double gapMs, ageMs;
+        QueryPerformanceCounter(&now);
+        gapMs = (haveCache && perfFrequency.QuadPart)
+            ? (double)(now.QuadPart - lastReadTick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+            : 1e9;
+        ageMs = (haveCache && perfFrequency.QuadPart)
+            ? (double)(now.QuadPart - lastRefreshTick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+            : 1e9;
+        if (!haveCache || gapMs > 5.0 || ageMs > 250.0) {
+            GetLocalTime(&cachedSt);
+            lastRefreshTick = now;
+            haveCache = 1;
+        }
+        lastReadTick = now;
+        st = cachedSt;
+    }
     unsigned char regB = cmosRegisters[0x0B];
     int useBcd = (regB & 0x04) == 0;   // Dm bit: 0 = BCD, 1 = binary
     int is24Hour = (regB & 0x02) != 0; // Mil bit: 1 = 24-hour, 0 = 12-hour + PM bit
@@ -3209,6 +3258,10 @@ long g_auxCoalesced = 0;      // host motion events folded into a later packet
 //
 // Keying on the ARRIVAL SEQUENCE of the byte at the head of the output buffer is
 // the rule itself: one interrupt per byte, in order, and silence while idle.
+// Why the main-loop PS/2 delivery does or does not run. kbIrq stayed at 1 across
+// a run holding 20 queued bytes, so the question is whether this path is reached
+// at all and, if so, which condition turns it away.
+long g_ps2GateReached = 0, g_ps2GatePassed = 0, g_ps2GateNoKernel = 0, g_ps2GateIfClear = 0;
 static unsigned long g_ps2AnnouncedSeq = 0;
 static int g_ps2Announced = 0;
 static LARGE_INTEGER g_ps2AnnouncedAt;
@@ -5851,10 +5904,41 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     // mode. ioapicResolveVector now DROPS those instead (g_guestApicMode), so the
     // conditions that broke it no longer exist.
     //
-    // Still gated on the kernel being up (firmware polls the i8042 and injecting
-    // during that phase wedged it at ~25000 exits), and still edge-asserted with a
-    // slow re-assert so a pending byte cannot become a 1kHz storm.
-    if (g_bpModuleBase && guestInterruptsEnabled(partition)) {
+    // The gate used to be g_bpModuleBase alone, and that DISABLED KEYBOARD INPUT
+    // FOR THE ENTIRE ISO BOOT. g_bpModuleBase means "we spotted ntoskrnl in guest
+    // memory", which never happens when booting the installer: WinPE runs from the
+    // boot.wim the firmware loaded into RAM, so there is no kernel image to
+    // discover. Windows Setup was therefore fully up, its IOAPIC entry for GSI 1
+    // live at vector 0xA0, keystrokes queued and waiting -- and this branch never
+    // ran, so only the halted-loop path ever fired. Measured: 33 keys typed,
+    // queue depth climbing 38->61 and never draining, kbIrq=4 for the whole run.
+    //
+    // g_guestApicMode is the honest gate for "a real OS owns interrupt routing":
+    // it is set when the guest programs any IOAPIC redirection entry. Combined
+    // with ioapicResolveVector -- which delivers only on an entry the guest has
+    // actually programmed, and drops a pristine or masked one -- the original
+    // hazard is already covered. That hazard was injecting legacy vectors 0x08/
+    // 0x09 while firmware polled the i8042; those are refused now regardless.
+    g_ps2GateReached++;
+    if (!(g_bpModuleBase || g_guestApicMode)) g_ps2GateNoKernel++;
+    else if (!guestInterruptsEnabled(partition)) g_ps2GateIfClear++;
+    // Reported on its OWN cadence. Folding this into the change-gated input
+    // heartbeat meant the only snapshot I ever read was from early boot, before
+    // the guest had even initialised the i8042 -- which is exactly the phase where
+    // the gate is legitimately closed, so it looked damning and proved nothing.
+    {
+        static long lastReported = 0;
+        if (g_ps2GateReached - lastReported >= 2000) {
+            lastReported = g_ps2GateReached;
+            printf("[ps2-gate] reached=%ld passed=%ld blockedNoKernelOrApic=%ld "
+                   "blockedIFclear=%ld (bpModuleBase=%d apicMode=%d)\n",
+                   g_ps2GateReached, g_ps2GatePassed, g_ps2GateNoKernel,
+                   g_ps2GateIfClear, g_bpModuleBase ? 1 : 0, g_guestApicMode);
+            fflush(stdout);
+        }
+    }
+    if ((g_bpModuleBase || g_guestApicMode) && guestInterruptsEnabled(partition)) {
+        g_ps2GatePassed++;
         // Delivery from HERE is required, not an optimisation. Input interrupts
         // were once raised only from the HALTED loop, and once Windows settles
         // into polling the ACPI PM timer (lastPort=0xB008, IRQL 0) it never halts
@@ -6028,6 +6112,10 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                         printf("\n");
                         total = g_kbVkLogged;
                         have = total < KB_LASTREAD_MAX ? total : KB_LASTREAD_MAX;
+                        printf("[ps2-gate] main-loop delivery reached=%ld passed=%ld "
+                               "blockedNoKernelOrApic=%ld blockedIFclear=%ld\n",
+                               g_ps2GateReached, g_ps2GatePassed,
+                               g_ps2GateNoKernel, g_ps2GateIfClear);
                         printf("[ps2-vkring]   last %ld of %ld VKs reaching WndProc:", have, total);
                         for (i2 = total - have; i2 < total; i2++)
                             printf(" %02X", g_kbVkRing[i2 % KB_LASTREAD_MAX]);
