@@ -1236,6 +1236,9 @@ static void u49VerifyAcpiTables(unsigned char *mem, SIZE_T memSize) {
 void injectInterrupt(WHV_PARTITION_HANDLE partition, unsigned char vector);
 int guestInterruptsEnabled(WHV_PARTITION_HANDLE partition);
 int ioapicResolveVector(int gsi, unsigned char legacyVector, unsigned char *outVector);
+// The redirection tables live much further down this file; the input heartbeat
+// needs to report a GSI's raw entry, so reach it through an accessor.
+UINT64 ioapicRteFor(int gsi);
 
 // U53: route a device interrupt through the guest's own I/O APIC programming.
 //
@@ -2919,17 +2922,47 @@ unsigned long kbSeqQ[PS2_QUEUE_SIZE], auxSeqQ[PS2_QUEUE_SIZE];
 // count here means the guest is not draining; for the mouse it should stay at
 // zero now that motion is coalesced rather than queued unbounded.
 long g_kbDropped = 0, g_auxDropped = 0;
+long g_kbVkLogged = 0;   // total WM_KEYDOWNs seen; slot = count % KB_LASTREAD_MAX
+extern unsigned char g_kbVkRing[];
+// Declared here rather than beside the other keyboard counters because kbEnqueue
+// (just below) needs it, and that sits earlier in the file than they do.
+#define KB_LASTREAD_MAX 48
+extern unsigned char g_kbLastEnq[];
+extern long g_kbLastEnqCount;
 
 static int ps2Used(int head, int tail) { return (tail - head + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE; }
 static int ps2Free(int head, int tail) { return PS2_QUEUE_SIZE - 1 - ps2Used(head, tail); }
 
 void kbEnqueue(unsigned char b) {
     PS2_LOCK();
-    if (ps2Free(kbHead, kbTail) < 1) { g_kbDropped++; PS2_UNLOCK(); return; }
+    // A FULL queue used to discard the byte being ADDED, which is the worst
+    // possible choice for a keyboard: the guest drains slowly (it cannot be
+    // interrupted at all until it programs GSI 1's redirection entry, and only
+    // once per re-assert after that), so the queue saturates with keystrokes the
+    // user typed seconds ago and every FRESH keypress is thrown away. Measured
+    // against Windows Setup: queue pinned at 63, 21 bytes dropped, and 12 TAB
+    // presses produced exactly one TAB in the guest -- indistinguishable from
+    // "the keyboard does nothing".
+    //
+    // Drop from the HEAD instead, oldest first, so recent keys always get in. Two
+    // bytes, because scancodes travel as make/break pairs and evicting a lone make
+    // leaves the guest holding a key down forever.
+    if (ps2Free(kbHead, kbTail) < 1) {
+        int evict = 2, k;
+        for (k = 0; k < evict && kbHead != kbTail; k++)
+            kbHead = (kbHead + 1) % PS2_QUEUE_SIZE;
+        g_kbDropped += evict;
+    }
     kbSeqQ[kbTail] = g_ps2Seq++;
     kbQueue[kbTail] = b;
     kbTail = (kbTail + 1) % PS2_QUEUE_SIZE;
     g_kbEnqueuedTotal++;
+    // Ring of what went IN, to sit beside the ring of what came OUT. The consumed
+    // stream shows only SPACE (39/B9) even though TAB/DOWN/A are posted and
+    // kbUser rises, and enqueued-vs-consumed is the only way to tell whether
+    // those bytes are lost before the queue or after it.
+    g_kbLastEnq[g_kbLastEnqCount % KB_LASTREAD_MAX] = b;
+    g_kbLastEnqCount++;
     PS2_UNLOCK();
 }
 int kbHasData() { return kbHead != kbTail; }
@@ -3137,6 +3170,16 @@ long g_auxPackets = 0;        // packets actually queued to the guest
 long g_auxBytesToGuest = 0;   // bytes the guest actually read back out of port 0x60
 long g_kbBytesToGuest = 0;    // keystroke bytes the guest actually read
 long g_kbIrqSent = 0, g_kbIrqMasked = 0;  // keyboard IRQs we fired / that were masked
+long g_kbMaskedLogged = 0;                // counts RTE transitions seen at refusals
+UINT64 g_kbLastRefusedRte = 0xFFFFFFFFFFFFFFFFULL;  // sentinel: no refusal seen yet
+// exitCount is a local in main(); mirror it so diagnostics elsewhere can date an
+// event without threading the value through every call.
+long g_exitCountForDiag = 0;
+unsigned char g_kbLastRead[KB_LASTREAD_MAX];
+long g_kbLastReadCount = 0;               // total; slot = count % KB_LASTREAD_MAX
+unsigned char g_kbLastEnq[KB_LASTREAD_MAX];
+long g_kbLastEnqCount = 0;
+unsigned char g_kbVkRing[KB_LASTREAD_MAX];
 long g_injectSkippedBusy = 0;             // injections skipped because one was still pending
 long g_auxPacketsGated = 0;   // suppressed because the guest has not enabled reporting
 long g_auxIrqSent = 0, g_auxIrqMasked = 0;  // mouse IRQs we fired / that were masked
@@ -3211,7 +3254,30 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
     } else {
         g_kbIrqSent++;
         delivered = injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
-        if (!delivered) g_kbIrqMasked++;
+        if (!delivered) {
+            g_kbIrqMasked++;
+            // WHY it was refused. The heartbeat's "masked" total conflates a
+            // never-routed entry with one the guest programmed and then masked,
+            // and the end-of-run snapshot shows the entry LIVE -- so the refusals
+            // must be happening in states the snapshot never sees. Log the entry
+            // as it was at the moment of the decision.
+            // EDGE-TRIGGERED, not capped. A "first 24" filled up during boot and
+            // showed only HAL's masked default, telling us nothing about the state
+            // during the phase where keys are actually pressed. Logging on CHANGE
+            // gives the entry's whole history for the cost of one comparison.
+            {
+                UINT64 rte = ioapicRteFor(GSI_KEYBOARD);
+                if (rte != g_kbLastRefusedRte) {
+                    g_kbLastRefusedRte = rte;
+                    g_kbMaskedLogged++;
+                    printf("[ps2-masked] kbd irq refused (total %ld): rte CHANGED to 0x%016llX (%s) apicMode=%d\n",
+                           g_kbIrqMasked, (unsigned long long)rte,
+                           rte == 0x10000ULL ? "pristine" : (rte & 0x10000ULL) ? "masked bit set" : "live?!",
+                           g_guestApicMode);
+                    fflush(stdout);
+                }
+            }
+        }
     }
 
     // Only counted as announced if it actually went somewhere. A masked GSI
@@ -3445,6 +3511,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_KEYDOWN: {
             unsigned char sc = vkToScancode((int)wParam);
+            // Which VKs actually reach this handler, and what they map to. The
+            // enqueue ring shows only SPACE arriving while TAB/DOWN/A posted in the
+            // same loop never appear -- this separates "the message never got here"
+            // from "it got here and mapped to scancode 0".
+            // A RING, not a capped log: a "first 40" filled up entirely with the
+            // boot-phase keys and showed nothing from the phase that matters.
+            g_kbVkRing[g_kbVkLogged % KB_LASTREAD_MAX] = (unsigned char)wParam;
+            g_kbVkLogged++;
+            // UNBOUNDED and unconditional. Keystrokes are rare (hundreds at most)
+            // and stdout is a file here, so there is no cost -- and every bounded
+            // or change-gated version of this has left it ambiguous whether a key
+            // was missing or merely unprinted.
+            printf("[ps2-key] #%ld WM_KEYDOWN vk=0x%02X -> sc=0x%02X  queueDepth=%d dropped=%ld\n",
+                   g_kbVkLogged, (unsigned)wParam, sc,
+                   (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
+            fflush(stdout);
             if (sc != 0) { kbEnqueue(sc); InterlockedIncrement(&g_kbUserBytes); }
             return 0;
         }
@@ -5856,6 +5938,48 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
                            kbHasData() ? 1 : 0, auxHasData() ? 1 : 0,
                            auxReportingEnabled, auxPortEnabled,
                            g_rawMouseAvailable, LH_TABLET_OWNS_POINTER ? 1 : 0);
+                    // "masked" above conflates two OPPOSITE situations, and which
+                    // one it is decides where the bug lives:
+                    //   rte == 0x10000  -> entry still at power-on default. The guest
+                    //                      has never routed this GSI, so in APIC mode
+                    //                      we drop. Means i8042prt never programmed it.
+                    //   rte &  0x10000  -> the guest programmed it and then MASKED it,
+                    //                      i.e. it knows about the line and refuses it.
+                    //   otherwise       -> routed and live; vector is rte & 0xFF.
+                    {
+                        UINT64 kbRte = ioapicRteFor(GSI_KEYBOARD);
+                        UINT64 msRte = ioapicRteFor(GSI_MOUSE);
+                        printf("[ps2-route] kbd gsi=%d rte=0x%016llX (%s) | mouse gsi=%d rte=0x%016llX (%s) "
+                               "| apicMode=%d legacyDropped=%ld\n",
+                               GSI_KEYBOARD, (unsigned long long)kbRte,
+                               kbRte == 0x10000ULL ? "PRISTINE -- guest never routed it"
+                                 : (kbRte & 0x10000ULL) ? "MASKED by guest" : "live",
+                               GSI_MOUSE, (unsigned long long)msRte,
+                               msRte == 0x10000ULL ? "PRISTINE -- guest never routed it"
+                                 : (msRte & 0x10000ULL) ? "MASKED by guest" : "live",
+                               g_guestApicMode, g_legacyVectorDropped);
+                    }
+                    {
+                        long total = g_kbLastReadCount;
+                        long have = total < KB_LASTREAD_MAX ? total : KB_LASTREAD_MAX;
+                        long i2;
+                        printf("[ps2-lastread] last %ld of %ld scancodes the guest consumed:", have, total);
+                        for (i2 = total - have; i2 < total; i2++)
+                            printf(" %02X", g_kbLastRead[i2 % KB_LASTREAD_MAX]);
+                        printf("\n");
+                        total = g_kbLastEnqCount;
+                        have = total < KB_LASTREAD_MAX ? total : KB_LASTREAD_MAX;
+                        printf("[ps2-lastenq]  last %ld of %ld scancodes WE enqueued: ", have, total);
+                        for (i2 = total - have; i2 < total; i2++)
+                            printf(" %02X", g_kbLastEnq[i2 % KB_LASTREAD_MAX]);
+                        printf("\n");
+                        total = g_kbVkLogged;
+                        have = total < KB_LASTREAD_MAX ? total : KB_LASTREAD_MAX;
+                        printf("[ps2-vkring]   last %ld of %ld VKs reaching WndProc:", have, total);
+                        for (i2 = total - have; i2 < total; i2++)
+                            printf(" %02X", g_kbVkRing[i2 % KB_LASTREAD_MAX]);
+                        printf("\n");
+                    }
                     fflush(stdout);
                 }
             }
@@ -7253,6 +7377,13 @@ typedef struct {
 IoApicState ioapic1 = { 1, 0, { 0 } };
 IoApicState ioapic2 = { 2, 0, { 0 } };
 
+UINT64 ioapicRteFor(int gsi) {
+    IoApicState *ap = (gsi < 24) ? &ioapic1 : &ioapic2;
+    int entry = (gsi < 24) ? gsi : (gsi - IOAPIC2_GSI_BASE);
+    if (entry < 0 || entry >= (int)(sizeof(ap->redirTable) / sizeof(ap->redirTable[0]))) return 0;
+    return ap->redirTable[entry];
+}
+
 UINT32 ioapicReadRegister(IoApicState *ap, UINT32 reg) {
     if (reg == 0x00) return (ap->id & 0xF) << 24;
     if (reg == 0x01) return (23u << 16) | 0x11u; // Version 0x11, Max Redirection Entry = 23 (24 entries)
@@ -7275,6 +7406,18 @@ void ioapicWriteRegister(IoApicState *ap, UINT32 reg, UINT32 value) {
         UINT64 old = ap->redirTable[entry];
         if (isHigh) ap->redirTable[entry] = (old & 0xFFFFFFFFULL) | ((UINT64)value << 32);
         else ap->redirTable[entry] = (old & 0xFFFFFFFF00000000ULL) | value;
+        // Every write to the KEYBOARD's entry, unconditionally. The end-of-run
+        // snapshot says this line is live while ~99% of keyboard IRQs were refused
+        // against a masked 0x100FF, so the entry's timeline -- when it goes live,
+        // and whether anything re-masks it -- is the whole question.
+        if (ap == &ioapic1 && entry == GSI_KEYBOARD) {
+            UINT64 now = ap->redirTable[entry];
+            printf("[kbd-rte] write: 0x%016llX -> 0x%016llX (vector 0x%02X, %s) at exit %ld\n",
+                   (unsigned long long)old, (unsigned long long)now,
+                   (unsigned)(now & 0xFF), (now & 0x10000ULL) ? "MASKED" : "unmasked",
+                   g_exitCountForDiag);
+            fflush(stdout);
+        }
         // The guest programming ANY redirection entry means it has moved to APIC
         // interrupt routing. From that point the legacy PIC-remapped vectors are
         // not just unhelpful, they are illegal: 0x08 (RTC) and 0x09 (keyboard) sit
@@ -10482,6 +10625,7 @@ int main(int argc, char *argv[]) {
         // Recorded here, before any handler runs, so the ring holds what the
         // guest ASKED for rather than what we did about it -- and so nothing can
         // be missed by a handler that returns early.
+        g_exitCountForDiag = exitCount;
         if (g_bootImgRunning) bootImgRingRecord(&exitContext, exitCount);
 
         // U40: sample RIP. Free -- VpContext.Rip is already populated by the exit
@@ -11551,6 +11695,19 @@ int main(int argc, char *argv[]) {
                             // produced one false "it works".
                             g_kbBytesToGuest++;
                             returnValue = kbDequeue();
+                            // A RING of the last scancodes the guest actually
+                            // consumed. Logging the FIRST n is useless here: those
+                            // are all i8042prt's boot handshake, and the question is
+                            // what it reads once Setup is up and a key is pressed.
+                            g_kbLastRead[g_kbLastReadCount % KB_LASTREAD_MAX] = returnValue;
+                            g_kbLastReadCount++;
+                            // Unbounded, like [ps2-key]. Both rings above are printed
+                            // from the change-gated heartbeat, so a stale snapshot was
+                            // indistinguishable from a byte that never moved -- which
+                            // is exactly the question here.
+                            printf("[ps2-out] #%ld guest read scancode 0x%02X\n",
+                                   g_kbLastReadCount, returnValue);
+                            fflush(stdout);
                         }
                         else if (auxHasData()) {
                             // Count what the guest actually CONSUMES. g_auxPackets
