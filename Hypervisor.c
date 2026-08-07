@@ -3462,7 +3462,7 @@ int g_bdsBootFailed = 0;
 // Bumped by appendToLog when the boot application prints its CD/DVD prompt;
 // the main loop presses a key once per bump. Set LOCALHOST_NO_AUTO_BOOT_KEY=1
 // to leave the prompt to the user.
-long g_autoBootKeyWanted = 0, g_autoBootKeySent = 0;
+long g_autoBootKeyWanted = 0, g_autoBootKeySent = 0, g_autoBootKeyReported = 0;
 int g_noAutoBootKey = 0;
 
 void appendToLog(char c) {
@@ -3501,9 +3501,24 @@ void appendToLog(char c) {
     {
         static const char needle[] = "Press any key to boot";
         static int matchPos = 0;
+        static ULONGLONG lastMatchTick = 0;
         if (c == needle[matchPos]) {
             matchPos++;
-            if (needle[matchPos] == '\0') { g_autoBootKeyWanted++; matchPos = 0; }
+            if (needle[matchPos] == '\0') {
+                // DEBOUNCED. The boot application mirrors its console to BOTH
+                // COM1 and COM2, so a single on-screen prompt reaches this
+                // matcher twice and looked like the prompt appearing again --
+                // which is the one thing that must not be misreported, since a
+                // genuine repeat means a mid-install reboot. A real second prompt
+                // is a reboot away, many seconds out, so anything within five
+                // seconds is the same prompt echoed on the other port.
+                ULONGLONG tick = GetTickCount64();
+                if (tick - lastMatchTick > 5000) {
+                    lastMatchTick = tick;
+                    g_autoBootKeyWanted++;
+                }
+                matchPos = 0;
+            }
         } else {
             matchPos = (c == needle[0]) ? 1 : 0;
         }
@@ -10212,8 +10227,11 @@ int main(int argc, char *argv[]) {
             {
                 const char *noAutoKey = getenv("LOCALHOST_NO_AUTO_BOOT_KEY");
                 g_noAutoBootKey = (noAutoKey && atol(noAutoKey) != 0) ? 1 : 0;
-                printf("[autokey] \"Press any key to boot from CD or DVD\" will be "
-                       "answered automatically: %s\n", g_noAutoBootKey ? "NO (disabled)" : "yes");
+                printf("[autokey] \"Press any key to boot from CD or DVD\": %s\n",
+                       g_noAutoBootKey
+                         ? "NOT answered (LOCALHOST_NO_AUTO_BOOT_KEY=1) -- press a key yourself"
+                         : "answered automatically on the FIRST boot only; later prompts "
+                           "(mid-install reboots) are left alone so the install can finish");
                 fflush(stdout);
             }
             const char *tabletEnv = getenv("LOCALHOST_USB_TABLET");
@@ -10677,13 +10695,39 @@ int main(int argc, char *argv[]) {
         // key. SPACE, as a make/break pair, because the boot application polls the
         // i8042 output buffer directly and a make with no break leaves the key
         // stuck down for whatever reads it next.
-        if (g_autoBootKeySent < g_autoBootKeyWanted && !g_noAutoBootKey) {
+        //
+        // ONLY on the very first boot, and only before the guest has reset. That
+        // prompt is a SAFETY MECHANISM, not an annoyance: its default is "do NOT
+        // boot the CD". Windows Setup reboots the machine partway through the
+        // install and must come back up on the DISK to continue -- if the ISO is
+        // still attached and something answers the prompt again, Setup restarts
+        // from the beginning instead, and the install can never finish. So answer
+        // it to START an install, and never again for the life of the VM.
+        //
+        // g_sawReset is the guest actually resetting (port 0x64/0xFE), which is
+        // exactly the mid-install reboot, so it distinguishes "first power-on"
+        // from "came back around" without guessing from timing.
+        if (!g_noAutoBootKey && g_autoBootKeySent == 0 && g_autoBootKeyWanted > 0
+            && !g_sawReset) {
             g_autoBootKeySent++;
+            // Mark THIS prompt as accounted for, or the branch below immediately
+            // reports the very prompt we just answered as a repeat.
+            g_autoBootKeyReported = g_autoBootKeyWanted;
             kbEnqueue(0x39);
             kbEnqueue(0xB9);
-            printf("[autokey] answered \"Press any key to boot from CD or DVD\" "
-                   "(press %ld). Set LOCALHOST_NO_AUTO_BOOT_KEY=1 to disable.\n",
-                   g_autoBootKeySent);
+            printf("[autokey] answered \"Press any key to boot from CD or DVD\" -- "
+                   "FIRST BOOT ONLY. Any later prompt (a mid-install reboot) is left "
+                   "unanswered so the guest boots the disk and Setup continues.\n");
+            fflush(stdout);
+        } else if (!g_noAutoBootKey && g_autoBootKeyWanted > g_autoBootKeyReported
+                   && (g_autoBootKeySent > 0 || g_sawReset)) {
+            // Say why we are deliberately staying quiet, so a boot that "ignores"
+            // the prompt does not look like the auto-answer having broken.
+            g_autoBootKeyReported = g_autoBootKeyWanted;
+            printf("[autokey] CD/DVD prompt shown again (guest reset=%d) -- NOT answering; "
+                   "booting from disk so an in-progress install can continue. "
+                   "Press a key in the window within ~5s to boot the ISO instead.\n",
+                   g_sawReset);
             fflush(stdout);
         }
 
