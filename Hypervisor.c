@@ -1422,13 +1422,35 @@ extern unsigned char g_reqIrqLastVector;
 int g_tprGateTimer = 1;
 
 // Route DEVICE (storage/NIC) interrupts through the APIC instead of the raw slot.
-// Default OFF until measured. See the note in drainInterruptQueue's APIC block.
-int g_apicDeviceVectors = 0;
+// DEFAULT ON. With the timer also on the APIC this is what finally lets storahci
+// complete commands: AHCI IRQ injections 15 -> 105, guest sectors 2817 -> 11547,
+// and Windows Setup reaches its edition-selection screen (which requires reading
+// the install image off the ISO). LOCALHOST_APIC_DEVICE=0 reverts.
+int g_apicDeviceVectors = 1;
+// Route TIMER (RTC) interrupts through the APIC instead of the raw slot.
+//
+// DEFAULT ON, measured. The raw slot jams on vector 0xD1 and leaves a HALTED
+// guest unwakeable, which is the VM "going mad" after being left alone: the guest
+// sits in HalProcessorIdle and nothing ever wakes it.
+//
+//   raw slot:  RTC fired 37000, only 1800 queued, 35414 coalesced onto ONE
+//              entry stuck at depth=1, 20 unwedge events, exitCount frozen 112s
+//   via APIC:  depth=0 throughout a 4-minute soak, 0 stalls, 0 unwedges,
+//              delivered climbing 2376 -> 7181 -> 15815, guest never froze
+//
+// The APIC has an IRR bit per vector, applies priority itself and tracks EOI, so
+// it cannot jam the way one register does. The reason this was previously scoped
+// away -- it "died immediately after the first RTC tick was delivered through the
+// APIC as vector 0xD1" -- was the HAL time-lock deadlock fixed in 31d7bab.
+// LOCALHOST_APIC_TIMER=0 reverts.
+int g_apicTimerVectors = 1;
 
-// Follow the guest when it re-programs BAR5. Default OFF -- correct, but it makes
-// the guest depend on AHCI completion interrupts that the raw slot cannot deliver
-// reliably, and Setup then never reaches its GUI. See ahciHandleBar5Access.
-int g_ahciAllowRebase = 0;
+// Follow the guest when it re-programs BAR5. DEFAULT ON now that AHCI completion
+// interrupts actually arrive (device+timer vectors on the APIC above). This was
+// off while the raw slot could not carry them and Setup never reached its GUI;
+// with the APIC carrying them, Setup reads the install image off the ISO and gets
+// as far as its edition-selection screen. LOCALHOST_AHCI_REBASE=0 reverts.
+int g_ahciAllowRebase = 1;
 
 // Deliver queued interrupts through the virtual APIC (WHvRequestInterrupt)
 // instead of forcing them into the raw pending-interruption slot.
@@ -1626,8 +1648,24 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
                 // the first RTC tick was delivered through the APIC as vector
                 // 0xD1", which is the HAL time-lock deadlock fixed in 31d7bab.
                 // Gated and default-off until measured.
+                // TIMER too, when g_apicTimerVectors is set. The raw slot is fatal
+                // for this vector specifically: measured over one idle run, the
+                // RTC fired 37000 times, only 1800 were ever queued, 35414 were
+                // coalesced onto ONE entry that sat at depth=1, and the unwedge
+                // path fired 20 times -- every one of them vector 0xD1. The guest
+                // halts in HalProcessorIdle and is then never woken: exitCount
+                // frozen for 112s, which presents as the VM "going mad" because
+                // input does nothing while the guest is not running at all.
+                //
+                // The APIC has an IRR bit per vector, applies priority itself and
+                // tracks EOI, so it cannot jam the way one register does. Retrying
+                // it for the timer is justified now because the reason it was
+                // scoped away -- it "died immediately after the first RTC tick was
+                // delivered through the APIC as vector 0xD1" -- is the HAL
+                // time-lock deadlock fixed in 31d7bab.
                 if (g_irqQueue[k].prio != IRQ_PRIO_INPUT &&
-                    !(g_apicDeviceVectors && g_irqQueue[k].prio == IRQ_PRIO_DEVICE)) continue;
+                    !(g_apicDeviceVectors && g_irqQueue[k].prio == IRQ_PRIO_DEVICE) &&
+                    !(g_apicTimerVectors  && g_irqQueue[k].prio == IRQ_PRIO_TIMER)) continue;
                 if (b < 0 || g_irqQueue[k].seq < g_irqQueue[b].seq) b = k;
             }
             if (b < 0) break;                       // nothing left for the APIC
@@ -3142,7 +3180,24 @@ int auxHead = 0, auxTail = 0;
 
 void auxEnqueue(unsigned char b) {
     PS2_LOCK();
-    if (ps2Free(auxHead, auxTail) < 1) { g_auxDropped++; PS2_UNLOCK(); return; }
+    // A FULL queue used to discard the byte being ADDED -- the same mistake
+    // kbEnqueue had, and worse here. Mouse packets are THREE bytes (status, dx,
+    // dy), so losing one byte does not lose one movement: it shifts every
+    // following byte into the wrong field, and the driver reads dx as status and
+    // dy as dx from then on. That is why the pointer "works until it doesn't" and
+    // never recovers on its own -- the stream is desynchronised, not merely
+    // behind.
+    //
+    // Evict a WHOLE PACKET from the head instead. Three bytes, because dropping
+    // any other number is what breaks framing in the first place; the head is
+    // packet-aligned in the steady state since motion is generated a packet at a
+    // time. Costs one stale movement and keeps every later packet aligned.
+    if (ps2Free(auxHead, auxTail) < 1) {
+        int evict = 3, k;
+        for (k = 0; k < evict && auxHead != auxTail; k++)
+            auxHead = (auxHead + 1) % PS2_QUEUE_SIZE;
+        g_auxDropped += evict;
+    }
     auxSeqQ[auxTail] = g_ps2Seq++;
     auxQueue[auxTail] = b;
     auxTail = (auxTail + 1) % PS2_QUEUE_SIZE;
@@ -10591,11 +10646,18 @@ int main(int argc, char *argv[]) {
                 fflush(stdout);
             }
             {
+                const char *apicTimerEnv = getenv("LOCALHOST_APIC_TIMER");
+                if (apicTimerEnv) g_apicTimerVectors = (atol(apicTimerEnv) != 0);
+                printf("[irq] timer interrupts via APIC: %s\n",
+                       g_apicTimerVectors ? "YES" : "no (raw slot)");
+                fflush(stdout);
+            }
+            {
                 const char *rebaseEnv = getenv("LOCALHOST_AHCI_REBASE");
                 if (rebaseEnv) g_ahciAllowRebase = (atol(rebaseEnv) != 0);
                 printf("[ahci] follow guest BAR re-base: %s\n",
-                       g_ahciAllowRebase ? "YES (storahci sees the disk; Setup may not reach its GUI)"
-                                         : "no (Setup boots; guest sees no disk)");
+                       g_ahciAllowRebase ? "YES (storahci binds and sees the disk)"
+                                         : "no (guest will see no disk)");
                 fflush(stdout);
             }
             {
