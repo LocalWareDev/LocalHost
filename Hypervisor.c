@@ -3669,6 +3669,41 @@ extern volatile LONG g_tabletX, g_tabletY, g_tabletButtons, g_tabletWheel, g_tab
 // apart, and that ambiguity has already cost one wrong guess in this file.
 extern volatile LONG g_tabletMoves;
 
+// Defined with the watchdog further down. Needed here so a keystroke can end the
+// current WHvRunVirtualProcessor call -- see ps2WakeRunLoop.
+extern WHV_PARTITION_HANDLE g_watchdogPartition;
+
+// A keystroke has been queued; make sure the run loop gets a turn to deliver it.
+//
+// PS/2 servicing runs only from the run loop, and that loop only iterates when
+// the guest EXITS. A guest sitting at a dialog waiting for input barely exits at
+// all, so WHvRunVirtualProcessor does not return, ps2ServiceOutputIrq is never
+// called, and the keystroke waits -- which is exactly the reported "input does
+// nothing", and why disabling the 50ms re-assert (the only thing that recovered
+// it on some later exit) made delivery collapse from 8/15 to 1/15.
+//
+// Same fault the USB schedules already had, and the same fix: stop depending on
+// the guest to generate exits. Cancelling is documented-safe from another thread
+// and the run loop already handles WHvRunVpExitReasonCanceled.
+//
+// STRICTLY EVENT-DRIVEN, once per key event. The existing rtcCancelThread carries
+// a hard-won warning: an unconditional cancel every 10ms "perturbs WHV itself
+// rather than helping" and made an unrelated early-boot stall reproduce 100% of
+// the time. A human generates a few key events a second, which is orders of
+// magnitude below that, and none at all while idle. Deliberately NOT applied to
+// mouse motion, which can fire hundreds of times a second and would recreate
+// precisely the continuous pattern that was reverted.
+// NOT VERIFIED AS A FIX. Measured across runs with Setup up in every one:
+// 15/15, 15/15, 0/15, 3/15 keys delivered. It addresses a real structural fault
+// and mirrors a fix already applied to the USB schedules, but delivery is still
+// dominated by something else. Gated (LOCALHOST_PS2_WAKE=0 disables) so it can be
+// A/B'd against that variance rather than assumed to help.
+int g_ps2WakeEnabled = 1;
+static void ps2WakeRunLoop(void) {
+    if (g_ps2WakeEnabled && g_watchdogPartition)
+        WHvCancelRunVirtualProcessor(g_watchdogPartition, 0, 0);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_KEYDOWN: {
@@ -3689,12 +3724,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                    g_kbVkLogged, (unsigned)wParam, sc,
                    (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
             fflush(stdout);
-            if (sc != 0) { kbEnqueue(sc); InterlockedIncrement(&g_kbUserBytes); }
+            if (sc != 0) { kbEnqueue(sc); InterlockedIncrement(&g_kbUserBytes); ps2WakeRunLoop(); }
             return 0;
         }
         case WM_KEYUP: {
             unsigned char sc = vkToScancode((int)wParam);
-            if (sc != 0) { kbEnqueue(sc | 0x80); InterlockedIncrement(&g_kbUserBytes); }
+            if (sc != 0) { kbEnqueue(sc | 0x80); InterlockedIncrement(&g_kbUserBytes); ps2WakeRunLoop(); }
             return 0;
         }
         // Raw device motion, used INSTEAD of WM_MOUSEMOVE deltas for movement.
@@ -10377,6 +10412,13 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *wakeEnv = getenv("LOCALHOST_PS2_WAKE");
+                if (wakeEnv) g_ps2WakeEnabled = (atol(wakeEnv) != 0);
+                printf("[ps2] wake run loop on keystroke: %s\n",
+                       g_ps2WakeEnabled ? "yes" : "no (disabled)");
+                fflush(stdout);
+            }
             {
                 const char *reassertEnv = getenv("LOCALHOST_PS2_REASSERT_MS");
                 if (reassertEnv) g_ps2ReassertMs = atof(reassertEnv);
