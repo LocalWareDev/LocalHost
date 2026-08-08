@@ -2987,6 +2987,11 @@ CRITICAL_SECTION ps2Lock;
 // programmed. See the rate-cap comment in deliverRtcPeriodicIrq.
 double g_rtcMinIntervalMs = 0.0;
 
+// ABAR traffic split by driver: firmware versus the Windows kernel. See the
+// comment in ahciHandleAbarMmio -- "Setup finds no drives" needs to distinguish
+// storahci never binding from storahci binding and then failing.
+long g_ahciAbarGuestAccesses = 0, g_ahciAbarFwAccesses = 0;
+
 // How long to wait before re-asserting the i8042 interrupt for a byte the guest
 // has not read yet. See the re-assert comment in ps2ServiceOutputIrq.
 //
@@ -5249,6 +5254,23 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     if (gpa < ahciAbarBase || gpa >= (UINT64)ahciAbarBase + AHCI_BAR_SIZE) return 0;
     UINT32 off = (UINT32)(gpa - ahciAbarBase);
 
+    // Split ABAR traffic by who is driving: firmware, or the Windows kernel once
+    // it has been discovered. Windows Setup reports "we couldn't find any drives",
+    // and the totals say the guest has read ZERO sectors while the firmware read
+    // 109MB -- so the question is whether storahci ever touches this controller at
+    // all, or never binds to it. Those need different fixes and the aggregate
+    // command counter cannot tell them apart.
+    if (g_bpModuleBase) {
+        g_ahciAbarGuestAccesses++;
+        if (g_ahciAbarGuestAccesses == 1) {
+            printf("[ahci-guest] FIRST kernel-side ABAR access at off=0x%X (rip=0x%llX)\n",
+                   off, (unsigned long long)exitContext->VpContext.Rip);
+            fflush(stdout);
+        }
+    } else {
+        g_ahciAbarFwAccesses++;
+    }
+
     int isWrite = 0, isImm = 0, regNum = 0, insnTotalLen = 0;
     UINT32 immVal = 0;
     if (!ioapicDecodeMmio(exitContext->MemoryAccess.InstructionBytes,
@@ -6536,6 +6558,27 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
             } else {
                 ahciBar5Sizing = 0;
                 UINT32 newBase = written & ~(UINT32)(AHCI_BAR_SIZE - 1);
+                // RE-BASING. The guard below is `!ahciAbarMapped`, so once the
+                // firmware has programmed BAR5 every later write was silently
+                // dropped and ahciAbarBase stayed at the firmware's address. That
+                // is fatal with a real OS: Windows PnP re-assigns PCI BARs as a
+                // matter of course, and when it moves this one we carried on
+                // trapping the old GPA, so every storahci access landed in
+                // unmapped space. Measured symptom: ABAR touches fw=36212
+                // kernel=0 -- the Windows kernel never reached this controller
+                // once, so it never bound to it, so Windows Setup reported "we
+                // couldn't find any drives".
+                //
+                // Honour the move. The backing buffer is deliberately never mapped
+                // into the guest (U58, so register accesses fault to us and
+                // write-1-to-clear behaves like hardware), which means re-basing
+                // is just pointing the trap window at the new address.
+                if (newBase != 0 && ahciAbarMapped && newBase != ahciAbarBase) {
+                    printf("[ahci-bar] guest RE-BASED ABAR: 0x%08X -> 0x%08X (kernelUp=%d)\n",
+                           ahciAbarBase, newBase, g_bpModuleBase ? 1 : 0);
+                    fflush(stdout);
+                    ahciAbarBase = newBase;
+                }
                 if (newBase != 0 && !ahciAbarMapped) {
                     ahciAbarBase = newBase;
                     ahciAbarMemory = VirtualAlloc(NULL, AHCI_BAR_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -10879,10 +10922,12 @@ int main(int argc, char *argv[]) {
                        " | pipe->guest: fromPipe=%ld toGuest=%ld ringDrop=%ld\n",
                        kdClientConnected, g_kdTxToPipe, g_kdTxWriteFail, (unsigned long)g_kdTxLastErr,
                        g_kdTxDropped, g_kdRxFromPipe, g_kdRxToGuest, g_kdRxDropped);
-                printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)\n",
+                printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)"
+                       " | ABAR touches: fw=%ld kernel=%ld\n",
                        g_ahciIrqCount,
                        g_ahciFwSectors, (g_ahciFwSectors * 512) / (1024 * 1024),
-                       g_ahciGuestSectors, (g_ahciGuestSectors * 512) / (1024 * 1024));
+                       g_ahciGuestSectors, (g_ahciGuestSectors * 512) / (1024 * 1024),
+                       g_ahciAbarFwAccesses, g_ahciAbarGuestAccesses);
                 printf("[heartbeat]   ahci: GHC=0x%08X (AE=%u IE=%u) PI=0x%X | PxCMD=0x%08X (ST=%u FRE=%u) PxIE=0x%08X PxIS=0x%08X PxCI=0x%08X PxTFD=0x%08X PxSSTS=0x%08X\n",
                        ghc, (ghc >> 31) & 1, (ghc >> 1) & 1, pi,
                        *(UINT32 *)(pt + 0x18), *(UINT32 *)(pt + 0x18) & 1, (*(UINT32 *)(pt + 0x18) >> 4) & 1,
