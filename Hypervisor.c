@@ -1916,6 +1916,9 @@ static long g_ahciLastIrqExit = 0;
 // Which ports were asserting at the last injection, so a NEW completion goes out
 // immediately while a repeat of the same unacknowledged one stays throttled.
 static UINT32 g_ahciLastAsserting = 0;
+// Wall-clock timestamp of the last AHCI interrupt injection. Replaces counting in
+// VM exits, which made disk latency depend on how busy the CPU was.
+static LARGE_INTEGER g_ahciLastIrqTick;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
     if (!ahciAbarMemory) return;
     unsigned char *ab = (unsigned char *)ahciAbarMemory;
@@ -1961,8 +1964,35 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     // Safe now in a way it was not before: these go through the APIC (6666e4c),
     // which has an IRR bit per vector and tracks EOI, so a fast edge cannot jam a
     // single slot the way the raw path did.
-    if (asserting == g_ahciLastAsserting &&
-        exitCount - g_ahciLastIrqExit < 500) return;    // same condition, still unacked
+    // THROTTLE BY TIME, NOT EXIT COUNT.
+    //
+    // The 500-EXIT gate was the whole bottleneck, and the edge check above does
+    // not rescue it: `asserting` is a bitmap of PORTS, so port 0 asserting for a
+    // brand-new completion looks identical to the previous one and still lands in
+    // the throttle. Measured mid-install: 1250 exits/sec / 500 = 2.5 injections
+    // per second, and the observed rate was 2.5 -- the guest was managing 1.7 AHCI
+    // commands/sec and 19 KB/s, which is ~60 hours for a Windows install.
+    //
+    // Counting in exits is wrong in principle too: it ties device latency to how
+    // busy the CPU happens to be, so the quieter the guest gets the slower its
+    // disk becomes -- the same mistake as driving the USB schedules and the window
+    // repaint off exit count, both already fixed here.
+    //
+    // 1ms re-assert. Still a real throttle against re-asserting an unacknowledged
+    // condition, but ~400x above the old ceiling and far above the ~100/sec the
+    // driver actually needs. Safe because these go through the APIC, whose IRR
+    // holds one bit per vector -- a duplicate assertion coalesces there instead of
+    // jamming, which is exactly what the raw slot could not do.
+    {
+        LARGE_INTEGER nowIrq;
+        QueryPerformanceCounter(&nowIrq);
+        if (asserting == g_ahciLastAsserting && perfFrequency.QuadPart) {
+            double sinceMs = (double)(nowIrq.QuadPart - g_ahciLastIrqTick.QuadPart)
+                             * 1000.0 / (double)perfFrequency.QuadPart;
+            if (sinceMs < 1.0) return;                  // same condition, just re-asserted
+        }
+        g_ahciLastIrqTick = nowIrq;
+    }
     g_ahciLastAsserting = asserting;
     if (!guestInterruptsEnabled(partition)) return;
     g_ahciLastIrqExit = exitCount;
