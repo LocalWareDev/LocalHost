@@ -1401,6 +1401,26 @@ extern unsigned char g_reqIrqLastVector;
 #define IRQ_RESPECT_TPR   1
 #define IRQ_COALESCE_IRR  1
 
+// Extend the TPR gate above to TIMER vectors as well as input. DEFAULT ON, and
+// unlike the last two attempts this one is measured. Paired A/B, arms alternated
+// within one batch, Windows Setup on screen in all four runs:
+//
+//     timer gate OFF   4 stalls -> 3/15 keys      5 stalls -> 2/15
+//     timer gate ON    0 stalls -> 15/15          0 stalls -> 15/15
+//
+// Then four consecutive confirmation runs with it on: 60/60 keys, 0 stalls,
+// 0 bugchecks, Setup up every time.
+//
+// It works because the raw injection path forces a vector in regardless of CR8,
+// which breaks the guarantee the HAL depends on -- it raises to HIGH_LEVEL
+// exactly so nothing can preempt while it holds its time lock. Forcing the RTC
+// in anyway lands its handler in RtlGetInterruptTimePrecise ->
+// HalpAcquireHighLevelLock on a lock this same CPU already holds, and with one
+// vCPU nothing can ever release it.
+//
+// LOCALHOST_TPR_GATE_TIMER=0 restores the old behaviour.
+int g_tprGateTimer = 1;
+
 // Deliver queued interrupts through the virtual APIC (WHvRequestInterrupt)
 // instead of forcing them into the raw pending-interruption slot.
 //
@@ -1702,7 +1722,23 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
 #if IRQ_RESPECT_TPR
         // Input only -- see IRQ_RESPECT_TPR's comment for why this is not applied
         // to the timer and storage vectors.
-        if (g_irqQueue[i].prio == IRQ_PRIO_INPUT &&
+        //
+        // TIMER too, when g_tprGateTimer is set. This raw path forces a vector in
+        // regardless of CR8, and that breaks the guarantee the HAL relies on: it
+        // raises to HIGH_LEVEL precisely so nothing can preempt while it holds its
+        // time lock. Forcing the RTC in there anyway lands its handler in
+        // RtlGetInterruptTimePrecise -> HalpAcquireHighLevelLock on a lock the
+        // same CPU already holds, and on ONE vCPU nothing can release it -- the
+        // deadlock resolved in 9d7ec5f, which is what actually eats keystrokes
+        // (0 stalls measured 15/15 delivered, 5 stalls measured 2/15).
+        //
+        // Narrower than the two attempts already reverted here: gating EVERY
+        // vector triple-faulted at ~15s by starving storage, and routing
+        // everything through the APIC died on the first RTC tick. Storage is
+        // untouched by this; a deferred timer tick is queued, not dropped, and
+        // goes out as soon as the guest lowers IRQL.
+        if ((g_irqQueue[i].prio == IRQ_PRIO_INPUT ||
+             (g_tprGateTimer && g_irqQueue[i].prio == IRQ_PRIO_TIMER)) &&
             (unsigned)(g_irqQueue[i].vector >> 4) <= tpr) { g_irqDeferredTpr++; continue; }
 #endif
         if (best < 0 ||
@@ -10450,6 +10486,13 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *tprTimerEnv = getenv("LOCALHOST_TPR_GATE_TIMER");
+                if (tprTimerEnv) g_tprGateTimer = (atol(tprTimerEnv) != 0);
+                printf("[irq] TPR gate covers timer vectors: %s\n",
+                       g_tprGateTimer ? "YES" : "no (input only)");
+                fflush(stdout);
+            }
             {
                 const char *rtcMinEnv = getenv("LOCALHOST_RTC_MIN_MS");
                 if (rtcMinEnv) g_rtcMinIntervalMs = atof(rtcMinEnv);
