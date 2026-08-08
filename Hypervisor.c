@@ -16,6 +16,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+// timeBeginPeriod. Without it Windows' default timer resolution is ~15.6ms, so
+// every Sleep(1) in this file actually sleeps ~15.6ms -- see the call in main().
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 #include <WinHvPlatformDefs.h>
 #include <WinHvPlatform.h>
 #include <stdio.h>
@@ -10209,6 +10213,24 @@ UINT64 measureTscFrequency(void) {
 }
 
 int main(int argc, char *argv[]) {
+    // Raise the system timer resolution to 1ms. Windows' default is ~15.6ms, so
+    // every Sleep(1) here -- including the one pacing the halted-CPU loop, where
+    // an idle guest spends nearly all its time -- sleeps ~15.6ms instead. The
+    // comment on that loop already assumed "roughly 1000 times a second", which is
+    // only true at 1ms resolution, so the assumption was written down but never
+    // established.
+    //
+    // HONEST SCOPE: this did NOT change the guest's clock rate. I added it
+    // expecting it to -- the RTC was delivering 67 ticks/sec against a programmed
+    // rate 5 (RegA=0x25) = 2048Hz, and ~64/sec smelled exactly like 15.6ms
+    // granularity. Measured after: still 67/sec. So the cap is elsewhere, and the
+    // likely explanation is that 67/sec is simply what the guest asks for: it
+    // toggles PIE on and off constantly ([cmos-ab] shows RegB 0x42 -> 0x02 ->
+    // 0x42), i.e. Windows is using the RTC for occasional profiling, not as its
+    // system clock. Kept because a VMM pacing itself on Sleep() should not run at
+    // 15.6ms granularity regardless, but it fixes nothing on its own.
+    timeBeginPeriod(1);
+
     netBackendInit();
 
     // argv[1]: VM name shown in the window title (defaults to "Guest Display")
