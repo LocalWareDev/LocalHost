@@ -3300,6 +3300,38 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
     if (!ps2OutputHead(&isAux, &seq)) { g_ps2Announced = 0; return 0; }
 
     QueryPerformanceCounter(&now);
+
+    // STALL DETECTOR, keyed on the BYTE rather than on our announcement state.
+    // The first version of this lived inside the "already announced" branch and
+    // never fired: when delivery fails, g_ps2Announced stays 0 and that branch is
+    // never entered -- so the case most worth inspecting was the one case it
+    // could not see. Keyed on the head byte's arrival sequence instead, it fires
+    // whenever the guest is not consuming, however the delivery attempt went.
+    //
+    // Whether vector 0xA0 is in the APIC's IRR (announced, never delivered) or
+    // its ISR (delivered, the handler was entered and never completed) tells two
+    // opposite stories: ours to fix, versus the guest stuck inside its keyboard
+    // ISR -- the i8042prt DIRQL deadlock this codebase already documents.
+    {
+        static unsigned long stallSeq = 0;
+        static LARGE_INTEGER stallSince, lastDump;
+        if (seq != stallSeq) { stallSeq = seq; stallSince = now; }
+        else if (perfFrequency.QuadPart && stallSince.QuadPart) {
+            double stuckMs = (double)(now.QuadPart - stallSince.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart;
+            double sinceDumpMs = lastDump.QuadPart
+                ? (double)(now.QuadPart - lastDump.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+                : 1e9;
+            if (stuckMs > 1500.0 && sinceDumpMs > 4000.0) {
+                lastDump = now;
+                printf("[ps2-stall] head byte unread for %.0f ms (isAux=%d, announced=%d, "
+                       "kbQueueDepth=%d) -- LAPIC follows\n",
+                       stuckMs, isAux, g_ps2Announced,
+                       (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE);
+                fflush(stdout);
+                u46DumpLapic(partition, "ps2 byte unread");
+            }
+        }
+    }
     if (g_ps2Announced && seq == g_ps2AnnouncedSeq) {
         // Same byte still sitting unread. Re-announce it, but slowly. A real
         // controller holds its line asserted until the byte is read, so going
@@ -3317,6 +3349,13 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
         double sinceMs = perfFrequency.QuadPart
             ? (double)(now.QuadPart - g_ps2AnnouncedAt.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
             : 0.0;
+        // The guest has been sitting on this byte for a while. Whether vector 0xA0
+        // is in the APIC's IRR (announced, never delivered) or its ISR (delivered,
+        // the ISR was entered and never completed) tells two opposite stories:
+        // the first is a delivery problem on our side, the second means the guest
+        // is stuck INSIDE its keyboard ISR -- the i8042prt DIRQL deadlock this
+        // codebase already documents. Reading it is the only way to tell them
+        // apart, and the counters cannot.
         if (sinceMs < PS2_REASSERT_MS) return 0;
     }
 
