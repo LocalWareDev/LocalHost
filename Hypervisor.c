@@ -62,6 +62,9 @@ unsigned char cmosEncodeRtcField(unsigned char decimalValue, int useBcd) {
 }
 
 extern LARGE_INTEGER perfFrequency;  // defined just below; needed by the latch
+// Max age of the latched RTC snapshot, in ms. 0 disables the latch (re-sample on
+// every register read, the old behaviour). Override with LOCALHOST_RTC_LATCH_MS.
+double g_rtcLatchMs = 20.0;
 
 unsigned char cmosReadRtcField(unsigned char reg) {
     // LATCHED, not sampled per register.
@@ -105,7 +108,14 @@ unsigned char cmosReadRtcField(unsigned char reg) {
         ageMs = (haveCache && perfFrequency.QuadPart)
             ? (double)(now.QuadPart - lastRefreshTick.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
             : 1e9;
-        if (!haveCache || gapMs > 5.0 || ageMs > 250.0) {
+        // 250ms was too coarse: it kept the exit count down but Windows loaded its
+        // kernel and then stalled, never reaching the Setup GUI (screen frozen on
+        // the firmware logo for 150s, guest idle at 160k exits). A quarter-second
+        // granular clock is evidently not something the kernel's timekeeping
+        // tolerates. 20ms still gives a read SEQUENCE (microseconds) a consistent
+        // snapshot -- which is the entire point -- while advancing the clock 50
+        // times a second. g_rtcLatchMs = 0 disables the latch entirely.
+        if (!haveCache || g_rtcLatchMs <= 0.0 || gapMs > 5.0 || ageMs > g_rtcLatchMs) {
             GetLocalTime(&cachedSt);
             lastRefreshTick = now;
             haveCache = 1;
@@ -5937,7 +5947,16 @@ void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
             fflush(stdout);
         }
     }
-    if ((g_bpModuleBase || g_guestApicMode) && guestInterruptsEnabled(partition)) {
+    // REVERTED to g_bpModuleBase alone. Widening this to g_guestApicMode was
+    // meant to fix input on the ISO boot (where ntoskrnl is never discovered
+    // because WinPE runs from a RAM-loaded boot.wim) but it was never shown to
+    // help -- and it lets PS/2 interrupts through during the FIRMWARE phase,
+    // which is precisely what the original comment warned wedges the boot. With
+    // it in place Windows loads its kernel and then stalls: screen frozen on the
+    // firmware logo for 150s, guest idle, 155k exits and no Setup. Ruled the RTC
+    // latch out first by disabling it (LOCALHOST_RTC_LATCH_MS=0) and reproducing
+    // the stall, so this is what is left.
+    if (g_bpModuleBase && guestInterruptsEnabled(partition)) {
         g_ps2GatePassed++;
         // Delivery from HERE is required, not an optimisation. Input interrupts
         // were once raised only from the HALTED loop, and once Windows settles
@@ -10313,6 +10332,13 @@ int main(int argc, char *argv[]) {
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
             {
+                const char *latchEnv = getenv("LOCALHOST_RTC_LATCH_MS");
+                if (latchEnv) g_rtcLatchMs = atof(latchEnv);
+                printf("[rtc] snapshot latch: %.0f ms%s\n", g_rtcLatchMs,
+                       g_rtcLatchMs <= 0.0 ? " (DISABLED -- re-sampling every register read)" : "");
+                fflush(stdout);
+            }
+            {
                 const char *noAutoKey = getenv("LOCALHOST_NO_AUTO_BOOT_KEY");
                 g_noAutoBootKey = (noAutoKey && atol(noAutoKey) != 0) ? 1 : 0;
                 printf("[autokey] \"Press any key to boot from CD or DVD\": %s\n",
@@ -10694,8 +10720,28 @@ int main(int argc, char *argv[]) {
             if (!running) break;
         }
 
-        if (exitCount % 5000 == 0 && g_hwnd) {
-            InvalidateRect(g_hwnd, NULL, FALSE);
+        // Repaint on WALL CLOCK, not on exit count.
+        //
+        // "every 5000 exits" silently ties the frame rate to how hard the guest is
+        // working, which is backwards: the better the guest behaves, the less it
+        // repaints. Latching the RTC removed ~1.3M exits per boot (the guest was
+        // spinning re-reading the clock), and the immediate consequence was a
+        // window still showing the firmware logo while Windows was already up --
+        // the screen looked hung when the guest was fine. Same class of bug as the
+        // USB schedules, which had to be moved off exit count for the same reason.
+        {
+            static LARGE_INTEGER lastPaint;
+            LARGE_INTEGER nowPaint;
+            QueryPerformanceCounter(&nowPaint);
+            if (g_hwnd && perfFrequency.QuadPart) {
+                double sincePaintMs = lastPaint.QuadPart
+                    ? (double)(nowPaint.QuadPart - lastPaint.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
+                    : 1e9;
+                if (sincePaintMs >= 33.0) {   // ~30fps
+                    lastPaint = nowPaint;
+                    InvalidateRect(g_hwnd, NULL, FALSE);
+                }
+            }
         }
 
         deliverPendingAtaIrq(partition);
