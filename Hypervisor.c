@@ -2947,6 +2947,10 @@ CRITICAL_SECTION ps2Lock;
 // One slot is always left empty so head==tail unambiguously means "empty".
 #define PS2_QUEUE_SIZE 64
 
+// Floor on the RTC periodic interval, in ms. 0 = honour whatever rate the guest
+// programmed. See the rate-cap comment in deliverRtcPeriodicIrq.
+double g_rtcMinIntervalMs = 0.0;
+
 // How long to wait before re-asserting the i8042 interrupt for a byte the guest
 // has not read yet. See the re-assert comment in ps2ServiceOutputIrq.
 //
@@ -3371,8 +3375,23 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
         delivered = injectDeviceIrq(partition, GSI_MOUSE, 0x74);
         if (!delivered) g_auxIrqMasked++;
     } else {
+        long apicOkBefore = g_reqIrqOk, apicFailBefore = g_reqIrqFail;
         g_kbIrqSent++;
         delivered = injectDeviceIrq(partition, GSI_KEYBOARD, 0x09);
+        // PER-ATTEMPT LEDGER, unbounded. Every aggregate counter so far has been a
+        // stale snapshot from a change-gated heartbeat, so "the interrupt was
+        // raised" and "the guest was actually asked" have never been distinguished
+        // for an individual keystroke. This says, for each attempt: which byte was
+        // being presented, whether the vector resolved, and whether the APIC
+        // accepted the request. Paired with [ps2-out] it gives the whole path from
+        // queued byte to guest read. PS/2 attempts are rare (keystrokes plus one
+        // re-assert per 50ms), so this cannot flood the way an RTC-rate log would.
+        printf("[ps2-irq] head=0x%02X seq=%lu -> %s (apicOk +%ld, apicFail +%ld) queueDepth=%d\n",
+               kbQueue[kbHead], seq,
+               delivered ? "raised" : "REFUSED",
+               g_reqIrqOk - apicOkBefore, g_reqIrqFail - apicFailBefore,
+               (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE);
+        fflush(stdout);
         if (!delivered) {
             g_kbIrqMasked++;
             // WHY it was refused. The heartbeat's "masked" total conflates a
@@ -7766,6 +7785,15 @@ int deliverRtcPeriodicIrq(WHV_PARTITION_HANDLE partition) {
     if (!(cmosRegisters[0x0B] & 0x40)) return 0; // PIE not enabled
     double intervalMs = rtcPeriodicIntervalMs(cmosRegisters[0x0A]);
     if (intervalMs <= 0.0) return 0;
+    // RATE CAP, for testing the input deadlock. The guest wedges spinning in
+    // KxWaitForSpinLockAndAcquire at IRQL HIGH_LEVEL, with HalpAcquireHighLevelLock
+    // and RtlGetInterruptTimePrecise on the stack above KeAcquireSpinLockAtDpcLevel:
+    // the HAL's time lock is taken at DPC level and then re-entered at HIGH_LEVEL,
+    // which on a ONE-vCPU guest nothing can ever release. An interrupt arriving
+    // while that lock is held is the way in, and this RTC fires at ~1kHz straight
+    // into the timekeeping path. Capping the rate tests that directly.
+    // LOCALHOST_RTC_MIN_MS=0 (default) leaves the guest's programmed rate alone.
+    if (g_rtcMinIntervalMs > intervalMs) intervalMs = g_rtcMinIntervalMs;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     double elapsedMs = (double)(now.QuadPart - lastRtcPeriodicTick.QuadPart) * 1000.0 / perfFrequency.QuadPart;
@@ -10422,6 +10450,13 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *rtcMinEnv = getenv("LOCALHOST_RTC_MIN_MS");
+                if (rtcMinEnv) g_rtcMinIntervalMs = atof(rtcMinEnv);
+                printf("[rtc] periodic interrupt floor: %.0f ms%s\n", g_rtcMinIntervalMs,
+                       g_rtcMinIntervalMs > 0.0 ? " (capping the guest's programmed rate)" : "");
+                fflush(stdout);
+            }
             {
                 const char *wakeEnv = getenv("LOCALHOST_PS2_WAKE");
                 if (wakeEnv) g_ps2WakeEnabled = (atol(wakeEnv) != 0);
