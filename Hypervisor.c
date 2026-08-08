@@ -3693,12 +3693,22 @@ extern WHV_PARTITION_HANDLE g_watchdogPartition;
 // magnitude below that, and none at all while idle. Deliberately NOT applied to
 // mouse motion, which can fire hundreds of times a second and would recreate
 // precisely the continuous pattern that was reverted.
-// NOT VERIFIED AS A FIX. Measured across runs with Setup up in every one:
-// 15/15, 15/15, 0/15, 3/15 keys delivered. It addresses a real structural fault
-// and mirrors a fix already applied to the USB schedules, but delivery is still
-// dominated by something else. Gated (LOCALHOST_PS2_WAKE=0 disables) so it can be
-// A/B'd against that variance rather than assumed to help.
-int g_ps2WakeEnabled = 1;
+// DEFAULT OFF: measured, and it makes input WORSE. Paired A/B, alternating arms
+// so host drift hits both equally, counting only runs with Setup on screen:
+//
+//     wake ON   3, 1, 2   =  6/45 keys delivered
+//     wake OFF  8, 1, 7   = 16/45
+//
+// Nearly three times worse with it on. The reasoning behind it still looks sound
+// -- servicing really is gated on the guest happening to exit -- but the fix does
+// not follow from the diagnosis, and the measurement wins. This is the same
+// warning rtcCancelThread already carries: cancelling perturbs WHV itself, and
+// that holds even when the cancel is event-driven and bounded to key events
+// rather than a continuous 10ms loop.
+//
+// Kept behind LOCALHOST_PS2_WAKE=1 rather than deleted, so the next person does
+// not re-derive it from the same (still reasonable) argument and re-measure it.
+int g_ps2WakeEnabled = 0;
 static void ps2WakeRunLoop(void) {
     if (g_ps2WakeEnabled && g_watchdogPartition)
         WHvCancelRunVirtualProcessor(g_watchdogPartition, 0, 0);
