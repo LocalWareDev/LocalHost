@@ -2949,7 +2949,14 @@ CRITICAL_SECTION ps2Lock;
 
 // How long to wait before re-asserting the i8042 interrupt for a byte the guest
 // has not read yet. See the re-assert comment in ps2ServiceOutputIrq.
-#define PS2_REASSERT_MS 50.0
+//
+// Runtime-tunable (LOCALHOST_PS2_REASSERT_MS) so it can be A/B'd against the
+// input wedge: if the guest is already inside its keyboard ISR, re-asserting is
+// a re-entrant interrupt at DIRQL, which is precisely the deadlock i8042prt
+// cannot survive on a one-vCPU guest. A very large value effectively disables
+// re-assertion, leaving one interrupt per byte presented.
+double g_ps2ReassertMs = 50.0;
+#define PS2_REASSERT_MS g_ps2ReassertMs
 
 unsigned char kbQueue[PS2_QUEUE_SIZE];
 int kbHead = 0, kbTail = 0;
@@ -10370,6 +10377,12 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *reassertEnv = getenv("LOCALHOST_PS2_REASSERT_MS");
+                if (reassertEnv) g_ps2ReassertMs = atof(reassertEnv);
+                printf("[ps2] interrupt re-assert interval: %.0f ms\n", g_ps2ReassertMs);
+                fflush(stdout);
+            }
             {
                 const char *latchEnv = getenv("LOCALHOST_RTC_LATCH_MS");
                 if (latchEnv) g_rtcLatchMs = atof(latchEnv);
