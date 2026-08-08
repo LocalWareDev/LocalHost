@@ -1913,6 +1913,9 @@ long g_ahciDropped = 0;  // commands discarded for an unusable PxCLB/CTBA
 long g_bootImgSvcLogged = 0;
 long g_pitTicksDelivered = 0; // firmware-era timer ticks (see deliverPitTimerIrq)
 static long g_ahciLastIrqExit = 0;
+// Which ports were asserting at the last injection, so a NEW completion goes out
+// immediately while a repeat of the same unacknowledged one stays throttled.
+static UINT32 g_ahciLastAsserting = 0;
 static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitCount) {
     if (!ahciAbarMemory) return;
     unsigned char *ab = (unsigned char *)ahciAbarMemory;
@@ -1929,9 +1932,9 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
     // Any implemented port can be the one asserting, and the global IS bit the
     // driver reads to find out has to name the right one -- so scan them all and
     // set a bit per asserting port rather than assuming port 0.
+    UINT32 asserting = 0;
     {
         int p;
-        UINT32 asserting = 0;
         for (p = 0; p < AHCI_PORT_COUNT; p++) {
             unsigned char *pp;
             if (!ahciPorts[p].present) continue;
@@ -1939,10 +1942,28 @@ static void ahciServiceLevelInterrupt(WHV_PARTITION_HANDLE partition, long exitC
             if ((*(UINT32 *)(pp + 0x10) & *(UINT32 *)(pp + 0x14)) != 0)
                 asserting |= (1u << p);
         }
-        if (asserting == 0) return;                 // nothing the driver wants to hear about
+        if (asserting == 0) { g_ahciLastAsserting = 0; return; } // nothing to report
         *(UINT32 *)(ab + 0x08) |= asserting;        // global IS
     }
-    if (exitCount - g_ahciLastIrqExit < 500) return; // throttle re-assertion
+    // EDGE-AWARE. This used to throttle EVERY assertion to one per 500 VM exits,
+    // which with ~1000 exits/sec capped disk completions at ~2/sec. Every command
+    // waited on that timer, so the guest managed ~3 AHCI commands a second and
+    // Windows Setup copied files at ~144 KB/s -- an install would have taken
+    // something like eight hours, and it looked stuck at 0%.
+    //
+    // The throttle exists to stop a storm of RE-assertions for a condition the
+    // driver has not acknowledged yet, and for that it is still right. But a NEW
+    // completion is not a re-assertion: it is exactly the edge the driver is
+    // waiting for, and delaying it serves nothing. So deliver immediately when the
+    // set of asserting ports CHANGES, and keep the throttle only for repeating an
+    // unchanged one.
+    //
+    // Safe now in a way it was not before: these go through the APIC (6666e4c),
+    // which has an IRR bit per vector and tracks EOI, so a fast edge cannot jam a
+    // single slot the way the raw path did.
+    if (asserting == g_ahciLastAsserting &&
+        exitCount - g_ahciLastIrqExit < 500) return;    // same condition, still unacked
+    g_ahciLastAsserting = asserting;
     if (!guestInterruptsEnabled(partition)) return;
     g_ahciLastIrqExit = exitCount;
     // U61: Windows issues exactly 12 commands and stops, leaving PxIS=0x1 set with
