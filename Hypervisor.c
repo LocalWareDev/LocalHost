@@ -12065,6 +12065,38 @@ int main(int argc, char *argv[]) {
                         // own reads is what paces the mouse to whatever rate it
                         // is actually willing to consume.
                         auxDrainPendingMotion();
+
+                        // RE-ASSERT NOW if the read left more data behind.
+                        //
+                        // On real hardware the read itself is what refills the
+                        // output buffer: OBF clears, the controller loads the next
+                        // byte, OBF sets again and the line re-asserts immediately.
+                        // We were not doing that. The next byte's interrupt waited
+                        // for ps2ServiceOutputIrq to be called from the run loop --
+                        // which only iterates when the guest EXITS, and is throttled
+                        // to 1ms on top. So after each keystroke the edge for the
+                        // following byte arrived whenever the host happened to get a
+                        // turn, and the 50ms re-assert was left as the only thing
+                        // reliably producing it.
+                        //
+                        // That matches every measurement: disabling the re-assert
+                        // collapsed delivery to 1/15 (it was carrying the whole
+                        // mechanism), keys arrived in fast bursts while the guest was
+                        // busy exiting and stalled once it went idle, and identical
+                        // runs scattered between 1/15 and 15/15 purely on timing.
+                        //
+                        // REVERTED, and the reason matters. Doing it HERE means
+                        // injecting from inside the I/O exit handler, before the
+                        // guest's RIP has been advanced past the IN instruction --
+                        // an interrupt taken at that point lands mid-emulation.
+                        // Measured against the same test: 16/60 delivered with it,
+                        // then 7/75 on a repeat, versus 16/45 without. Worse, twice.
+                        //
+                        // The hardware reasoning is still right -- a real controller
+                        // re-asserts the moment the read refills its output buffer --
+                        // so if this is retried, do it AFTER the exit is fully
+                        // handled and RIP advanced, not from within the handler.
+                        //   if (kbHasData() || auxHasData()) ps2ServiceOutputIrq(partition);
                     }
                     else if (port == 0x61) {
                         LARGE_INTEGER now;
