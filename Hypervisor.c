@@ -1421,6 +1421,15 @@ extern unsigned char g_reqIrqLastVector;
 // LOCALHOST_TPR_GATE_TIMER=0 restores the old behaviour.
 int g_tprGateTimer = 1;
 
+// Route DEVICE (storage/NIC) interrupts through the APIC instead of the raw slot.
+// Default OFF until measured. See the note in drainInterruptQueue's APIC block.
+int g_apicDeviceVectors = 0;
+
+// Follow the guest when it re-programs BAR5. Default OFF -- correct, but it makes
+// the guest depend on AHCI completion interrupts that the raw slot cannot deliver
+// reliably, and Setup then never reaches its GUI. See ahciHandleBar5Access.
+int g_ahciAllowRebase = 0;
+
 // Deliver queued interrupts through the virtual APIC (WHvRequestInterrupt)
 // instead of forcing them into the raw pending-interruption slot.
 //
@@ -1603,7 +1612,22 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
                 if (g_irqQueue[k].vector < 0x10) continue;
                 // INPUT VECTORS ONLY. Widening this has been tried twice and is
                 // fatal both times -- see the note below on the RTC.
-                if (g_irqQueue[k].prio != IRQ_PRIO_INPUT) continue;
+                //
+                // DEVICE vectors too when g_apicDeviceVectors is set. The raw slot
+                // demonstrably jams -- 20 unwedge events in one run on vectors
+                // 0x50 and 0xD1 -- and that did not matter while storahci never
+                // bound to our controller. Now that it does (e3b482b), it issues a
+                // command, we complete it, and the completion interrupt cannot get
+                // through: PxIS=0x1 pending, 15 injections total, the guest reads
+                // 1MB and then waits forever at IRQL 0. That is the slow boot.
+                //
+                // Worth retrying precisely because the measurement that scoped
+                // this to input predates today's work: it died "immediately after
+                // the first RTC tick was delivered through the APIC as vector
+                // 0xD1", which is the HAL time-lock deadlock fixed in 31d7bab.
+                // Gated and default-off until measured.
+                if (g_irqQueue[k].prio != IRQ_PRIO_INPUT &&
+                    !(g_apicDeviceVectors && g_irqQueue[k].prio == IRQ_PRIO_DEVICE)) continue;
                 if (b < 0 || g_irqQueue[k].seq < g_irqQueue[b].seq) b = k;
             }
             if (b < 0) break;                       // nothing left for the APIC
@@ -1737,9 +1761,26 @@ void drainInterruptQueue(WHV_PARTITION_HANDLE partition) {
         // everything through the APIC died on the first RTC tick. Storage is
         // untouched by this; a deferred timer tick is queued, not dropped, and
         // goes out as soon as the guest lowers IRQL.
-        if ((g_irqQueue[i].prio == IRQ_PRIO_INPUT ||
-             (g_tprGateTimer && g_irqQueue[i].prio == IRQ_PRIO_TIMER)) &&
+        if (g_irqQueue[i].prio == IRQ_PRIO_INPUT &&
             (unsigned)(g_irqQueue[i].vector >> 4) <= tpr) { g_irqDeferredTpr++; continue; }
+        // TIMER: defer ONLY at HIGH_LEVEL, not at every raised IRQL.
+        //
+        // The first cut of this gated the timer on the same rule as input --
+        // defer whenever the vector's priority class <= CR8 -- and that starved
+        // the guest's clock. The RTC is vector 0xD1, class 13, so it was held
+        // back at any IRQL >= 13, and because the queue keeps ONE entry per
+        // vector, every tick arriving behind a deferred one was coalesced away.
+        // Measured: 9000 ticks fired, 573 delivered -- a ~7Hz clock instead of
+        // ~1kHz, so Windows ran with time crawling and the boot took minutes.
+        // That is the "boot is so slow" regression, and it was mine.
+        //
+        // The deadlock this exists to prevent is specific: it happens when we
+        // force a timer interrupt into a guest holding the HAL's time lock, which
+        // it takes at HIGH_LEVEL precisely so nothing can preempt. So gate on
+        // HIGH_LEVEL alone. Below that the guest is interruptible by design and
+        // the clock flows at full rate.
+        if (g_tprGateTimer && g_irqQueue[i].prio == IRQ_PRIO_TIMER &&
+            tpr >= 0xF) { g_irqDeferredTpr++; continue; }
 #endif
         if (best < 0 ||
             g_irqQueue[i].prio < g_irqQueue[best].prio ||
@@ -6573,7 +6614,20 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
                 // into the guest (U58, so register accesses fault to us and
                 // write-1-to-clear behaves like hardware), which means re-basing
                 // is just pointing the trap window at the new address.
-                if (newBase != 0 && ahciAbarMapped && newBase != ahciAbarBase) {
+                // DEFAULT OFF (LOCALHOST_AHCI_REBASE=1 enables). Following the
+                // re-base is CORRECT and it does what it claims -- storahci binds
+                // and reads the disk for the first time. But it also makes the
+                // guest depend on AHCI completion interrupts, and those go through
+                // the raw injection slot, which jams (20+ unwedge events a run).
+                // Measured: with re-basing on, Windows Setup never reaches its GUI
+                // at all, where without it Setup renders in ~30s. Routing device
+                // vectors through the APIC instead (LOCALHOST_APIC_DEVICE=1) moves
+                // more data -- 4613 sectors vs 2817 -- but still does not get there.
+                //
+                // So: off by default, because "boots to Setup with no disk" beats
+                // "does not boot". Turn it on together with a fix for AHCI
+                // interrupt delivery, which is the actual remaining blocker.
+                if (g_ahciAllowRebase && newBase != 0 && ahciAbarMapped && newBase != ahciAbarBase) {
                     printf("[ahci-bar] guest RE-BASED ABAR: 0x%08X -> 0x%08X (kernelUp=%d)\n",
                            ahciAbarBase, newBase, g_bpModuleBase ? 1 : 0);
                     fflush(stdout);
@@ -10529,6 +10583,21 @@ int main(int argc, char *argv[]) {
             printf("[kd] named pipe \\\\.\\pipe\\LocalHostKD ready -- attach WinDbg with "
                    "-k com:pipe,port=\\\\.\\pipe\\LocalHostKD,resets=0,reconnect (COM2, ports 0x2F8-0x2FF)\n");
             fflush(stdout);
+            {
+                const char *apicDevEnv = getenv("LOCALHOST_APIC_DEVICE");
+                if (apicDevEnv) g_apicDeviceVectors = (atol(apicDevEnv) != 0);
+                printf("[irq] device interrupts via APIC: %s\n",
+                       g_apicDeviceVectors ? "YES" : "no (raw slot)");
+                fflush(stdout);
+            }
+            {
+                const char *rebaseEnv = getenv("LOCALHOST_AHCI_REBASE");
+                if (rebaseEnv) g_ahciAllowRebase = (atol(rebaseEnv) != 0);
+                printf("[ahci] follow guest BAR re-base: %s\n",
+                       g_ahciAllowRebase ? "YES (storahci sees the disk; Setup may not reach its GUI)"
+                                         : "no (Setup boots; guest sees no disk)");
+                fflush(stdout);
+            }
             {
                 const char *tprTimerEnv = getenv("LOCALHOST_TPR_GATE_TIMER");
                 if (tprTimerEnv) g_tprGateTimer = (atol(tprTimerEnv) != 0);
