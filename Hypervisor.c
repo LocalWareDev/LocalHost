@@ -6941,11 +6941,29 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
 // polling for link doesn't spin forever waiting for autonegotiation we
 // don't emulate. Called both at startup and whenever the guest issues a
 // software reset via CR (see rtl8139HandleIoAccess).
+// The chip's hardware version, reported in TCR bits 31:26 (+ 24:22). Every
+// Realtek driver reads this to decide WHICH chip it is talking to, and refuses to
+// start one it does not recognise. We reported 0 -- not a chip -- which is why
+// Windows loaded the inbox "RTL8139/810x Family" driver and then failed it with a
+// yellow bang: the driver bound on the PCI ID and then gave up on the hardware.
+// 0x74000000 is RTL8139C, the variant that inbox driver is built around.
+#define RTL8139_TCR_HWVERID 0x74000000U
+
 void rtl8139InitRegs(void) {
     memset(rtl8139Regs, 0, RTL8139_IO_SIZE);
     memcpy(rtl8139Regs + 0x00, rtl8139Mac, 6); // IDR0-5
     rtl8139Regs[0x37] = 0x01; // CR: BUFE (RX buffer empty) set, TE/RE/RST clear
     rtl8139Regs[0x76] = 0x04; // BMSR: bit2 = link status up
+    // Registers the driver inspects during start, none of which existed before --
+    // they all read back as zero, which is a valid value for none of them.
+    *(UINT32 *)(rtl8139Regs + 0x40) = RTL8139_TCR_HWVERID; // TCR: chip version
+    *(UINT32 *)(rtl8139Regs + 0x44) = 0x0000000E;          // RCR: accept broadcast/multicast/mine
+    rtl8139Regs[0x50] = 0x00;   // CR9346: config registers locked (normal state)
+    rtl8139Regs[0x51] = 0x00;   // CONFIG0
+    rtl8139Regs[0x52] = 0x10;   // CONFIG1: driver-loaded bit, not sleeping
+    rtl8139Regs[0x58] = 0x40;   // MSR: link up, 100Mbps, not in low-power
+    rtl8139Regs[0x62] = 0x00;   // CONFIG3
+    rtl8139Regs[0x69] = 0x00;   // CONFIG4
     rtl8139RxWritePos = 0;
     pendingRtl8139Irq = 0;
 }
@@ -7001,7 +7019,16 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
 
     if (io->AccessInfo.IsWrite) {
         UINT64 written = io->Rax;
-        if (offset == 0x37 && accessSize >= 1) {
+        if (offset == 0x40 && accessSize >= 4) {
+            // TCR: the hardware-version bits (31:26 and 24:22) are READ-ONLY on
+            // real silicon. The driver writes this register during setup, and
+            // letting that write land would erase the chip identity we just
+            // reported and leave it looking like an unknown device again.
+            UINT32 val = (UINT32)written;
+            *(UINT32 *)(rtl8139Regs + 0x40) =
+                (val & ~0xFC800000U) | (RTL8139_TCR_HWVERID & 0xFC800000U);
+        }
+        else if (offset == 0x37 && accessSize >= 1) {
             // CR: RST (bit4) resets instantly and clears itself; TE/RE
             // (bits 2-3) are just tracked. BUFE (bit0) is a status bit the
             // NIC controls (see rtl8139ReceiveFrame / the CAPR handling
