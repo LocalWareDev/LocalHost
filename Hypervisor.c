@@ -3844,6 +3844,13 @@ int g_noAutoBootKey = 0;
 // it. Suppresses the CD/DVD auto-answer so we boot the installed system instead
 // of the installer. LOCALHOST_BOOT_ISO=1 overrides, for a deliberate reinstall.
 int g_diskHasOs = 0, g_forceBootIso = 0;
+// NIC register traffic split by driver, plus a ring of the most recent accesses.
+// Windows reports the RTL8139 as Code 10; this separates "the driver never
+// reached the card" from "it reached it and gave up", which need different fixes.
+#define NIC_RING_MAX 40
+long g_nicGuestAccesses = 0, g_nicFwAccesses = 0, g_nicRingCount = 0, g_nicReadLogged = 0, g_nicCfgLogged = 0;
+unsigned char g_nicRingOff[NIC_RING_MAX], g_nicRingWrite[NIC_RING_MAX];
+UINT32 g_nicRingVal[NIC_RING_MAX];
 
 void appendToLog(char c) {
     EnterCriticalSection(&logLock);
@@ -5399,6 +5406,14 @@ void pciInitConfigSpaces(void) {
     pciRtl8139Config[0x00] = 0xEC; pciRtl8139Config[0x01] = 0x10; // vendor 0x10EC (Realtek)
     pciRtl8139Config[0x02] = 0x39; pciRtl8139Config[0x03] = 0x81; // device 0x8139
     pciRtl8139Config[0x08] = 0x10; // revision ID (RTL8139C-family)
+    // Subsystem vendor/device. Left at 0000:0000 before, which no real card
+    // reports. Real 8139s echo the Realtek IDs here and so does QEMU's model --
+    // and QEMU's rtl8139 is known to bind Windows' inbox driver successfully,
+    // which makes it the reference worth matching. Storage got away without one
+    // (pciAhciConfig sets no subsystem either and storahci binds fine), but NDIS
+    // miniports inspect more of config space than storage miniports do.
+    pciRtl8139Config[0x2C] = 0xEC; pciRtl8139Config[0x2D] = 0x10; // subsys vendor 0x10EC
+    pciRtl8139Config[0x2E] = 0x39; pciRtl8139Config[0x2F] = 0x81; // subsys device 0x8139
     pciRtl8139Config[0x0A] = 0x00; // subclass: ethernet controller
     pciRtl8139Config[0x0B] = 0x02; // base class: network controller
     pciRtl8139Config[0x0E] = 0x00; // header type 0, single-function
@@ -6947,7 +6962,12 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
 // Windows loaded the inbox "RTL8139/810x Family" driver and then failed it with a
 // yellow bang: the driver bound on the PCI ID and then gave up on the hardware.
 // 0x74000000 is RTL8139C, the variant that inbox driver is built around.
-#define RTL8139_TCR_HWVERID 0x74000000U
+// Overridable so the revision can be swept without a rebuild: the driver reads
+// this register, twice, and then stops -- it is rejecting the revision, and which
+// ones it accepts is not documented anywhere we can consult.
+// LOCALHOST_RTL_VERID=0x78000000 etc.
+UINT32 g_rtlHwVerId = 0x74000000U;
+#define RTL8139_TCR_HWVERID g_rtlHwVerId
 
 void rtl8139InitRegs(void) {
     memset(rtl8139Regs, 0, RTL8139_IO_SIZE);
@@ -6996,6 +7016,26 @@ void rtl8139HandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffs
                     printf("[rtl8139] I/O BAR mapped at 0x%X\n", rtl8139IoBase & ~0x3);
                     fflush(stdout);
                 }
+                // FOLLOW A RE-BASE. The guard above is "rtl8139IoBase == 0", so
+                // once the firmware programmed this BAR every later write was
+                // dropped -- exactly the bug fixed for the AHCI ABAR in e3b482b,
+                // sitting in the handler right next to it and missed at the time.
+                //
+                // Windows PnP re-assigns PCI BARs as a matter of course. When it
+                // moved this one we carried on decoding the firmware's old port
+                // range, so every register access from the Realtek driver reached
+                // nothing at all, its miniport initialisation failed, and Device
+                // Manager reported Code 10 -- "this device cannot start".
+                //
+                // Deliberately does NOT re-init the registers here: re-basing is
+                // where the device lives, not a reset, and wiping its state
+                // mid-configuration would undo whatever the driver had set up.
+                else if (addrPart != 0 && (addrPart | 0x1) != rtl8139IoBase) {
+                    printf("[rtl8139] guest RE-BASED I/O BAR: 0x%X -> 0x%X (kernelUp=%d)\n",
+                           rtl8139IoBase & ~0x3, addrPart, g_bpModuleBase ? 1 : 0);
+                    fflush(stdout);
+                    rtl8139IoBase = addrPart | 0x1;
+                }
             }
         }
     } else {
@@ -7016,6 +7056,31 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
     UINT32 offset = io->PortNumber - base;
     UINT32 accessSize = io->AccessInfo.AccessSize ? io->AccessInfo.AccessSize : 1;
     UINT64 rax = 0;
+
+    // WHO IS DRIVING THIS CARD? Same split that cracked the AHCI case, where
+    // "kernel touches = 0" proved storahci never bound at all. Windows reports the
+    // NIC as Code 10, and "the driver never reached the registers" and "the driver
+    // reached them and gave up" need completely different fixes.
+    if (g_bpModuleBase) {
+        g_nicGuestAccesses++;
+        if (g_nicGuestAccesses == 1) {
+            printf("[rtl8139-guest] FIRST kernel-side register access: off=0x%02X write=%d\n",
+                   offset, io->AccessInfo.IsWrite ? 1 : 0);
+            fflush(stdout);
+        }
+        // Ring of the most recent accesses, dumped from the heartbeat. The LAST
+        // register the driver touches before it gives up is the interesting one,
+        // and a capped log would fill with the first ones instead.
+        {
+            int slot = (int)(g_nicRingCount % NIC_RING_MAX);
+            g_nicRingOff[slot]   = (unsigned char)offset;
+            g_nicRingWrite[slot] = (unsigned char)(io->AccessInfo.IsWrite ? 1 : 0);
+            g_nicRingVal[slot]   = (UINT32)io->Rax;
+            g_nicRingCount++;
+        }
+    } else {
+        g_nicFwAccesses++;
+    }
 
     if (io->AccessInfo.IsWrite) {
         UINT64 written = io->Rax;
@@ -7101,6 +7166,20 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         UINT32 i;
         for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
             rax |= (UINT64)rtl8139Regs[offset + i] << (i * 8);
+        }
+        // What we ACTUALLY hand back. The ring above records io->Rax, which on a
+        // read is the register's value BEFORE the instruction and therefore says
+        // nothing about our answer -- the same artefact that misled the AHCI and
+        // PM-timer traces. The driver reads TCR (0x40) twice and then stops, so
+        // whether it is seeing the chip version we think we are reporting is the
+        // whole question, and the access SIZE matters: the version bits live in
+        // the top byte, so a 1-byte read of 0x40 returns 0x00 and looks like no
+        // chip at all.
+        if (g_bpModuleBase && g_nicReadLogged < 40) {
+            g_nicReadLogged++;
+            printf("[rtl8139-read] off=0x%02X size=%u -> returned 0x%08llX\n",
+                   offset, accessSize, (unsigned long long)rax);
+            fflush(stdout);
         }
     }
 
@@ -7192,6 +7271,25 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         // accesses, then periodically, to see whether it's a genuinely huge
         // (but bounded/normal) enumeration or something stuck cycling the
         // same slot.
+        // EVERY config access to the NIC once the kernel is up. The general log
+        // below is capped at 300 and firmware enumeration consumes all of it, so
+        // what WINDOWS does with this device -- assigning its I/O range, its
+        // interrupt, enabling I/O space and bus mastering in the command register
+        // -- has never been visible. The driver reads one register and gives up,
+        // so the failure is on the resource side rather than in the device model,
+        // and this is where resources are handed out.
+        // FUNC and cfg-presence included deliberately. Without them a burst of
+        // 0xFFFF vendor-ID reads looks like "the device vanished", when it is
+        // almost certainly the normal func=1..7 multifunction probe, where
+        // all-ones IS the correct answer. Logging a value without the context
+        // that makes it interpretable has produced three wrong readings today.
+        if (g_bpModuleBase && dev == 3 && g_nicCfgLogged < 80) {
+            g_nicCfgLogged++;
+            printf("[nic-cfg] func=%u off=0x%02X size=%u write=%d val=0x%llX cfg=%s\n",
+                   func, baseOffset, accessSize, io->AccessInfo.IsWrite,
+                   (unsigned long long)rax, cfg ? "present" : "absent");
+            fflush(stdout);
+        }
         pciConfigAccessLogCount++;
         if (pciConfigAccessLogCount <= 300 || pciConfigAccessLogCount % 50000 == 0) {
             printf("[pcicfg #%d] bus=%u dev=%u func=%u off=0x%02X size=%u write=%d val=0x%llX cfg=%s\n",
@@ -11418,6 +11516,19 @@ int main(int argc, char *argv[]) {
                             u46DumpLapic(partition, "periodic (what paces the guest?)");
                         }
                     }
+                }
+                {
+                    long total = g_nicRingCount;
+                    long have = total < NIC_RING_MAX ? total : NIC_RING_MAX;
+                    long i2;
+                    printf("[heartbeat]   nic: fwAccesses=%ld kernelAccesses=%ld  last %ld:",
+                           g_nicFwAccesses, g_nicGuestAccesses, have);
+                    for (i2 = total - have; i2 < total; i2++) {
+                        int s2 = (int)(i2 % NIC_RING_MAX);
+                        printf(" %s%02X=%X", g_nicRingWrite[s2] ? "W" : "R",
+                               g_nicRingOff[s2], g_nicRingVal[s2]);
+                    }
+                    printf("\n");
                 }
                 {
                     double totMs = g_haltedMs + g_runningMs;
