@@ -3747,8 +3747,53 @@ void auxDrainPendingMotion(void) {
     PS2_UNLOCK();
 }
 
-unsigned char vkToScancode(int vk) {
+// Maps a Windows virtual key to a set-1 scancode, and reports whether it is an
+// EXTENDED key -- one the guest expects to arrive prefixed with 0xE0.
+//
+// The prefix is not cosmetic. The arrow keys, Insert/Delete/Home/End/PageUp/
+// PageDown, right Ctrl/Alt, the Windows keys and keypad Enter/slash all share
+// their base scancode with a keypad key, and 0xE0 is the only thing telling them
+// apart. Sending a bare 0x48 does not mean "Up" to the guest, it means keypad-8,
+// which is why arrows behaved oddly. The Windows keys were not in this table at
+// all, so they mapped to 0 and were dropped entirely -- and the HOST handled
+// them, which is what opens the host Start menu.
+unsigned char vkToScancode(int vk, int *extended) {
+    if (extended) *extended = 0;
     switch (vk) {
+        // --- extended (0xE0-prefixed) keys ---
+        case VK_LWIN:    if (extended) *extended = 1; return 0x5B;
+        case VK_RWIN:    if (extended) *extended = 1; return 0x5C;
+        case VK_APPS:    if (extended) *extended = 1; return 0x5D;  // context-menu key
+        case VK_INSERT:  if (extended) *extended = 1; return 0x52;
+        case VK_DELETE:  if (extended) *extended = 1; return 0x53;
+        case VK_HOME:    if (extended) *extended = 1; return 0x47;
+        case VK_END:     if (extended) *extended = 1; return 0x4F;
+        case VK_PRIOR:   if (extended) *extended = 1; return 0x49;  // PageUp
+        case VK_NEXT:    if (extended) *extended = 1; return 0x51;  // PageDown
+        case VK_RCONTROL:if (extended) *extended = 1; return 0x1D;
+        case VK_RMENU:   if (extended) *extended = 1; return 0x38;  // right Alt
+        case VK_DIVIDE:  if (extended) *extended = 1; return 0x35;  // keypad /
+        case VK_UP:      if (extended) *extended = 1; return 0x48;
+        case VK_LEFT:    if (extended) *extended = 1; return 0x4B;
+        case VK_RIGHT:   if (extended) *extended = 1; return 0x4D;
+        case VK_DOWN:    if (extended) *extended = 1; return 0x50;
+
+        // --- plain keys ---
+        case VK_LCONTROL: case VK_CONTROL: return 0x1D;
+        case VK_LMENU:    case VK_MENU:    return 0x38;
+        case VK_LSHIFT:   case VK_SHIFT:   return 0x2A;
+        case VK_RSHIFT:   return 0x36;
+        case VK_CAPITAL:  return 0x3A;
+        case VK_F1:  return 0x3B; case VK_F2:  return 0x3C; case VK_F3:  return 0x3D;
+        case VK_F4:  return 0x3E; case VK_F5:  return 0x3F; case VK_F6:  return 0x40;
+        case VK_F7:  return 0x41; case VK_F8:  return 0x42; case VK_F9:  return 0x43;
+        case VK_F10: return 0x44; case VK_F11: return 0x57; case VK_F12: return 0x58;
+        case VK_OEM_MINUS:  return 0x0C; case VK_OEM_PLUS:   return 0x0D;
+        case VK_OEM_4:      return 0x1A; case VK_OEM_6:      return 0x1B;
+        case VK_OEM_1:      return 0x27; case VK_OEM_7:      return 0x28;
+        case VK_OEM_3:      return 0x29; case VK_OEM_5:      return 0x2B;
+        case VK_OEM_COMMA:  return 0x33; case VK_OEM_PERIOD: return 0x34;
+        case VK_OEM_2:      return 0x35;
         case VK_ESCAPE: return 0x01;
         case '1': return 0x02; case '2': return 0x03; case '3': return 0x04;
         case '4': return 0x05; case '5': return 0x06; case '6': return 0x07;
@@ -3768,10 +3813,9 @@ unsigned char vkToScancode(int vk) {
         case 'V': return 0x2F; case 'B': return 0x30; case 'N': return 0x31;
         case 'M': return 0x32;
         case VK_SPACE: return 0x39;
-        case VK_UP: return 0x48;
-        case VK_LEFT: return 0x4B;
-        case VK_RIGHT: return 0x4D;
-        case VK_DOWN: return 0x50;
+        // NOTE: the arrow keys used to live here as bare 0x48/0x4B/0x4D/0x50,
+        // which are the KEYPAD scancodes. They are handled as extended keys at
+        // the top of this switch now; do not re-add them here.
         default: return 0x00;
     }
 }
@@ -3796,6 +3840,10 @@ int g_bdsBootFailed = 0;
 // to leave the prompt to the user.
 long g_autoBootKeyWanted = 0, g_autoBootKeySent = 0, g_autoBootKeyReported = 0;
 int g_noAutoBootKey = 0;
+// Set when the target disk already carries a GPT, i.e. something is installed on
+// it. Suppresses the CD/DVD auto-answer so we boot the installed system instead
+// of the installer. LOCALHOST_BOOT_ISO=1 overrides, for a deliberate reinstall.
+int g_diskHasOs = 0, g_forceBootIso = 0;
 
 void appendToLog(char c) {
     EnterCriticalSection(&logLock);
@@ -3940,7 +3988,8 @@ static void ps2WakeRunLoop(void) {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_KEYDOWN: {
-            unsigned char sc = vkToScancode((int)wParam);
+            int ext = 0;
+            unsigned char sc = vkToScancode((int)wParam, &ext);
             // Which VKs actually reach this handler, and what they map to. The
             // enqueue ring shows only SPACE arriving while TAB/DOWN/A posted in the
             // same loop never appear -- this separates "the message never got here"
@@ -3953,16 +4002,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // and stdout is a file here, so there is no cost -- and every bounded
             // or change-gated version of this has left it ambiguous whether a key
             // was missing or merely unprinted.
-            printf("[ps2-key] #%ld WM_KEYDOWN vk=0x%02X -> sc=0x%02X  queueDepth=%d dropped=%ld\n",
-                   g_kbVkLogged, (unsigned)wParam, sc,
+            printf("[ps2-key] #%ld WM_KEYDOWN vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
+                   g_kbVkLogged, (unsigned)wParam, sc, ext ? " (E0)" : "",
                    (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
             fflush(stdout);
-            if (sc != 0) { kbEnqueue(sc); InterlockedIncrement(&g_kbUserBytes); ps2WakeRunLoop(); }
+            if (sc != 0) {
+                // Extended keys go out as 0xE0 then the make code. Without the
+                // prefix the guest reads a keypad key instead -- see vkToScancode.
+                if (ext) { kbEnqueue(0xE0); InterlockedIncrement(&g_kbUserBytes); }
+                kbEnqueue(sc);
+                InterlockedIncrement(&g_kbUserBytes);
+                ps2WakeRunLoop();
+            }
             return 0;
         }
         case WM_KEYUP: {
-            unsigned char sc = vkToScancode((int)wParam);
-            if (sc != 0) { kbEnqueue(sc | 0x80); InterlockedIncrement(&g_kbUserBytes); ps2WakeRunLoop(); }
+            int ext = 0;
+            unsigned char sc = vkToScancode((int)wParam, &ext);
+            if (sc != 0) {
+                // Break codes carry the same 0xE0 prefix as their make codes; a
+                // release without it leaves the guest holding the key down.
+                if (ext) { kbEnqueue(0xE0); InterlockedIncrement(&g_kbUserBytes); }
+                kbEnqueue(sc | 0x80);
+                InterlockedIncrement(&g_kbUserBytes);
+                ps2WakeRunLoop();
+            }
             return 0;
         }
         // Raw device motion, used INSTEAD of WM_MOUSEMOVE deltas for movement.
@@ -4142,6 +4206,62 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // GetMessage loop, so responsiveness no longer depends on guest exit frequency.
 // The main loop's InvalidateRect calls still work cross-thread (they post
 // WM_PAINT to this thread's queue) and now repaint promptly.
+// KEYBOARD CAPTURE.
+//
+// Without this the host eats the keys the guest most needs. The Windows key opens
+// the HOST Start menu, Alt+Tab switches HOST windows, and the guest never sees
+// either -- they are never delivered to our window at all, so no amount of work
+// in WndProc can recover them. A low-level hook is the only place they can be
+// intercepted before the shell claims them.
+//
+// While our window is in the foreground and capture is on, every keystroke is
+// posted to our window and then SWALLOWED (return 1) so the host never processes
+// it. Because it is swallowed, the normal focus path delivers nothing, so each
+// key still arrives exactly once -- no double input.
+//
+// RIGHT CTRL IS THE RELEASE KEY, and it is not optional: capture that swallows
+// Alt+Tab with no way out would trap the user in the window. It toggles capture,
+// is never forwarded to the guest, and the state is shown in the title bar.
+// Deliberately right Ctrl -- the same convention VirtualBox uses, and a key
+// almost nothing needs.
+//
+// Scoped to the foreground check: when our window is not focused this hook does
+// nothing at all, so it can never interfere with the rest of the desktop.
+int g_kbCaptureEnabled = 1;
+static HHOOK g_kbHook = NULL;
+
+static void updateCaptureTitle(void) {
+    char buf[256];
+    if (!g_hwnd) return;
+    _snprintf(buf, sizeof(buf) - 1, "%s%s", g_windowTitle,
+              g_kbCaptureEnabled ? "  [keys captured -- Right Ctrl to release]"
+                                 : "  [keys released -- Right Ctrl to capture]");
+    buf[sizeof(buf) - 1] = '\0';
+    SetWindowTextA(g_hwnd, buf);
+}
+
+static LRESULT CALLBACK lowLevelKbProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && g_hwnd && GetForegroundWindow() == g_hwnd) {
+        KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lParam;
+        int isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        int isUp   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP);
+        if (k->vkCode == VK_RCONTROL) {          // the release key
+            if (isDown) {
+                g_kbCaptureEnabled = !g_kbCaptureEnabled;
+                updateCaptureTitle();
+                printf("[kbd-capture] %s\n", g_kbCaptureEnabled ? "ON" : "OFF");
+                fflush(stdout);
+            }
+            return 1;                            // never reaches host or guest
+        }
+        if (g_kbCaptureEnabled && (isDown || isUp)) {
+            PostMessage(g_hwnd, isDown ? WM_KEYDOWN : WM_KEYUP, k->vkCode, 0);
+            return 1;                            // host never sees it
+        }
+    }
+    return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+}
+
 static DWORD WINAPI windowThreadProc(LPVOID param) {
     (void)param;
     WNDCLASSA wc = { 0 };
@@ -4155,6 +4275,17 @@ static DWORD WINAPI windowThreadProc(LPVOID param) {
                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                             740, 480, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(g_hwnd, SW_SHOW);
+
+    // Installed on THIS thread because a low-level hook is dispatched on the
+    // thread that set it, and that thread must pump messages -- which this one
+    // does, below. Installing it from the VM thread would silently never fire.
+    g_kbHook = SetWindowsHookExA(WH_KEYBOARD_LL, lowLevelKbProc, GetModuleHandle(NULL), 0);
+    if (!g_kbHook) {
+        printf("[kbd-capture] SetWindowsHookEx failed (%lu) -- the Windows key will "
+               "keep opening the HOST Start menu\n", (unsigned long)GetLastError());
+        fflush(stdout);
+    }
+    updateCaptureTitle();
 
     // Raw Input for the mouse, so the guest receives unaccelerated device deltas
     // rather than host-cooked coordinates (see the WM_INPUT handler for why).
@@ -10485,6 +10616,34 @@ int main(int argc, char *argv[]) {
                    isIso ? "ISO" : "disk", slot, path,
                    (unsigned long long)dev->sectors, dev->sectorSize);
 
+            // DOES THIS DISK ALREADY HAVE AN OS ON IT?
+            //
+            // This decides whether we answer the "Press any key to boot from CD or
+            // DVD" prompt, and getting it wrong is very visible: after Windows was
+            // installed, launching the VM dropped straight back into the INSTALLER,
+            // because the auto-answer was "first boot of this process" and a fresh
+            // process always looks like a first boot. The mid-install reboot case
+            // was handled; "the install already finished" was not.
+            //
+            // Intent is what actually matters: a blank disk means you want to
+            // install, a disk with a partition table means you want to boot it. Read
+            // the GPT header at LBA 1 -- signature "EFI PART" -- which is what the
+            // installer writes and what the firmware boots from.
+            if (!isIso && dev->sectorSize == 512 && fileSize >= 2048) {
+                unsigned char gptSig[8];
+                _fseeki64(dev->file, 512, SEEK_SET);
+                if (fread(gptSig, 1, 8, dev->file) == 8 &&
+                    memcmp(gptSig, "EFI PART", 8) == 0) {
+                    g_diskHasOs = 1;
+                    printf("  -> disk carries a GPT (EFI PART): treating it as installed, "
+                           "so the CD/DVD prompt will NOT be auto-answered\n");
+                } else {
+                    printf("  -> no GPT on this disk: blank target, the CD/DVD prompt "
+                           "will be auto-answered so an install can start\n");
+                }
+                fflush(stdout);
+            }
+
             // Port 0 also backs the legacy IDE path and the existing globals.
             if (slot == 0) {
                 ataDiskFile = dev->file;
@@ -10832,6 +10991,15 @@ int main(int argc, char *argv[]) {
                 printf("[rtc] snapshot latch: %.0f ms%s\n", g_rtcLatchMs,
                        g_rtcLatchMs <= 0.0 ? " (DISABLED -- re-sampling every register read)" : "");
                 fflush(stdout);
+            }
+            {
+                const char *forceIso = getenv("LOCALHOST_BOOT_ISO");
+                if (forceIso) g_forceBootIso = (atol(forceIso) != 0);
+                if (g_forceBootIso) {
+                    printf("[autokey] LOCALHOST_BOOT_ISO=1 -- answering the CD/DVD prompt even "
+                           "though the disk has an OS (deliberate reinstall)\n");
+                    fflush(stdout);
+                }
             }
             {
                 const char *noAutoKey = getenv("LOCALHOST_NO_AUTO_BOOT_KEY");
@@ -11387,8 +11555,12 @@ int main(int argc, char *argv[]) {
         // g_sawReset is the guest actually resetting (port 0x64/0xFE), which is
         // exactly the mid-install reboot, so it distinguishes "first power-on"
         // from "came back around" without guessing from timing.
+        // Also skipped when the disk already carries an OS -- otherwise launching
+        // the VM after a successful install drops back into the INSTALLER instead
+        // of booting what was installed. See the GPT probe where the disk is
+        // attached. LOCALHOST_BOOT_ISO=1 forces the answer for a reinstall.
         if (!g_noAutoBootKey && g_autoBootKeySent == 0 && g_autoBootKeyWanted > 0
-            && !g_sawReset) {
+            && !g_sawReset && (!g_diskHasOs || g_forceBootIso)) {
             g_autoBootKeySent++;
             // Mark THIS prompt as accounted for, or the branch below immediately
             // reports the very prompt we just answered as a repeat.
