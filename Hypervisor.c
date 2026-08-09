@@ -2735,6 +2735,15 @@ LARGE_INTEGER pitChannel2LoadTime;
 // we just stop calling WHvRunVirtualProcessor until we have something to
 // inject (keyboard data or a timer tick), then resume normally.
 int cpuHalted = 0;
+// HOW MUCH WALL TIME IS THE GUEST ACTUALLY RUNNING?
+//
+// Setup copies at ~19 KB/s while its disk is idle, every interrupt is delivered,
+// and the exit rate (~667/sec, ~1% of a core) is far too low to be the cost. So
+// either the guest is computing slowly, or it is HALTED most of the time and only
+// does work when something wakes it. Those need opposite fixes and no counter so
+// far distinguishes them. Accumulate the two directly.
+double g_haltedMs = 0.0, g_runningMs = 0.0;
+long g_haltEntries = 0;
 LARGE_INTEGER lastTimerTick;
 #define TIMER_TICK_INTERVAL_MS 54.925 // ~18.2 Hz, classic PC/PIT default rate
 
@@ -10977,7 +10986,15 @@ int main(int argc, char *argv[]) {
             if (injected) {
                 cpuHalted = 0; // fall through to WHvRunVirtualProcessor below
             } else {
+                // Time spent here is time the guest is HALTED and waiting. See
+                // g_haltedMs: this is the measurement that separates "the guest is
+                // computing slowly" from "the guest is idle waiting to be woken".
+                LARGE_INTEGER hs, he;
+                QueryPerformanceCounter(&hs);
                 Sleep(1);
+                QueryPerformanceCounter(&he);
+                if (perfFrequency.QuadPart)
+                    g_haltedMs += (double)(he.QuadPart - hs.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart;
             }
         }
         if (!running) break;
@@ -11126,6 +11143,35 @@ int main(int argc, char *argv[]) {
                        " | pipe->guest: fromPipe=%ld toGuest=%ld ringDrop=%ld\n",
                        kdClientConnected, g_kdTxToPipe, g_kdTxWriteFail, (unsigned long)g_kdTxLastErr,
                        g_kdTxDropped, g_kdRxFromPipe, g_kdRxToGuest, g_kdRxDropped);
+                // WHAT IS THE GUEST ACTUALLY USING AS ITS CLOCK?
+                //
+                // Setup copies files at ~19 KB/s while the disk sits idle (PxCI=0,
+                // every interrupt delivered, nothing stuck), so something paces the
+                // GUEST rather than our I/O. Our RTC delivers 67/sec, but the guest
+                // toggles PIE constantly, so it is probably not using the RTC as
+                // its system clock -- which leaves the WHP-emulated LAPIC timer.
+                // Its LVT/InitialCount/CurrentCount say the rate the guest asked
+                // for and whether it is actually counting. Sampled on wall clock,
+                // not exit count, and only once the kernel is up.
+                if (g_bpModuleBase) {
+                    static LARGE_INTEGER lastLapicDump;
+                    LARGE_INTEGER nowLapic;
+                    QueryPerformanceCounter(&nowLapic);
+                    if (perfFrequency.QuadPart) {
+                        double sinceS = lastLapicDump.QuadPart
+                            ? (double)(nowLapic.QuadPart - lastLapicDump.QuadPart) / (double)perfFrequency.QuadPart
+                            : 1e9;
+                        if (sinceS > 20.0) {
+                            lastLapicDump = nowLapic;
+                            u46DumpLapic(partition, "periodic (what paces the guest?)");
+                        }
+                    }
+                }
+                {
+                    double totMs = g_haltedMs + g_runningMs;
+                    printf("[heartbeat]   vcpu: running=%.0f ms  halted=%.0f ms  (%.1f%% halted)\n",
+                           g_runningMs, g_haltedMs, totMs > 0.0 ? (g_haltedMs * 100.0 / totMs) : 0.0);
+                }
                 printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)"
                        " | ABAR touches: fw=%ld kernel=%ld\n",
                        g_ahciIrqCount,
@@ -11247,7 +11293,17 @@ int main(int argc, char *argv[]) {
         }
 
         WHV_RUN_VP_EXIT_CONTEXT exitContext;
-        hr = WHvRunVirtualProcessor(partition, 0, &exitContext, sizeof(exitContext));
+        {
+            LARGE_INTEGER rs, re;
+            QueryPerformanceCounter(&rs);
+            hr = WHvRunVirtualProcessor(partition, 0, &exitContext, sizeof(exitContext));
+            QueryPerformanceCounter(&re);
+            // Wall time the vCPU was actually executing guest code, as opposed to
+            // sitting halted in the loop above. Paired with g_haltedMs this says
+            // whether the guest is slow or simply idle.
+            if (perfFrequency.QuadPart)
+                g_runningMs += (double)(re.QuadPart - rs.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart;
+        }
         if (FAILED(hr)) { printf("Failed to run vCPU. HRESULT: 0x%lx\n", hr); break; }
 
         // Recorded here, before any handler runs, so the ring holds what the
