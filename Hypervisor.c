@@ -866,6 +866,9 @@ int g_bootImgRunning = 0;
 long g_bootImgIoLogged = 0;
 long g_bootImgReadLogged = 0;
 long g_ahciShortReads = 0;
+// Transfers that moved the wrong number of bytes -- the signature of silent data
+// corruption (Windows Setup 0x80070570). See the checks in ahciServicePort.
+long g_ahciBadWrites = 0, g_ahciBadReads = 0;
 long g_bootImgCmosLogged = 0;
 long g_bootImgMmioLogged = 0;
 long g_bootImgWriteLogged = 0;
@@ -7339,7 +7342,29 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
     unsigned char ataCmd = cfis[2]; // byte 2 of a Register H2D FIS: the ATA command
     UINT32 lbaLow = (UINT32)cfis[4] | ((UINT32)cfis[5] << 8) | ((UINT32)cfis[6] << 16);
     UINT32 lbaHigh = (UINT32)cfis[8] | ((UINT32)cfis[9] << 8) | ((UINT32)cfis[10] << 16);
-    UINT32 sectorCount = (UINT32)cfis[12] | ((UINT32)cfis[13] << 8);
+    // 28-bit vs 48-bit addressing decide where the HIGH LBA bits live, and getting
+    // this wrong silently corrupts the disk rather than failing.
+    //
+    // 48-bit (EXT) commands put LBA 47:24 in the "expanded" registers cfis[8..10].
+    // 28-bit commands do NOT use those at all -- they are zero -- and carry LBA
+    // 27:24 in the low nibble of the DEVICE register, cfis[7]. We were reading
+    // cfis[8..10] unconditionally, so for a 28-bit command the top four bits were
+    // dropped and every access above LBA 0xFFFFFF (8GB) ALIASED back into the
+    // first 8GB, overwriting data already written there.
+    //
+    // Windows' storahci uses 28-bit commands here exclusively -- measured 1306x
+    // 0x20, 572x 0xC8, 71x 0xCA and not a single 0x25/0x35 -- and the highest LBA
+    // ever observed was exactly 0xFFFFFF, which was us truncating rather than the
+    // guest's real request. Symptom: Windows Setup reached 96% and then failed
+    // with 0x80070570 (ERROR_FILE_CORRUPT), because files written past the 8GB
+    // mark landed on top of earlier ones. The same ISO installs fine under VMware.
+    //
+    // Sector count is 8-bit for 28-bit commands and 16-bit only for EXT, for the
+    // same reason: cfis[13] is an expanded register.
+    int is48Bit = (ataCmd == 0x24 || ataCmd == 0x34 || ataCmd == 0x25 || ataCmd == 0x35 ||
+                   ataCmd == 0x29 || ataCmd == 0x39 || ataCmd == 0x2A || ataCmd == 0x3A);
+    UINT32 sectorCount = is48Bit ? ((UINT32)cfis[12] | ((UINT32)cfis[13] << 8))
+                                 : (UINT32)cfis[12];
     // ATA's classic "0 means max" sector-count convention -- but the max
     // differs by addressing mode: 28-bit commands (0x20/0x30/0xC8/0xCA) use
     // an 8-bit-derived count where 0 means 256; 48-bit EXT commands
@@ -7350,11 +7375,11 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
     // sectors) for a request whose CFIS sector count was 0, while we were
     // only transferring 512 bytes and leaving the rest of the guest's
     // buffer untouched (effectively garbage), corrupting real file reads.
-    if (sectorCount == 0) {
-        int is48Bit = (ataCmd == 0x24 || ataCmd == 0x34 || ataCmd == 0x25 || ataCmd == 0x35);
-        sectorCount = is48Bit ? 65536 : 256;
-    }
-    UINT64 lba = ((UINT64)lbaHigh << 24) | lbaLow;
+    if (sectorCount == 0) sectorCount = is48Bit ? 65536 : 256;
+    // THE FIX: take LBA 27:24 from the device register for 28-bit commands, and
+    // only use the expanded registers for EXT. See the addressing comment above.
+    UINT64 lba = is48Bit ? (((UINT64)lbaHigh << 24) | lbaLow)
+                         : ((((UINT64)cfis[7] & 0x0F) << 24) | lbaLow);
 
     unsigned char *prdt = cmdTable + 0x80; // PRDT starts at command table offset 0x80
     UINT32 bytesTransferred = 0;
@@ -7445,6 +7470,20 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
                 }
             }
             bytesTransferred = ahciScatterToPrdt(prdt, prdtl, ataDataBuffer, want);
+            // Same integrity check as the write side, and for the same reason:
+            // scattering fewer bytes than the command asked for leaves the tail of
+            // the guest's buffer holding whatever was there before, which it will
+            // happily treat as file data. Silent until now. This runs for EVERY
+            // read, not just the boot window below.
+            if (bytesTransferred != want) {
+                g_ahciBadReads++;
+                if (g_ahciBadReads <= 20) {
+                    printf("[ahci-badread] port %d lba=%llu count=%u: asked %u, scattered %u (prdtl=%u)\n",
+                           portIndex, (unsigned long long)lba, sectorCount, want,
+                           bytesTransferred, prdtl);
+                    fflush(stdout);
+                }
+            }
             // Does what the guest ASKED for (the PRDT's own byte count) match what
             // we actually delivered? A read that "succeeds" while moving the wrong
             // number of bytes is exactly the failure that makes a caller retry the
@@ -7475,10 +7514,28 @@ static void ahciServicePort(WHV_PARTITION_HANDLE partition, unsigned char *abar,
             // that tries gets a real error instead of believing the write landed.
             ok = 0;
         } else {
-            UINT32 gathered = ahciGatherFromPrdt(prdt, prdtl, ataDataBuffer, sectorCount * dev->sectorSize);
+            UINT32 want = sectorCount * dev->sectorSize;
+            UINT32 gathered = ahciGatherFromPrdt(prdt, prdtl, ataDataBuffer, want);
+            size_t wrote;
             _fseeki64(dev->file, (long long)lba * dev->sectorSize, SEEK_SET);
-            fwrite(ataDataBuffer, 1, gathered, dev->file);
+            wrote = fwrite(ataDataBuffer, 1, gathered, dev->file);
             fflush(dev->file);
+            // INTEGRITY. Windows Setup fails with 0x80070570 (ERROR_FILE_CORRUPT),
+            // and the same ISO installs cleanly under VMware -- so the media is
+            // good and we are handing the guest wrong bytes somewhere. Both of
+            // these were silent: a PRDT that gathers less than the command asked
+            // for writes a short block, and fwrite's return value was never
+            // checked at all, so a short write to the host file looked identical
+            // to success. Either one corrupts a file the guest later verifies.
+            if (gathered != want || wrote != (size_t)gathered) {
+                g_ahciBadWrites++;
+                if (g_ahciBadWrites <= 20) {
+                    printf("[ahci-badwrite] port %d lba=%llu count=%u: asked %u, gathered %u, fwrote %llu (prdtl=%u)\n",
+                           portIndex, (unsigned long long)lba, sectorCount, want, gathered,
+                           (unsigned long long)wrote, prdtl);
+                    fflush(stdout);
+                }
+            }
             bytesTransferred = gathered;
         }
     } else if (ataCmd == 0xEA || ataCmd == 0xE7) { // FLUSH CACHE EXT / FLUSH CACHE
@@ -11172,11 +11229,13 @@ int main(int argc, char *argv[]) {
                     printf("[heartbeat]   vcpu: running=%.0f ms  halted=%.0f ms  (%.1f%% halted)\n",
                            g_runningMs, g_haltedMs, totMs > 0.0 ? (g_haltedMs * 100.0 / totMs) : 0.0);
                 }
+                printf("[heartbeat]   ahci integrity: badWrites=%ld badReads=%ld shortReads=%ld rejected=%ld dropped=%ld\\n",
+                       g_ahciBadWrites, g_ahciBadReads, g_ahciShortReads, g_ahciRejected, g_ahciDropped);
                 printf("[heartbeat]   ahci irq injections (uncapped)=%ld  data: firmware=%ld sectors (%ld MB) guest=%ld sectors (%ld MB)"
                        " | ABAR touches: fw=%ld kernel=%ld\n",
                        g_ahciIrqCount,
-                       g_ahciFwSectors, (g_ahciFwSectors * 512) / (1024 * 1024),
-                       g_ahciGuestSectors, (g_ahciGuestSectors * 512) / (1024 * 1024),
+                       g_ahciFwSectors, (long)(((UINT64)g_ahciFwSectors * 512) / (1024 * 1024)),
+                       g_ahciGuestSectors, (long)(((UINT64)g_ahciGuestSectors * 512) / (1024 * 1024)),
                        g_ahciAbarFwAccesses, g_ahciAbarGuestAccesses);
                 printf("[heartbeat]   ahci: GHC=0x%08X (AE=%u IE=%u) PI=0x%X | PxCMD=0x%08X (ST=%u FRE=%u) PxIE=0x%08X PxIS=0x%08X PxCI=0x%08X PxTFD=0x%08X PxSSTS=0x%08X\n",
                        ghc, (ghc >> 31) & 1, (ghc >> 1) & 1, pi,
