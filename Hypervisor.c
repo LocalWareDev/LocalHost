@@ -4593,7 +4593,60 @@ int ahciAbarMapped = 0;
 #define RTL8139_IO_SIZE 0x100
 int rtl8139Bar0Sizing = 0;    // true after the guest probes the BAR size with an all-1s write
 UINT32 rtl8139IoBase = 0;     // guest-programmed BAR0 I/O base, once set (0 = not yet programmed)
-unsigned char rtl8139Regs[RTL8139_IO_SIZE] = { 0 }; // raw register file, offset-indexed
+
+// BAR1 -- the MEMORY window onto the same 256-byte register file. A real RTL8139
+// exposes both: BAR0 decodes I/O space, BAR1 decodes memory space, and they alias
+// the identical registers. We implemented only BAR0, so PnP could never offer the
+// driver a memory resource, and two separate measurements pointed here:
+//   - as plain 8139 (PCI rev 0x10) the driver read TCR twice over I/O and gave up;
+//   - as 8139C+ (rev 0x20) it failed with kernelAccesses=0, never touching a
+//     register at all -- C+ is the memory-mapped datapath, so it goes looking for
+//     the memory window before it does anything else and quits when there is none.
+// Both end in Code 10 / STATUS_UNSUCCESSFUL.
+// Left unmapped like the EHCI BAR (not backed by a WHvMapGpaRange buffer) so every
+// access faults out and runs the same side effects as the I/O path -- registers
+// like ISR and the TSDs must not behave as passive RAM just because they were
+// reached through memory instead of ports.
+int rtl8139Bar1Sizing = 0;
+UINT32 rtl8139MmioBase = 0;   // guest-programmed BAR1 memory base (0 = not programmed)
+int g_nicMmioClobbered = 0;   // set if a scratch page ever got mapped over BAR1
+
+// BAR1 is advertised as a full PAGE rather than the chip's true 256 bytes. WHP can
+// only map and protect at page granularity, so a 256-byte BAR would share its page
+// with whatever PnP put next to it, and the read-only mapping below would silently
+// answer that neighbour's reads out of our buffer. Asking for a page guarantees we
+// own it outright. The register file is still 256 bytes; the rest reads as zero.
+#define RTL8139_MMIO_SIZE 0x1000
+
+// Reads are served DIRECTLY from this page by the CPU; only writes trap.
+//
+// This replaces decoding every instruction that touches the window, which was a
+// losing game: three different guest instruction forms showed up in three
+// consecutive runs (`and word ptr` RMW, `test byte ptr`, `movzx r32, byte ptr`),
+// two of them ordinary reads, and each undecodable one cost us the whole BAR
+// because the generic fallback maps RAM over it. Letting real silicon execute the
+// reads makes every read form work forever -- including their flag effects, which
+// hand-emulation kept getting wrong -- and leaves only writes, which genuinely
+// need side effects, to be decoded.
+//
+// rtl8139Regs is re-pointed INTO this page rather than copied, so a register the
+// device itself updates (ISR on RX/TX, CBR, BUFE) is visible to the guest the
+// instant we write it. A copy would have gone stale between syncs, and the driver
+// polls ISR.
+void *rtl8139MmioPage = NULL;
+int rtl8139MmioMapped = 0;
+// The register file. A POINTER, not an array, because once BAR1 is programmed it
+// is re-pointed at the page we map into the guest -- see rtl8139MmioPage below.
+// Indexing syntax is unchanged everywhere else.
+unsigned char rtl8139RegsStorage[RTL8139_IO_SIZE] = { 0 };
+unsigned char *rtl8139Regs = rtl8139RegsStorage;
+
+// PCI revision ID. 0x20 = RTL8139C+, paired with the C+ hardware-version word in
+// g_rtlHwVerId far below -- see the long note there for why C+ is the identity
+// worth reporting. Declared up here because pciInitConfigSpaces() needs it and
+// runs earlier in the file. Overridable alongside the version word so the two can
+// be swept as a pair: LOCALHOST_RTL_PCIREV=0x10.
+unsigned char g_rtlPciRev = 0x20;
 
 // Locally-administered MAC (52:54:00:xx:xx:xx is the same OUI prefix QEMU's
 // own emulated NICs use for exactly this purpose -- a safe, real-hardware-
@@ -5405,7 +5458,12 @@ void pciInitConfigSpaces(void) {
     // real chip so nothing keyed off vendor/device ID gets confused.
     pciRtl8139Config[0x00] = 0xEC; pciRtl8139Config[0x01] = 0x10; // vendor 0x10EC (Realtek)
     pciRtl8139Config[0x02] = 0x39; pciRtl8139Config[0x03] = 0x81; // device 0x8139
-    pciRtl8139Config[0x08] = 0x10; // revision ID (RTL8139C-family)
+    // Revision 0x20 = RTL8139C+, matching the TCR hardware-version ID we report
+    // (g_rtlHwVerId, 0x74800000) and matching QEMU, which uses
+    // RTL8139_PCI_REVID_8139CPLUS = 0x20 by default. These two are one identity:
+    // reporting a C+ version word from a rev-0x10 chip is a combination no real
+    // card produces, and the driver is entitled to disbelieve it.
+    pciRtl8139Config[0x08] = g_rtlPciRev; // revision ID
     // Subsystem vendor/device. Left at 0000:0000 before, which no real card
     // reports. Real 8139s echo the Realtek IDs here and so does QEMU's model --
     // and QEMU's rtl8139 is known to bind Windows' inbox driver successfully,
@@ -5861,6 +5919,8 @@ unsigned char usbTabletSetup[8];         // most recent SETUP packet
 unsigned char usbTabletReplyBuf[128];    // staged response for the data stage
 UINT32 usbTabletReplyLen = 0, usbTabletReplyPos = 0;
 long g_usbSetupPackets = 0, g_usbDescriptorReads = 0, g_usbStalls = 0, g_usbReportsSent = 0;
+long g_usbShortReports = 0;   // reports truncated because the qTD asked for < 6 bytes
+long g_usbReportLogged = 0;
 
 // Absolute pointer state, fed by the window (0..32767 in both axes).
 volatile LONG g_tabletX = 16384, g_tabletY = 16384;
@@ -6179,6 +6239,23 @@ static int ehciRunQueueHead(UINT64 qh) {
                     rep[4] = (unsigned char)((g_tabletY >> 8) & 0xFF);
                     rep[5] = (unsigned char)g_tabletWheel;
                     UINT32 n = usbMin32(6, total);
+                    // What we actually put on the wire. "reports" alone cannot
+                    // distinguish "never delivered" from "delivered but ignored",
+                    // and it says nothing about the coordinates -- the whole
+                    // question for an ABSOLUTE device. A short qTD is the specific
+                    // hazard: if the guest asks for fewer than 6 bytes the report
+                    // is truncated mid-coordinate and the cursor cannot track,
+                    // which would look identical to "the guest ignores us".
+                    if (n < 6) g_usbShortReports++;
+                    if (g_usbReportLogged < 12) {
+                        g_usbReportLogged++;
+                        printf("[usb-tablet] report #%ld: x=%ld y=%ld btn=0x%lX "
+                               "qtdLen=%u wrote=%u%s\n",
+                               g_usbReportsSent + 1, (long)g_tabletX, (long)g_tabletY,
+                               (unsigned long)g_tabletButtons, total, n,
+                               n < 6 ? "  *** TRUNCATED ***" : "");
+                        fflush(stdout);
+                    }
                     ehciQtdCopy(qtd, 0, rep, n, 1);
                     g_usbReportsSent++;
                     moved = n;
@@ -6961,16 +7038,121 @@ void ahciHandleBar5Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS
 // start one it does not recognise. We reported 0 -- not a chip -- which is why
 // Windows loaded the inbox "RTL8139/810x Family" driver and then failed it with a
 // yellow bang: the driver bound on the PCI ID and then gave up on the hardware.
-// 0x74000000 is RTL8139C, the variant that inbox driver is built around.
 // Overridable so the revision can be swept without a rebuild: the driver reads
 // this register, twice, and then stops -- it is rejecting the revision, and which
 // ones it accepts is not documented anywhere we can consult.
 // LOCALHOST_RTL_VERID=0x78000000 etc.
-UINT32 g_rtlHwVerId = 0x74000000U;
+//
+// 0x74800000 is RTL8139C+, and it is what QEMU's rtl8139 reports:
+//     HW_REVID(1, 1, 1, 0, 1, 1, 0)   /* bits 30,29,28,26,23 */
+// That matters more than any other candidate, because QEMU's model is the one
+// configuration known to bind AND START this same inbox driver, so it is the
+// reference to match rather than guess against.
+//
+// It is also the value the earlier sweep structurally COULD NOT have found. That
+// sweep enumerated Linux's rtl_chip_info table from 8139too -- but 8139too does
+// not drive C+ chips at all (Linux handles those in the separate 8139cp driver),
+// so the C+ ID is absent from the table, and "all eight IDs rejected" only ever
+// meant "all eight NON-C+ IDs rejected". Pairs with PCI revision 0x20 below;
+// the two halves of the identity go together on real silicon and QEMU sets both.
+UINT32 g_rtlHwVerId = 0x74800000U;
 #define RTL8139_TCR_HWVERID g_rtlHwVerId
+
+// --- 93C46 serial EEPROM -----------------------------------------------------
+//
+// A real RTL8139 keeps its MAC address (and its PCI IDs) in a little 64x16-bit
+// serial EEPROM, and the driver BIT-BANGS it through CR9346 (0x50) to read them.
+// That is not optional: with 0x50 as plain storage the driver clocks out a
+// garbage address and never gets a usable MAC.
+//
+// This is exactly where the driver was observed to be stuck once BAR1 let it get
+// this far -- 258 register accesses, every one of them offset 0x50, cycling
+//     0x88 (mode=10, EECS)  ->  0x8C (+EESK)  ->  read back for EEDO
+// which is the 93C46 clocking protocol and nothing else.
+//
+// CR9346 bit layout: 7:6 = EEM1:EEM0 (mode; 10 = EEPROM access), 3 = EECS
+// (chip select), 2 = EESK (clock), 1 = EEDI (data in), 0 = EEDO (data out,
+// device-driven -- the bit the driver is actually reading).
+typedef struct {
+    UINT16 contents[64];
+    int cs, sk;          // last EECS / EESK levels, for edge detection
+    UINT32 shiftIn;      // command bits clocked in from EEDI
+    int shiftInCount;
+    UINT16 shiftOut;     // data being clocked out on EEDO
+    int shiftOutCount;
+    int eedo;            // current data-out level
+} Rtl8139Eeprom;
+Rtl8139Eeprom g_rtlEeprom;
+
+// Contents match QEMU's model: signature, the PCI IDs mirrored, and the MAC in
+// words 7-9 (little-endian byte pairs) -- the layout every Realtek driver expects.
+void rtl8139EepromInit(void) {
+    memset(&g_rtlEeprom, 0, sizeof(g_rtlEeprom));
+    g_rtlEeprom.contents[0] = 0x8129;                 // 93C46 signature
+    g_rtlEeprom.contents[1] = 0x10EC;                 // vendor
+    g_rtlEeprom.contents[2] = 0x8139;                 // device
+    g_rtlEeprom.contents[7] = (UINT16)(rtl8139Mac[0] | (rtl8139Mac[1] << 8));
+    g_rtlEeprom.contents[8] = (UINT16)(rtl8139Mac[2] | (rtl8139Mac[3] << 8));
+    g_rtlEeprom.contents[9] = (UINT16)(rtl8139Mac[4] | (rtl8139Mac[5] << 8));
+    g_rtlEeprom.contents[10] = 0x10EC;                // subsystem vendor
+    g_rtlEeprom.contents[11] = 0x8139;                // subsystem device
+    g_rtlEeprom.eedo = 1;
+}
+
+// Drives the state machine from a CR9346 write and returns the byte to store,
+// with bit 0 replaced by the EEPROM's data-out so a subsequent read of 0x50 sees
+// it. Commands are start(1) + opcode(2) + address(6) = 9 bits for a 93C46; on a
+// READ (opcode 10) the addressed word is then clocked out MSB-first.
+unsigned char rtl8139Eeprom9346Write(unsigned char val) {
+    int mode = (val >> 6) & 3;
+    int cs   = (val >> 3) & 1;
+    int sk   = (val >> 2) & 1;
+    int di   = (val >> 1) & 1;
+
+    if (mode != 2) {              // not EEPROM-access mode: leave the chip alone
+        g_rtlEeprom.cs = 0; g_rtlEeprom.sk = 0;
+        return (unsigned char)((val & 0xFE) | (g_rtlEeprom.eedo & 1));
+    }
+    if (!cs) {                    // deselected -- abort any command in progress
+        g_rtlEeprom.shiftIn = 0; g_rtlEeprom.shiftInCount = 0;
+        g_rtlEeprom.shiftOutCount = 0;
+        g_rtlEeprom.eedo = 1;
+    } else if (sk && !g_rtlEeprom.sk) {           // rising clock edge
+        if (g_rtlEeprom.shiftOutCount > 0) {
+            g_rtlEeprom.eedo = (g_rtlEeprom.shiftOut >> 15) & 1;
+            g_rtlEeprom.shiftOut = (UINT16)(g_rtlEeprom.shiftOut << 1);
+            g_rtlEeprom.shiftOutCount--;
+        } else {
+            g_rtlEeprom.shiftIn = (g_rtlEeprom.shiftIn << 1) | (UINT32)di;
+            g_rtlEeprom.shiftInCount++;
+            if (g_rtlEeprom.shiftInCount >= 9) {
+                UINT32 c = g_rtlEeprom.shiftIn;
+                if ((c >> 8) & 1) {                        // start bit present
+                    UINT32 op   = (c >> 6) & 3;
+                    UINT32 addr = c & 0x3F;
+                    if (op == 2) {                         // READ
+                        g_rtlEeprom.shiftOut = g_rtlEeprom.contents[addr];
+                        g_rtlEeprom.shiftOutCount = 16;
+                        g_rtlEeprom.eedo = 0;              // dummy bit before data
+                    }
+                    // WRITE/EWEN/EWDS are accepted and ignored: nothing in the
+                    // guest depends on this EEPROM being writable, and silently
+                    // dropping them is better than corrupting the MAC.
+                    g_rtlEeprom.shiftIn = 0; g_rtlEeprom.shiftInCount = 0;
+                } else if (g_rtlEeprom.shiftInCount > 32) {
+                    g_rtlEeprom.shiftIn = 0; g_rtlEeprom.shiftInCount = 0;
+                }
+            }
+        }
+    }
+    g_rtlEeprom.sk = sk;
+    g_rtlEeprom.cs = cs;
+    return (unsigned char)((val & 0xFE) | (g_rtlEeprom.eedo & 1));
+}
 
 void rtl8139InitRegs(void) {
     memset(rtl8139Regs, 0, RTL8139_IO_SIZE);
+    rtl8139EepromInit();
     memcpy(rtl8139Regs + 0x00, rtl8139Mac, 6); // IDR0-5
     rtl8139Regs[0x37] = 0x01; // CR: BUFE (RX buffer empty) set, TE/RE/RST clear
     rtl8139Regs[0x76] = 0x04; // BMSR: bit2 = link status up
@@ -7046,26 +7228,86 @@ void rtl8139HandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffs
     }
 }
 
-// Handles the actual register file at the guest-programmed BAR0 I/O base
-// (rtl8139IoBase & ~0x3, since bit0 is the I/O-space indicator, not part of
-// the real address). Most registers are plain read/write storage in
-// rtl8139Regs; a handful need real side effects.
-void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
-    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
-    UINT32 base = rtl8139IoBase & ~0x3;
-    UINT32 offset = io->PortNumber - base;
-    UINT32 accessSize = io->AccessInfo.AccessSize ? io->AccessInfo.AccessSize : 1;
-    UINT64 rax = 0;
+// BAR1 (config offset 0x14) -- the memory-space counterpart of BAR0 above, and
+// the resource whose absence PnP could never offer the driver. Same
+// probe-then-program protocol; what differs is the low attribute bits, which on a
+// memory BAR encode 32-bit / non-prefetchable (all zero) rather than BAR0's fixed
+// bit-0 I/O indicator. As with the EHCI BAR nothing is mapped -- the GPA is left
+// to fault so rtl8139HandleBar1Mmio can apply real register semantics.
+void rtl8139MapBar1(WHV_PARTITION_HANDLE partition, UINT32 newBase) {
+    if (rtl8139MmioPage == NULL) {
+        rtl8139MmioPage = VirtualAlloc(NULL, RTL8139_MMIO_SIZE,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (rtl8139MmioPage == NULL) {
+            printf("[rtl8139] BAR1: VirtualAlloc failed -- memory window unavailable\n");
+            fflush(stdout);
+            return;
+        }
+        memset(rtl8139MmioPage, 0, RTL8139_MMIO_SIZE);
+        // Carry the current register contents over, then re-point the register file
+        // at the page so the device and the guest share one copy.
+        memcpy(rtl8139MmioPage, rtl8139RegsStorage, RTL8139_IO_SIZE);
+        rtl8139Regs = (unsigned char *)rtl8139MmioPage;
+    }
+    if (rtl8139MmioMapped && rtl8139MmioBase != 0 && rtl8139MmioBase != newBase) {
+        WHvUnmapGpaRange(partition, rtl8139MmioBase, RTL8139_MMIO_SIZE);
+        rtl8139MmioMapped = 0;
+    }
+    // READ ONLY. Reads are served by the CPU straight out of this page with no
+    // exit; writes have no mapping and therefore fault out to
+    // rtl8139HandleBar1Mmio, which is exactly where side effects belong.
+    HRESULT hr = WHvMapGpaRange(partition, rtl8139MmioPage, newBase, RTL8139_MMIO_SIZE,
+                                WHvMapGpaRangeFlagRead);
+    rtl8139MmioBase = newBase;
+    rtl8139MmioMapped = SUCCEEDED(hr) ? 1 : 0;
+    printf("[rtl8139] memory BAR1 at 0x%X -- reads native, writes trapped (hr=0x%lX %s)\n",
+           newBase, (unsigned long)hr, SUCCEEDED(hr) ? "ok" : "FAILED");
+    fflush(stdout);
+}
 
-    // WHO IS DRIVING THIS CARD? Same split that cracked the AHCI case, where
-    // "kernel touches = 0" proved storahci never bound at all. Windows reports the
-    // NIC as Code 10, and "the driver never reached the registers" and "the driver
-    // reached them and gave up" need completely different fixes.
+void rtl8139HandleBar1Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS_CONTEXT *io,
+                             UINT32 baseOffset, UINT32 accessSize, UINT64 *rax) {
+    if (io->AccessInfo.IsWrite) {
+        if (baseOffset == 0x14 && accessSize >= 4) {
+            UINT32 written = (UINT32)io->Rax;
+            if (written == 0xFFFFFFFF) {
+                rtl8139Bar1Sizing = 1;
+            } else {
+                rtl8139Bar1Sizing = 0;
+                UINT32 newBase = written & ~(UINT32)(RTL8139_MMIO_SIZE - 1);
+                // "newBase != 0" for the same reason as BAR0: PCI discovery writes
+                // 0 to clear a BAR before programming the real address, and
+                // latching that would leave us decoding at 0.
+                if (newBase != 0 && newBase != rtl8139MmioBase) {
+                    rtl8139MapBar1(partition, newBase);
+                }
+            }
+        }
+        return;
+    }
+    {
+        UINT32 currentValue = rtl8139Bar1Sizing ? (UINT32)(~(UINT32)(RTL8139_MMIO_SIZE - 1))
+                                                : rtl8139MmioBase;
+        UINT32 shift = (baseOffset - 0x14) * 8;
+        UINT64 mask = (accessSize >= 4) ? 0xFFFFFFFFULL : (accessSize >= 2 ? 0xFFFFULL : 0xFFULL);
+        *rax = (currentValue >> shift) & mask;
+    }
+}
+
+// Accounting, shared by both windows onto the register file.
+//
+// WHO IS DRIVING THIS CARD? Same split that cracked the AHCI case, where
+// "kernel touches = 0" proved storahci never bound at all. "The driver never
+// reached the registers" and "the driver reached them and gave up" need
+// completely different fixes, and for this NIC we have now seen BOTH: rev 0x10
+// gave two TCR reads then silence, rev 0x20 gave zero accesses. `via` records
+// which BAR the access arrived through, so those stay distinguishable too.
+void rtl8139AccountAccess(UINT32 offset, int isWrite, UINT32 val, const char *via) {
     if (g_bpModuleBase) {
         g_nicGuestAccesses++;
         if (g_nicGuestAccesses == 1) {
-            printf("[rtl8139-guest] FIRST kernel-side register access: off=0x%02X write=%d\n",
-                   offset, io->AccessInfo.IsWrite ? 1 : 0);
+            printf("[rtl8139-guest] FIRST kernel-side register access: off=0x%02X write=%d via=%s\n",
+                   offset, isWrite ? 1 : 0, via);
             fflush(stdout);
         }
         // Ring of the most recent accesses, dumped from the heartbeat. The LAST
@@ -7074,16 +7316,22 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         {
             int slot = (int)(g_nicRingCount % NIC_RING_MAX);
             g_nicRingOff[slot]   = (unsigned char)offset;
-            g_nicRingWrite[slot] = (unsigned char)(io->AccessInfo.IsWrite ? 1 : 0);
-            g_nicRingVal[slot]   = (UINT32)io->Rax;
+            g_nicRingWrite[slot] = (unsigned char)(isWrite ? 1 : 0);
+            g_nicRingVal[slot]   = val;
             g_nicRingCount++;
         }
     } else {
         g_nicFwAccesses++;
     }
+}
 
-    if (io->AccessInfo.IsWrite) {
-        UINT64 written = io->Rax;
+// The register file's real semantics, independent of which BAR the access came
+// through. Most registers are plain read/write storage in rtl8139Regs; a handful
+// need side effects, and those must NOT degrade into passive RAM merely because
+// the driver reached them through the memory window rather than the I/O ports.
+// That sharing is the whole reason this is a separate function.
+void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 accessSize, UINT64 written) {
+    {
         if (offset == 0x40 && accessSize >= 4) {
             // TCR: the hardware-version bits (31:26 and 24:22) are READ-ONLY on
             // real silicon. The driver writes this register during setup, and
@@ -7114,6 +7362,13 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
                     printf("[rtl8139] receiver enabled\n"); fflush(stdout);
                 }
             }
+        } else if (offset == 0x50) {
+            // CR9346: the EEPROM's serial interface. Must run the 93C46 state
+            // machine rather than store the byte, because bit 0 (EEDO) is driven
+            // by the device -- as plain storage it just echoed the driver's own
+            // write back, which is what left the driver clocking out a garbage
+            // MAC address forever.
+            rtl8139Regs[0x50] = rtl8139Eeprom9346Write((unsigned char)written);
         } else if (offset == 0x3E) {
             // ISR: write-1-to-clear, not a plain overwrite.
             UINT32 i;
@@ -7162,32 +7417,374 @@ void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
                 rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
             }
         }
-    } else {
-        UINT32 i;
-        for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
-            rax |= (UINT64)rtl8139Regs[offset + i] << (i * 8);
-        }
-        // What we ACTUALLY hand back. The ring above records io->Rax, which on a
-        // read is the register's value BEFORE the instruction and therefore says
-        // nothing about our answer -- the same artefact that misled the AHCI and
-        // PM-timer traces. The driver reads TCR (0x40) twice and then stops, so
-        // whether it is seeing the chip version we think we are reporting is the
-        // whole question, and the access SIZE matters: the version bits live in
-        // the top byte, so a 1-byte read of 0x40 returns 0x00 and looks like no
-        // chip at all.
-        if (g_bpModuleBase && g_nicReadLogged < 40) {
-            g_nicReadLogged++;
-            printf("[rtl8139-read] off=0x%02X size=%u -> returned 0x%08llX\n",
-                   offset, accessSize, (unsigned long long)rax);
-            fflush(stdout);
-        }
     }
+}
+
+UINT64 rtl8139RegRead(UINT32 offset, UINT32 accessSize) {
+    UINT64 rax = 0;
+    UINT32 i;
+    for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+        rax |= (UINT64)rtl8139Regs[offset + i] << (i * 8);
+    }
+    // What we ACTUALLY hand back. The access ring records the guest's incoming
+    // value, which on a read is the register's content BEFORE the instruction and
+    // therefore says nothing about our answer -- the same artefact that misled the
+    // AHCI and PM-timer traces. The access SIZE matters too: the chip-version bits
+    // live in TCR's top byte, so a 1-byte read of 0x40 returns 0x00 and looks like
+    // no chip at all.
+    if (g_bpModuleBase && g_nicReadLogged < 40) {
+        g_nicReadLogged++;
+        printf("[rtl8139-read] off=0x%02X size=%u -> returned 0x%08llX\n",
+               offset, accessSize, (unsigned long long)rax);
+        fflush(stdout);
+    }
+    return rax;
+}
+
+// BAR0: the I/O window onto the register file, at the guest-programmed base
+// (rtl8139IoBase & ~0x3 -- bit 0 is the I/O-space indicator, not address).
+void rtl8139HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT32 base = rtl8139IoBase & ~0x3;
+    UINT32 offset = io->PortNumber - base;
+    UINT32 accessSize = io->AccessInfo.AccessSize ? io->AccessInfo.AccessSize : 1;
+    UINT64 rax = 0;
+
+    rtl8139AccountAccess(offset, io->AccessInfo.IsWrite ? 1 : 0, (UINT32)io->Rax, "io");
+
+    if (io->AccessInfo.IsWrite) rtl8139RegWrite(partition, offset, accessSize, io->Rax);
+    else                        rax = rtl8139RegRead(offset, accessSize);
 
     WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
     WHV_REGISTER_VALUE values[2] = { 0 };
     values[0].Reg64 = io->AccessInfo.IsWrite ? 0 : rax;
     values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
     WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+}
+
+// BAR1: the MEMORY window onto the very same registers. The GPA is left unmapped,
+// so every access faults out here and is decoded with the shared MMIO decoder --
+// the same one the IOAPIC and the AHCI ABAR use.
+//
+// It MUST claim its range: the MemoryAccess fallback maps a zero-filled scratch
+// page over anything unclaimed, which would quietly turn the entire register file
+// into zeros -- a driver reading TCR would see "no chip" instead of a failure we
+// could observe.
+// Minimal decoder for the group-1 READ-MODIFY-WRITE forms, which the shared MMIO
+// decoder does not handle -- it only understands plain loads and stores.
+//
+// This is not a nicety. The C+ datapath's very first act is
+//     66 81 A1 E0 00 00 00 FC FF   =  and word ptr [rcx+0xE0], 0xFFFC
+// on CpCmd, and an instruction we cannot decode is NOT harmless: it falls through
+// to the generic MemoryAccess handler, which maps RAM over the page and silently
+// turns the whole register file into storage. Measured: BAR1 died on that first
+// instruction and every later MMIO access went into the void.
+//
+// Returns 1 and fills the outputs when insn is `<alu> r/m, imm` against memory.
+// Known gap: EFLAGS are not updated. Drivers do not branch on the flags of an
+// MMIO read-modify-write in practice, but it is a real deviation.
+// Decodes the STORE forms that can fault on the read-only BAR1 page.
+//
+// This only has to cover writes, and that is the point of the read-only mapping:
+// reads never fault, because the CPU serves them from the mapped page. Chasing
+// read forms one at a time is what produced three failed runs in a row (`and`,
+// `test`, `movzx`); the set of ways to WRITE memory is small and closed:
+//
+//   88 /r        MOV  m8,  r8          C6 /0 ib   MOV m8,  imm8
+//   89 /r        MOV  m,   r           C7 /0 iz   MOV m,   imm
+//   00/08/20/28/30 /r  ADD/OR/AND/SUB/XOR m8, r8
+//   01/09/21/29/31 /r  ADD/OR/AND/SUB/XOR m,  r
+//   80/81/83 /n        group 1 with an immediate  (the `and word ptr` RMW)
+//
+// *aluOp is -1 for a plain MOV, otherwise the group-1 operation number.
+int rtl8139DecodeStore(const unsigned char *insn, int len, int *aluOp, int *isImm,
+                       UINT32 *immVal, int *regNum, int *opSize, int *totalLen) {
+    int i = 0, size = 4, rex = 0, byteOp = 0;
+    if (i < len && insn[i] == 0x66) { size = 2; i++; }       // operand-size override
+    if (i < len && (insn[i] & 0xF0) == 0x40) {               // REX
+        rex = insn[i];
+        if (rex & 0x08) size = 8;                            // REX.W
+        i++;
+    }
+    if (i >= len) return 0;
+    unsigned char op = insn[i++];
+
+    int alu = -1, imm = 0;
+    switch (op) {
+        case 0x88: byteOp = 1; break;                        // MOV m8, r8
+        case 0x89:             break;                        // MOV m, r
+        case 0xC6: byteOp = 1; imm = 1; break;               // MOV m8, imm8
+        case 0xC7:             imm = 1; break;               // MOV m, imm
+        case 0x00: alu = 0; byteOp = 1; break;
+        case 0x01: alu = 0; break;
+        case 0x08: alu = 1; byteOp = 1; break;
+        case 0x09: alu = 1; break;
+        case 0x20: alu = 4; byteOp = 1; break;
+        case 0x21: alu = 4; break;
+        case 0x28: alu = 5; byteOp = 1; break;
+        case 0x29: alu = 5; break;
+        case 0x30: alu = 6; byteOp = 1; break;
+        case 0x31: alu = 6; break;
+        case 0x80: byteOp = 1; imm = 1; alu = -2; break;     // group 1, op in ModRM.reg
+        case 0x81:             imm = 1; alu = -2; break;
+        case 0x83:             imm = 2; alu = -2; break;     // imm8, sign-extended
+        default: return 0;
+    }
+    if (byteOp) size = 1;
+
+    if (i >= len) return 0;
+    unsigned char modrm = insn[i++];
+    int mod = (modrm >> 6) & 3;
+    int reg = (modrm >> 3) & 7;
+    int rm  = modrm & 7;
+    if (mod == 3) return 0;                                  // register destination: not MMIO
+    if (alu == -2) alu = reg;                                // group 1: operation is in reg
+    if (rm == 4) { if (i >= len) return 0; i++; }            // SIB byte
+    if (mod == 1)                       i += 1;              // disp8
+    else if (mod == 2)                  i += 4;              // disp32
+    else if (mod == 0 && rm == 5)       i += 4;              // disp32 / RIP-relative
+    if (i > len) return 0;
+
+    UINT32 immediate = 0;
+    if (imm == 2) {                                          // imm8, sign-extended
+        if (i >= len) return 0;
+        immediate = (UINT32)(INT32)(signed char)insn[i]; i += 1;
+    } else if (imm) {
+        if (size == 1)      { if (i + 1 > len) return 0; immediate = insn[i]; i += 1; }
+        else if (size == 2) { if (i + 2 > len) return 0;
+                              immediate = (UINT32)(insn[i] | (insn[i+1] << 8)); i += 2; }
+        else                { if (i + 4 > len) return 0;
+                              immediate = (UINT32)insn[i] | ((UINT32)insn[i+1] << 8) |
+                                          ((UINT32)insn[i+2] << 16) | ((UINT32)insn[i+3] << 24);
+                              i += 4; }
+    }
+
+    *aluOp = alu;
+    *isImm = imm ? 1 : 0;
+    *immVal = immediate;
+    // REX.R extends the source register. Without REX, an 8-bit reg of 4..7 means
+    // AH/CH/DH/BH -- flagged as +16 so the caller can take the high byte.
+    *regNum = reg | ((rex & 0x04) ? 8 : 0);
+    if (byteOp && !rex && reg >= 4) *regNum = (reg - 4) + 16;
+    *opSize = (size == 8) ? 4 : size;   // no RTL8139 register is wider than 4 bytes
+    *totalLen = i;
+    return 1;
+}
+
+// Gets the faulting instruction's bytes, fetching them from guest memory when WHP
+// does not supply them.
+//
+// WHP fills MemoryAccess.InstructionBytes for a fault on an UNMAPPED GPA, but not
+// for a protection fault on a MAPPED range -- there InstructionByteCount is 0.
+// Once BAR1 became a real read-only mapping, every write fault arrived with zero
+// bytes, so every decoder failed and the fallback mapped RAM over the window. So
+// walk the guest's page tables and read the instruction ourselves.
+//
+// Returns the number of bytes available (up to 16).
+int rtl8139FetchInsn(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext,
+                     unsigned char *buf) {
+    int have = exitContext->MemoryAccess.InstructionByteCount;
+    if (have > 0) {
+        if (have > 16) have = 16;
+        memcpy(buf, exitContext->MemoryAccess.InstructionBytes, (size_t)have);
+        return have;
+    }
+    if (!guestMemory) return 0;
+    WHV_GUEST_PHYSICAL_ADDRESS gpa = 0;
+    WHV_TRANSLATE_GVA_RESULT tr = { 0 };
+    HRESULT hr = WHvTranslateGva(partition, 0, exitContext->VpContext.Rip,
+                                 WHvTranslateGvaFlagValidateRead, &tr, &gpa);
+    if (FAILED(hr) || tr.ResultCode != WHvTranslateGvaResultSuccess) return 0;
+    if (gpa >= guestMemSize) return 0;
+    // Never read past the end of guest RAM, and stop at the page boundary: the
+    // next page may not be present, and 16 bytes is enough for these forms.
+    UINT64 avail = guestMemSize - gpa;
+    UINT64 toPageEnd = 0x1000 - (gpa & 0xFFF);
+    UINT64 n = 16;
+    if (n > avail) n = avail;
+    if (n > toPageEnd) n = toPageEnd;
+    memcpy(buf, (unsigned char *)guestMemory + gpa, (size_t)n);
+    return (int)n;
+}
+
+// TEST r/m, r (opcodes 0x84 / 0x85). Reads memory and writes no memory -- but it
+// SETS FLAGS, and the driver branches on them immediately (the instruction we hit
+// is `test byte ptr [rax+0x5A], r8b` followed by `jz`). Emulating the access while
+// leaving RFLAGS alone would send the driver down the wrong branch, which is worse
+// than not handling it at all -- so this reports the register operand and the
+// caller computes flags exactly as the CPU would.
+int rtl8139DecodeTest(const unsigned char *insn, int len, int *regNum,
+                      int *opSize, int *totalLen) {
+    int i = 0, size = 4, rex = 0;
+    if (i < len && insn[i] == 0x66) { size = 2; i++; }
+    if (i < len && (insn[i] & 0xF0) == 0x40) {
+        rex = insn[i];
+        if (rex & 0x08) size = 8;
+        i++;
+    }
+    if (i >= len) return 0;
+    unsigned char op = insn[i++];
+    if (op != 0x84 && op != 0x85) return 0;
+    if (op == 0x84) size = 1;
+    if (i >= len) return 0;
+    unsigned char modrm = insn[i++];
+    int mod = (modrm >> 6) & 3;
+    int rm  = modrm & 7;
+    int reg = ((modrm >> 3) & 7) | ((rex & 0x04) ? 8 : 0);   // REX.R extends reg
+    if (mod == 3) return 0;                                   // register operand: not MMIO
+    if (rm == 4) { if (i >= len) return 0; i++; }             // SIB
+    if (mod == 1)                 i += 1;
+    else if (mod == 2)            i += 4;
+    else if (mod == 0 && rm == 5) i += 4;
+    if (i > len) return 0;
+    *regNum = reg;
+    *opSize = (size == 8) ? 4 : size;   // no register here is wider than 4 bytes
+    *totalLen = i;
+    return 1;
+}
+
+int rtl8139HandleBar1Mmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    UINT64 gpa = exitContext->MemoryAccess.Gpa;
+    if (rtl8139MmioBase == 0) return 0;
+    if (gpa < rtl8139MmioBase || gpa >= (UINT64)rtl8139MmioBase + RTL8139_MMIO_SIZE) return 0;
+    UINT32 off = (UINT32)(gpa - rtl8139MmioBase);
+    // With the page mapped read-only, reads never get here -- the CPU serves them
+    // from rtl8139MmioPage. What arrives is writes (and read-modify-writes), which
+    // are the accesses that actually need side effects. Offsets past the 256-byte
+    // register file are reserved: rtl8139RegRead/Write bound-check, so they read as
+    // zero and absorb writes, which is what reserved space does.
+
+    unsigned char insnBuf[16];
+    int insnLen = rtl8139FetchInsn(partition, exitContext, insnBuf);
+
+    // TEST: reads memory, writes flags.
+    {
+        int testReg = 0, testSize = 0, testLen = 0;
+        if (rtl8139DecodeTest(insnBuf, insnLen, &testReg, &testSize, &testLen)) {
+            UINT64 memVal = rtl8139RegRead(off, (UINT32)testSize);
+            WHV_REGISTER_VALUE regVal = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[testReg], 1, &regVal);
+            UINT64 mask = (testSize == 1) ? 0xFFULL : (testSize == 2) ? 0xFFFFULL : 0xFFFFFFFFULL;
+            UINT64 res = (memVal & regVal.Reg64) & mask;
+
+            WHV_REGISTER_NAME flagsName = WHvX64RegisterRflags;
+            WHV_REGISTER_VALUE flags = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &flagsName, 1, &flags);
+            UINT64 f = flags.Reg64;
+            f &= ~0x8D5ULL;                              // clear CF,PF,AF,ZF,SF,OF
+            if (res == 0) f |= 0x40;                     // ZF
+            if (res & (mask ^ (mask >> 1))) f |= 0x80;   // SF: top bit of the operand size
+            {                                            // PF: parity of the low byte
+                unsigned char b = (unsigned char)(res & 0xFF);
+                int bit, ones = 0;
+                for (bit = 0; bit < 8; bit++) if (b & (1 << bit)) ones++;
+                if ((ones & 1) == 0) f |= 0x04;
+            }
+            flags.Reg64 = f;
+            WHvSetVirtualProcessorRegisters(partition, 0, &flagsName, 1, &flags);
+
+            rtl8139AccountAccess(off, 0, (UINT32)memVal, "mmio-test");
+            WHV_REGISTER_NAME tRip = WHvX64RegisterRip;
+            WHV_REGISTER_VALUE tRipVal = { 0 };
+            tRipVal.Reg64 = exitContext->VpContext.Rip + (UINT64)testLen;
+            WHvSetVirtualProcessorRegisters(partition, 0, &tRip, 1, &tRipVal);
+            return 1;
+        }
+    }
+
+    // Stores, including the read-modify-write forms. A rejection here costs us the
+    // whole memory window (see rtl8139DecodeStore), so this runs before the shared
+    // decoder, which knows neither the 8-bit nor the group-1 forms.
+    {
+        int aluOp = 0, isImm = 0, srcReg = 0, stSize = 0, stLen = 0;
+        UINT32 imm = 0;
+        if (rtl8139DecodeStore(insnBuf, insnLen, &aluOp, &isImm, &imm, &srcReg,
+                               &stSize, &stLen)) {
+            UINT64 src = imm;
+            if (!isImm) {
+                int hiByte = (srcReg >= 16);
+                WHV_REGISTER_VALUE regVal = { 0 };
+                WHvGetVirtualProcessorRegisters(partition, 0,
+                                                &ioapicGprNames[hiByte ? srcReg - 16 : srcReg],
+                                                1, &regVal);
+                src = hiByte ? ((regVal.Reg64 >> 8) & 0xFF) : regVal.Reg64;
+            }
+            UINT64 mask = (stSize == 1) ? 0xFFULL : (stSize == 2) ? 0xFFFFULL : 0xFFFFFFFFULL;
+            UINT64 val;
+            int writes = 1;
+            if (aluOp < 0) {
+                val = src;                               // plain MOV
+            } else {
+                UINT64 cur = rtl8139RegRead(off, (UINT32)stSize);
+                switch (aluOp) {
+                    case 0: val = cur + src; break;      // ADD
+                    case 1: val = cur | src; break;      // OR
+                    case 4: val = cur & src; break;      // AND
+                    case 5: val = cur - src; break;      // SUB
+                    case 6: val = cur ^ src; break;      // XOR
+                    case 7: val = cur; writes = 0; break;// CMP -- compares only
+                    default: return 0;                   // ADC/SBB: not modelled
+                }
+            }
+            val &= mask;
+
+            rtl8139AccountAccess(off, writes, (UINT32)val, "mmio");
+            if (writes) rtl8139RegWrite(partition, off, (UINT32)stSize, val);
+
+            WHV_REGISTER_NAME stRip = WHvX64RegisterRip;
+            WHV_REGISTER_VALUE stRipVal = { 0 };
+            stRipVal.Reg64 = exitContext->VpContext.Rip + (UINT64)stLen;
+            WHvSetVirtualProcessorRegisters(partition, 0, &stRip, 1, &stRipVal);
+            return 1;
+        }
+    }
+
+    int isWrite = 0, isImm = 0, regNum = 0, insnTotalLen = 0;
+    UINT32 immVal = 0;
+    if (!ioapicDecodeMmio(insnBuf, insnLen,
+                          &isWrite, &isImm, &regNum, &immVal, &insnTotalLen)) {
+        static int nicMmioFailLog = 0;
+        if (nicMmioFailLog++ < 20) {
+            printf("[rtl8139-mmio] undecodable instruction at rip=0x%llX off=0x%02X (%d bytes):",
+                   (unsigned long long)exitContext->VpContext.Rip, off, insnLen);
+            int bi;
+            for (bi = 0; bi < insnLen; bi++)
+                printf(" %02X", insnBuf[bi]);
+            printf("\n");
+            fflush(stdout);
+        }
+        return 0; // let the generic handler deal with it rather than corrupting state
+    }
+
+    // The decoder does not report operand width, and the RTL8139's registers are a
+    // mix of 1/2/4 bytes. Four is right for every register the C+ datapath drives;
+    // clamp so a register near the end of the file cannot read or write past it.
+    UINT32 accessSize = (off + 4 <= RTL8139_IO_SIZE) ? 4 : (RTL8139_IO_SIZE - off);
+
+    if (isWrite) {
+        UINT32 value = immVal;
+        if (!isImm) {
+            WHV_REGISTER_VALUE regVal = { 0 };
+            WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+            value = (UINT32)regVal.Reg64;
+        }
+        rtl8139AccountAccess(off, 1, value, "mmio");
+        rtl8139RegWrite(partition, off, accessSize, (UINT64)value);
+    } else {
+        rtl8139AccountAccess(off, 0, 0, "mmio");
+        UINT64 value = rtl8139RegRead(off, accessSize);
+        WHV_REGISTER_VALUE regVal = { 0 };
+        regVal.Reg64 = value;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &regVal);
+    }
+
+    // InstructionLength is not populated for MMIO exits, so advance RIP by the
+    // length our own decode determined -- same as the IOAPIC and ABAR paths.
+    WHV_REGISTER_NAME ripName = WHvX64RegisterRip;
+    WHV_REGISTER_VALUE ripVal = { 0 };
+    ripVal.Reg64 = exitContext->VpContext.Rip + (UINT64)insnTotalLen;
+    WHvSetVirtualProcessorRegisters(partition, 0, &ripName, 1, &ripVal);
+    return 1;
 }
 
 // Handles I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC-0xCFF (CONFIG_DATA) --
@@ -7233,6 +7830,8 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
             ahciHandleBar5Access(partition, io, baseOffset, accessSize, &rax);
         } else if (cfg == pciRtl8139Config && baseOffset >= 0x10 && baseOffset <= 0x13) {
             rtl8139HandleBar0Access(io, baseOffset, accessSize, &rax);
+        } else if (cfg == pciRtl8139Config && baseOffset >= 0x14 && baseOffset <= 0x17) {
+            rtl8139HandleBar1Access(partition, io, baseOffset, accessSize, &rax);
         } else if (cfg == pciEhciConfig && baseOffset >= 0x10 && baseOffset <= 0x13) {
             ehciHandleBar0Access(io, baseOffset, accessSize, &rax);
         } else if (cfg != NULL && baseOffset <= 255) {
@@ -11076,6 +11675,29 @@ int main(int argc, char *argv[]) {
                 fflush(stdout);
             }
             {
+                // THIS PARSING DID NOT EXIST. The comment on g_rtlHwVerId said the
+                // value was "overridable so the revision can be swept without a
+                // rebuild", and startvm.bat duly set LOCALHOST_RTL_VERID -- but
+                // nothing ever read it, so the eight-chip-ID sweep booted the same
+                // compiled-in 0x74000000 eight times and its "all eight rejected"
+                // table measured nothing at all. A knob that is documented and
+                // plumbed but never read is worse than no knob: it produces
+                // confident, entirely fictional results.
+                //
+                // Hence the printf. Every run now states the identity it is
+                // actually presenting, so a sweep can be checked against the log
+                // instead of trusted.
+                const char *veridEnv = getenv("LOCALHOST_RTL_VERID");
+                if (veridEnv) g_rtlHwVerId = (UINT32)strtoul(veridEnv, NULL, 0);
+                const char *pciRevEnv = getenv("LOCALHOST_RTL_PCIREV");
+                if (pciRevEnv) g_rtlPciRev = (unsigned char)strtoul(pciRevEnv, NULL, 0);
+                printf("[rtl8139] identity: TCR hwver=0x%08lX, PCI rev=0x%02X%s\n",
+                       (unsigned long)g_rtlHwVerId, g_rtlPciRev,
+                       (g_rtlHwVerId == 0x74800000U && g_rtlPciRev == 0x20)
+                           ? " (RTL8139C+, matching QEMU)" : "");
+                fflush(stdout);
+            }
+            {
                 const char *rebaseEnv = getenv("LOCALHOST_AHCI_REBASE");
                 if (rebaseEnv) g_ahciAllowRebase = (atol(rebaseEnv) != 0);
                 printf("[ahci] follow guest BAR re-base: %s\n",
@@ -11483,10 +12105,11 @@ int main(int argc, char *argv[]) {
                        ehciBarBase, g_ehciMmioReads, g_ehciMmioWrites, g_ehciPortResets,
                        ehciUsbCmd, ehciUsbSts, ehciConfigFlag, ehciPortSc);
                 printf("[heartbeat]   USB tablet: setups=%ld descriptorReads=%ld stalls=%ld reports=%ld "
-                       "addr=%d configured=%d asyncBase=0x%X irqs=%ld moves=%ld periodicBase=0x%X\n",
+                       "addr=%d configured=%d asyncBase=0x%X irqs=%ld moves=%ld periodicBase=0x%X"
+                       " shortReports=%ld enabled=%d\n",
                        g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
                        usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
-                       (long)g_tabletMoves, ehciPeriodicBase);
+                       (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
                 printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
@@ -12980,12 +13603,34 @@ int main(int argc, char *argv[]) {
                 if (ehciHandleMmio(partition, &exitContext)) { // USB 2.0 controller
                     break;
                 }
+                if (rtl8139HandleBar1Mmio(partition, &exitContext)) { // NIC memory window
+                    break;
+                }
                 UINT64 faultAddr = exitContext.MemoryAccess.Gpa;
                 UINT64 pageBase = faultAddr & ~0xFFFULL;
                 memAccessFaultCount++;
                 if (memAccessFaultCount <= 20 || memAccessFaultCount % 1000 == 0) {
                     printf("[memaccess fault #%d gpa=0x%llX]\n", memAccessFaultCount, (unsigned long long)faultAddr);
                     fflush(stdout);
+                }
+                // Mapping RAM over a device BAR silently converts its registers
+                // into passive storage -- side effects stop, and the device looks
+                // alive while doing nothing. That is a debugging trap, so say so
+                // loudly rather than let it happen quietly. (Seen for real: an
+                // undecodable 16-bit read-modify-write on the NIC's CpCmd fell
+                // through to here and covered the whole BAR1 page.) We still map,
+                // because without a decoded instruction length there is no way to
+                // step over the access, and refusing would spin on it forever.
+                if (rtl8139MmioBase != 0 &&
+                    pageBase == ((UINT64)rtl8139MmioBase & ~0xFFFULL)) {
+                    if (!g_nicMmioClobbered) {
+                        g_nicMmioClobbered = 1;
+                        printf("[rtl8139] *** WARNING: scratch page mapped over BAR1 "
+                               "(gpa=0x%llX) -- the NIC's memory window is now plain RAM "
+                               "and its registers have no side effects\n",
+                               (unsigned long long)faultAddr);
+                        fflush(stdout);
+                    }
                 }
                 void *scratchPage = VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (scratchPage != NULL) {
