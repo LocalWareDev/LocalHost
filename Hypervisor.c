@@ -4615,6 +4615,7 @@ int g_nicMmioClobbered = 0;   // set if a scratch page ever got mapped over BAR1
 // apart from "we transmitted and the backend dropped it".
 long g_netTxFrames = 0, g_netRxFrames = 0;
 long g_netRxOffered = 0, g_netRxDropNoRe = 0, g_netRxDropNoBuf = 0, g_netRxDropSize = 0;
+long g_netRxPadded = 0;   // runts padded up to the 60-byte Ethernet minimum
 long g_netTxArp = 0, g_netTxIpv4 = 0, g_netTxIpv6 = 0, g_netTxOther = 0;
 long g_netArpLogged = 0, g_netArpReplies = 0;
 long g_netRingReEnables = 0, g_netRingResetSkipped = 0;
@@ -5447,9 +5448,38 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     UINT32 rxBase = *(UINT32 *)&rtl8139Regs[0x30];
     if (rxBase == 0 || !guestMemory) { g_netRxDropNoBuf++; return; }
 
+    // Pad runts to the 60-byte Ethernet minimum. A real NIC pads short frames
+    // before they ever go on the wire, so a receiver never sees one shorter than
+    // this -- and the driver treats a runt as a receive error and resets the
+    // receiver rather than consuming it.
+    //
+    // This is why ARP never completed while DHCP always did: our ARP reply is 42
+    // bytes and our DHCP reply is ~300. Every ARP answer we delivered was
+    // rejected as a runt (CAPR frozen at 0 while our write pointer moved), so the
+    // guest re-ARPed forever and the driver sat toggling RE hundreds of thousands
+    // of times. Frame size, not the ring pointers, was the actual defect.
+    unsigned char padded[64];
+    if (len < 60) {
+        if (len > sizeof(padded)) { g_netRxDropSize++; return; }
+        memset(padded, 0, sizeof(padded));
+        memcpy(padded, frame, len);
+        frame = padded;
+        len = 60;
+        g_netRxPadded++;
+    }
+
     UINT32 ringSize = rtl8139RxRingSize();
     UINT32 avail = ringSize + 16;
-    UINT32 totalLen = 4 + len; // 4-byte status+length header + frame bytes
+    // Header + frame + the 4-byte FCS. The FCS is NOT optional bookkeeping: we
+    // report it in the length field below (rxLen = len + 4, which is what real
+    // hardware does), and the driver derives the NEXT packet's offset from that
+    // length. Advancing by only header+frame left our write pointer 4 bytes
+    // behind the driver's read pointer for every single packet -- measured as
+    // CAPR+16 = 0x144 against ourWritePos = 0x140 -- so the "ring is empty" test
+    // below could never match, BUFE was never set, and the driver spun at
+    // DISPATCH_LEVEL toggling RE 752,773 times waiting for a drain signal that
+    // could not arrive. The guest wedged outright.
+    UINT32 totalLen = 4 + len + 4;
     UINT32 alignedLen = (totalLen + 3) & ~3u; // next packet is 4-byte aligned
     if (totalLen > avail || rxBase + avail > guestMemSize) { g_netRxDropSize++; return; }
     g_netRxFrames++;   // actually delivered into the ring
@@ -5459,12 +5489,16 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
 
     unsigned char *ring = (unsigned char *)guestMemory + rxBase;
     UINT16 rxStatus = 0x0001; // ROK
-    UINT16 rxLen = (UINT16)(len + 4); // real hardware includes the 4-byte CRC it doesn't actually store
+    UINT16 rxLen = (UINT16)(len + 4); // real hardware includes the 4-byte CRC
     ring[pos + 0] = (unsigned char)(rxStatus & 0xFF);
     ring[pos + 1] = (unsigned char)(rxStatus >> 8);
     ring[pos + 2] = (unsigned char)(rxLen & 0xFF);
     ring[pos + 3] = (unsigned char)(rxLen >> 8);
     memcpy(ring + pos + 4, frame, len);
+    // Occupy the 4 FCS bytes we just claimed in rxLen. Zeros: the driver has ROK
+    // and does not re-check the checksum, but the SPACE has to be reserved or the
+    // next packet lands where the driver expects the CRC to be.
+    memset(ring + pos + 4 + len, 0, 4);
 
     rtl8139RxWritePos = (pos + alignedLen) % ringSize;
     *(UINT16 *)&rtl8139Regs[0x3A] = (UINT16)rtl8139RxWritePos; // CBR
@@ -7505,7 +7539,18 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             UINT16 capr = *(UINT16 *)&rtl8139Regs[0x38];
             UINT32 ringSize = rtl8139RxRingSize();
             UINT32 consumedPos = ((UINT32)capr + 16) % ringSize;
-            if (consumedPos == (rtl8139RxWritePos % ringSize)) {
+            UINT32 writePos = rtl8139RxWritePos % ringSize;
+            // "Caught up" must not be an EXACT-equality test. A drain signal that
+            // can be stepped over is a hang: when our write pointer trailed the
+            // driver's read pointer by 4 bytes per packet, this never matched,
+            // BUFE was never set, and the driver spun at DISPATCH_LEVEL forever.
+            // The pointer arithmetic is fixed above, but treat "read pointer is
+            // at or past the write pointer" as drained regardless, so a future
+            // off-by-a-few can cost a stale flag rather than wedge the guest.
+            // The window is generous in the wrap direction only up to a packet's
+            // worth, so a genuinely full ring is still reported as non-empty.
+            UINT32 ahead = (consumedPos - writePos) % ringSize;
+            if (consumedPos == writePos || ahead <= 8) {
                 rtl8139Regs[0x37] |= 0x01; // BUFE set -- caught up
             }
         } else {
@@ -12211,10 +12256,11 @@ int main(int argc, char *argv[]) {
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession);
                 printf("[heartbeat]   net TX: total=%ld arp=%ld ipv4=%ld ipv6=%ld other=%ld"
                        " | RX offered=%ld delivered=%ld dropped(noRE=%ld noBuf=%ld size=%ld)"
-                       " arpReplies=%ld\n",
+                       " arpReplies=%ld padded=%ld\n",
                        g_netTxFrames, g_netTxArp, g_netTxIpv4, g_netTxIpv6, g_netTxOther,
                        g_netRxOffered, g_netRxFrames,
-                       g_netRxDropNoRe, g_netRxDropNoBuf, g_netRxDropSize, g_netArpReplies);
+                       g_netRxDropNoRe, g_netRxDropNoBuf, g_netRxDropSize, g_netArpReplies,
+                       g_netRxPadded);
                 // Written-into-the-ring is NOT the same as consumed-by-the-guest.
                 // CAPR is the driver's read pointer; if it stops advancing while our
                 // write pointer moves, the guest has stopped draining the ring and
