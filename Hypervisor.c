@@ -4611,6 +4611,14 @@ int rtl8139Bar1Sizing = 0;
 UINT32 rtl8139MmioBase = 0;   // guest-programmed BAR1 memory base (0 = not programmed)
 int g_nicMmioClobbered = 0;   // set if a scratch page ever got mapped over BAR1
 
+// Frame counts at the device layer, so "the guest never transmitted" can be told
+// apart from "we transmitted and the backend dropped it".
+long g_netTxFrames = 0, g_netRxFrames = 0;
+long g_netRxOffered = 0, g_netRxDropNoRe = 0, g_netRxDropNoBuf = 0, g_netRxDropSize = 0;
+long g_netTxArp = 0, g_netTxIpv4 = 0, g_netTxIpv6 = 0, g_netTxOther = 0;
+long g_netArpLogged = 0, g_netArpReplies = 0;
+long g_netRingReEnables = 0, g_netRingResetSkipped = 0;
+
 // BAR1 is advertised as a full PAGE rather than the chip's true 256 bytes. WHP can
 // only map and protect at page granularity, so a 256-byte BAR would share its page
 // with whatever PnP put next to it, and the read-only mapping below would silently
@@ -4903,6 +4911,16 @@ void netHandleArp(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UI
     memcpy(rarp + 18, frame + 6, 6); // target hw addr: requester
     netWr32(rarp + 24, netRd32(arp + 14)); // target IP: requester's own IP (sender IP from the request)
 
+    g_netArpReplies++;
+    if (g_netArpLogged < 20) {
+        g_netArpLogged++;
+        printf("[net-arp] reply  #%ld: %d.%d.%d.%d is-at %02X:%02X:%02X:%02X:%02X:%02X\n",
+               g_netArpReplies,
+               (targetIp >> 24) & 0xFF, (targetIp >> 16) & 0xFF,
+               (targetIp >> 8) & 0xFF, targetIp & 0xFF,
+               replyMac[0], replyMac[1], replyMac[2], replyMac[3], replyMac[4], replyMac[5]);
+        fflush(stdout);
+    }
     rtl8139ReceiveFrame(partition, reply, sizeof(reply));
 }
 
@@ -5015,6 +5033,8 @@ typedef struct {
     netsock_t sock;
 } NetUdpSession;
 NetUdpSession g_udpSessions[NET_MAX_UDP_SESSIONS];
+long g_netUdpOut = 0, g_netUdpOutFail = 0, g_netUdpIn = 0, g_netUdpNoSession = 0;
+long g_netUdpLogged = 0;
 
 // Looks up the session for guestPort, opening a new real UDP socket for it
 // if none exists yet. Returns NULL if the table is full or socket()
@@ -5051,10 +5071,34 @@ void netHandleUdpGuestPacket(UINT32 dstIp, const unsigned char *udp, UINT32 udpL
     UINT16 realDstPort = dstPort;
 
     NetUdpSession *sess = netFindOrCreateUdpSession(srcPort);
-    if (!sess) return;
+    if (!sess) {
+        g_netUdpNoSession++;
+        return;
+    }
 
     struct sockaddr_in dst = netMakeSockAddr(realDstIp, realDstPort);
-    sendto(sess->sock, (const char *)payload, (int)payloadLen, 0, (struct sockaddr *)&dst, sizeof(dst));
+    int sent = sendto(sess->sock, (const char *)payload, (int)payloadLen, 0,
+                      (struct sockaddr *)&dst, sizeof(dst));
+    if (sent < 0) g_netUdpOutFail++; else g_netUdpOut++;
+
+    // DNS is the open failure, and the four ways it can break are
+    // indistinguishable from outside: the guest never asks; we fail to send; the
+    // upstream never answers; or it answers and the guest rejects our framing.
+    // Log the send side with its error code so the first three are separable --
+    // a blocked outbound socket (AV/firewall) shows up here as a WSA error, not
+    // as silence.
+    if (g_netUdpLogged < 40) {
+        g_netUdpLogged++;
+        printf("[net-udp] OUT guest:%u -> %d.%d.%d.%d:%u (%u bytes)%s sent=%d%s\n",
+               srcPort,
+               (realDstIp >> 24) & 0xFF, (realDstIp >> 16) & 0xFF,
+               (realDstIp >> 8) & 0xFF, realDstIp & 0xFF,
+               realDstPort, payloadLen,
+               (dstIp == NET_DNS_IP && dstPort == 53) ? " [DNS relay]" : "",
+               sent, sent < 0 ? "" : "");
+        if (sent < 0) printf("[net-udp] OUT FAILED, WSAGetLastError=%d\n", WSAGetLastError());
+        fflush(stdout);
+    }
 }
 
 // Polls every active UDP session for a reply, non-blocking, and relays
@@ -5076,7 +5120,22 @@ void netPollUdpSessions(WHV_PARTITION_HANDLE partition) {
             // real upstream resolver should appear to come from the
             // virtual DNS proxy the guest actually queried.
             UINT32 replySrcIp = (fromIp == NET_UPSTREAM_DNS_IP && fromPort == 53) ? NET_DNS_IP : fromIp;
-            netSendUdp(partition, netGatewayMac, replySrcIp, fromPort, NET_GUEST_IP, g_udpSessions[i].guestPort,
+            g_netUdpIn++;
+            if (g_netUdpLogged < 40) {
+                g_netUdpLogged++;
+                printf("[net-udp] IN  %d.%d.%d.%d:%u -> guest:%u (%d bytes), presented as %d.%d.%d.%d\n",
+                       (fromIp >> 24) & 0xFF, (fromIp >> 16) & 0xFF, (fromIp >> 8) & 0xFF, fromIp & 0xFF,
+                       fromPort, g_udpSessions[i].guestPort, n,
+                       (replySrcIp >> 24) & 0xFF, (replySrcIp >> 16) & 0xFF,
+                       (replySrcIp >> 8) & 0xFF, replySrcIp & 0xFF);
+                fflush(stdout);
+            }
+            // Answer from the MAC the guest ARPed for. It asked for 10.0.2.3 and
+            // was told netDnsMac, so a reply claiming to come from 10.0.2.3 while
+            // bearing the gateway's MAC is inconsistent with what the guest was
+            // told -- the ICMP path already picks per-address, this one did not.
+            const unsigned char *replyMac = (replySrcIp == NET_DNS_IP) ? netDnsMac : netGatewayMac;
+            netSendUdp(partition, replyMac, replySrcIp, fromPort, NET_GUEST_IP, g_udpSessions[i].guestPort,
                        buf, (UINT32)n);
         }
     }
@@ -5322,13 +5381,31 @@ void netSlirpTransmit(WHV_PARTITION_HANDLE partition, const unsigned char *frame
 
     UINT16 ethertype = netRd16(frame + 12);
     if (ethertype == 0x0806) {
+        // Log which address the guest is asking about. A guest that keeps
+        // re-ARPing for the same IP is a guest that is not accepting our reply,
+        // and that is indistinguishable from "we never answered" unless the
+        // request target is visible.
+        g_netTxArp++;
+        if (g_netArpLogged < 20) {
+            g_netArpLogged++;
+            const unsigned char *arp = frame + 14;
+            UINT32 tgt = (len >= 14 + 28) ? netRd32(arp + 24) : 0;
+            UINT32 spa = (len >= 14 + 28) ? netRd32(arp + 14) : 0;
+            printf("[net-arp] request #%ld: who-has %d.%d.%d.%d  tell %d.%d.%d.%d\n",
+                   g_netTxArp,
+                   (tgt >> 24) & 0xFF, (tgt >> 16) & 0xFF, (tgt >> 8) & 0xFF, tgt & 0xFF,
+                   (spa >> 24) & 0xFF, (spa >> 16) & 0xFF, (spa >> 8) & 0xFF, spa & 0xFF);
+            fflush(stdout);
+        }
         netHandleArp(partition, frame, len);
         return;
     }
     if (ethertype == 0x0800) {
+        g_netTxIpv4++;
         netHandleIpv4(partition, frame, len);
         return;
     }
+    if (ethertype == 0x86DD) g_netTxIpv6++; else g_netTxOther++;
 
     printf("[rtl8139] TX %u bytes, dst=%02X:%02X:%02X:%02X:%02X:%02X src=%02X:%02X:%02X:%02X:%02X:%02X ethertype=0x%04X\n",
            len, frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
@@ -5347,6 +5424,7 @@ void rtl8139TransmitFrame(WHV_PARTITION_HANDLE partition, const unsigned char *f
         fflush(stdout);
         return;
     }
+    g_netTxFrames++;
     if (g_netTransmit) g_netTransmit(partition, frame, len);
 }
 
@@ -5359,16 +5437,22 @@ void rtl8139TransmitFrame(WHV_PARTITION_HANDLE partition, const unsigned char *f
 // hardware wraparound corner case (undocumented without a spec on hand)
 // made in favor of never writing outside guest memory.
 void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    // Counted per REASON, not once at entry. Counting attempts here (as this
+    // first did) makes "we delivered 52 frames" indistinguishable from "we were
+    // asked to deliver 52 and dropped them all", which is exactly the ambiguity
+    // that matters when the guest keeps re-ARPing: it looks like we are answering.
+    g_netRxOffered++;
     unsigned char cr = rtl8139Regs[0x37];
-    if (!(cr & 0x08)) return; // RE (receiver enable) not set
+    if (!(cr & 0x08)) { g_netRxDropNoRe++; return; }   // RE (receiver enable) not set
     UINT32 rxBase = *(UINT32 *)&rtl8139Regs[0x30];
-    if (rxBase == 0 || !guestMemory) return;
+    if (rxBase == 0 || !guestMemory) { g_netRxDropNoBuf++; return; }
 
     UINT32 ringSize = rtl8139RxRingSize();
     UINT32 avail = ringSize + 16;
     UINT32 totalLen = 4 + len; // 4-byte status+length header + frame bytes
     UINT32 alignedLen = (totalLen + 3) & ~3u; // next packet is 4-byte aligned
-    if (totalLen > avail || rxBase + avail > guestMemSize) return; // can't fit / would leave guest RAM
+    if (totalLen > avail || rxBase + avail > guestMemSize) { g_netRxDropSize++; return; }
+    g_netRxFrames++;   // actually delivered into the ring
 
     UINT32 pos = rtl8139RxWritePos % ringSize;
     if (pos + totalLen > avail) pos = 0; // wouldn't fit before the pad ends -- wrap to start
@@ -7356,10 +7440,23 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
                 unsigned char newCr = (val & ~(unsigned char)0x11) | (oldCr & 0x01);
                 rtl8139Regs[0x37] = newCr;
                 if (!(oldCr & 0x08) && (newCr & 0x08)) {
-                    // RE freshly enabled -- real hardware resets ring state.
-                    rtl8139RxWritePos = 0;
-                    rtl8139Regs[0x37] |= 0x01; // BUFE set, ring empty
-                    printf("[rtl8139] receiver enabled\n"); fflush(stdout);
+                    // RE freshly enabled. This used to reset the ring
+                    // unconditionally, which DESTROYED frames already queued:
+                    // the driver toggles RE off and on during normal operation
+                    // (observed W37=4 -> W37=C repeatedly), and every toggle
+                    // threw away whatever we had written but the guest had not
+                    // yet read. That is why ARP replies never arrived -- we
+                    // answered all four "who-has 10.0.2.3" requests, and wiped
+                    // each answer before the guest could consume it, leaving
+                    // CAPR=0 CBR=0 BUFE=1 with nothing in the ring.
+                    //
+                    // Real hardware does not clear the receive buffer on an RE
+                    // transition either; only a software RESET does that.
+                    g_netRingReEnables++;
+                    if (rtl8139RxWritePos != 0) g_netRingResetSkipped++;
+                    printf("[rtl8139] receiver enabled (ring kept: writePos=0x%X)\n",
+                           rtl8139RxWritePos);
+                    fflush(stdout);
                 }
             }
         } else if (offset == 0x50) {
@@ -12110,6 +12207,30 @@ int main(int argc, char *argv[]) {
                        g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
                        usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
                        (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
+                printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld\n",
+                       g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession);
+                printf("[heartbeat]   net TX: total=%ld arp=%ld ipv4=%ld ipv6=%ld other=%ld"
+                       " | RX offered=%ld delivered=%ld dropped(noRE=%ld noBuf=%ld size=%ld)"
+                       " arpReplies=%ld\n",
+                       g_netTxFrames, g_netTxArp, g_netTxIpv4, g_netTxIpv6, g_netTxOther,
+                       g_netRxOffered, g_netRxFrames,
+                       g_netRxDropNoRe, g_netRxDropNoBuf, g_netRxDropSize, g_netArpReplies);
+                // Written-into-the-ring is NOT the same as consumed-by-the-guest.
+                // CAPR is the driver's read pointer; if it stops advancing while our
+                // write pointer moves, the guest has stopped draining the ring and
+                // every later frame is invisible to it no matter how many we deliver.
+                {
+                    UINT16 capr = *(UINT16 *)&rtl8139Regs[0x38];
+                    UINT16 cbr  = *(UINT16 *)&rtl8139Regs[0x3A];
+                    printf("[heartbeat]   net RX ring: CAPR=0x%04X CBR=0x%04X ourWritePos=0x%X "
+                           "size=%u CR=0x%02X(RE=%d BUFE=%d) IMR=0x%04X ISR=0x%04X\n",
+                           capr, cbr, rtl8139RxWritePos, rtl8139RxRingSize(),
+                           rtl8139Regs[0x37], (rtl8139Regs[0x37] >> 3) & 1, rtl8139Regs[0x37] & 1,
+                           *(UINT16 *)&rtl8139Regs[0x3C], *(UINT16 *)&rtl8139Regs[0x3E]);
+                    printf("[heartbeat]   net RX ring: reEnables=%ld (would have wiped a"
+                           " non-empty ring %ld times)\n",
+                           g_netRingReEnables, g_netRingResetSkipped);
+                }
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
                 printf("[heartbeat]   KD pipe: client=%d | guest->pipe: written=%ld writeFail=%ld (lastErr=%lu) ringDrop=%ld"
