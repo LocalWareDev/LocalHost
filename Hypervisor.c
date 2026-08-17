@@ -5160,7 +5160,13 @@ void netPollUdpSessions(WHV_PARTITION_HANDLE partition) {
 #define NET_TCP_PSH  0x08
 #define NET_TCP_ACK  0x10
 
-typedef enum { NET_TCP_CONNECTING, NET_TCP_ESTABLISHED } NetTcpState;
+// NET_TCP_PEER_CLOSED: the real peer has closed its side, we have told the guest
+// with a FIN, but the SESSION IS KEPT. Destroying it at that moment (as this
+// first did) means the guest's in-flight segments arrive for a connection we no
+// longer know about and get dropped as "unknown" -- the guest then gets no ack
+// for data it believes is outstanding and resorts to RST. Keeping the session
+// lets us keep acking until the guest closes properly.
+typedef enum { NET_TCP_CONNECTING, NET_TCP_ESTABLISHED, NET_TCP_PEER_CLOSED } NetTcpState;
 typedef struct {
     int inUse;
     NetTcpState state;
@@ -5170,6 +5176,10 @@ typedef struct {
     netsock_t sock;
     UINT32 guestSeq; // next sequence number we expect from the guest (our ack value)
     UINT32 hostSeq;  // next sequence number we send
+    // The guest's advertised MSS, taken from its SYN options. Segments larger
+    // than this may be dropped by the guest rather than reassembled, so we cap
+    // what we hand it instead of assuming our 1400-byte buffer is acceptable.
+    UINT32 guestMss;
 } NetTcpSession;
 NetTcpSession g_tcpSessions[NET_MAX_TCP_SESSIONS];
 // TCP NAT was completely uninstrumented, so "no TCP in the log" meant nothing at
@@ -5303,10 +5313,46 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
         s->sock = sock;
         s->guestSeq = seq + 1; // SYN consumes one sequence number
         s->hostSeq = 1000;     // arbitrary ISN
+
+        // Read the guest's MSS out of the SYN options (kind 2, length 4). Options
+        // live between the fixed 20-byte header and hdrLen.
+        s->guestMss = 0;
+        {
+            UINT32 o = 20;
+            while (o + 1 < hdrLen) {
+                unsigned char kind = tcp[o];
+                if (kind == 0) break;          // end of option list
+                if (kind == 1) { o++; continue; } // NOP
+                if (o + 1 >= hdrLen) break;
+                unsigned char optLen = tcp[o + 1];
+                if (optLen < 2 || o + optLen > hdrLen) break;
+                if (kind == 2 && optLen == 4) s->guestMss = netRd16(tcp + o + 2);
+                o += optLen;
+            }
+        }
         return;
     }
 
     if (!s) { g_tcpUnknown++; return; } // packet for a connection we don't know about
+
+    // The peer is gone but the guest may still be talking. Acknowledge whatever
+    // it sends so it closes cleanly rather than retransmitting into a void, and
+    // release the slot once it finishes.
+    if (s->state == NET_TCP_PEER_CLOSED) {
+        if (payloadLen > 0) {
+            INT32 d = (INT32)(seq - s->guestSeq);
+            if (d <= 0 && (UINT32)(-d) < payloadLen) s->guestSeq += payloadLen - (UINT32)(-d);
+            netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                               s->hostSeq, s->guestSeq, NET_TCP_ACK, NULL, 0);
+        }
+        if (flags & NET_TCP_FIN) {
+            s->guestSeq += 1;
+            netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                               s->hostSeq, s->guestSeq, NET_TCP_ACK, NULL, 0);
+            netCloseTcpSession(s);
+        }
+        return;
+    }
 
     if (payloadLen > 0) {
         // HONOUR THE SEQUENCE NUMBER. This used to append every payload to the
@@ -5426,15 +5472,26 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
         }
 
         if (s->state == NET_TCP_ESTABLISHED) {
-            unsigned char buf[1400];
-            int n = recv(s->sock, (char *)buf, sizeof(buf), 0);
-            if (n > 0) {
-                g_tcpBytesToGuest += n;
-                netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
-                                   s->hostSeq, s->guestSeq, NET_TCP_PSH | NET_TCP_ACK, buf, (UINT32)n);
-                s->hostSeq += (UINT32)n;
-            } else if (n == 0) {
-                g_tcpClosed++;
+            // DRAIN, don't take a single bite per poll. One recv per main-loop
+            // iteration throttles a server's reply to however often the loop
+            // happens to run, which for a multi-KB TLS flight means the peer can
+            // finish and close before we have collected what it already sent.
+            // Bounded so one busy connection cannot starve the others.
+            int drained = 0;
+            for (;;) {
+                unsigned char buf[1400];
+                UINT32 chunk = (s->guestMss && s->guestMss < sizeof(buf)) ? s->guestMss : (UINT32)sizeof(buf);
+                int n = recv(s->sock, (char *)buf, (int)chunk, 0);
+                if (n > 0) {
+                    g_tcpBytesToGuest += n;
+                    netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                       s->hostSeq, s->guestSeq, NET_TCP_PSH | NET_TCP_ACK, buf, (UINT32)n);
+                    s->hostSeq += (UINT32)n;
+                    if (++drained >= 8) break;   // yield to the other sessions
+                    continue;
+                }
+                if (n == 0) {
+                    g_tcpClosed++;
                 if (g_tcpLogged < 24) {
                     g_tcpLogged++;
                     printf("[net-tcp] PEER CLOSED guest:%u -> %d.%d.%d.%d:%u after %ld bytes in\n",
@@ -5444,11 +5501,18 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
                            g_tcpBytesToGuest);
                     fflush(stdout);
                 }
-                netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
-                                   s->hostSeq, s->guestSeq, NET_TCP_FIN | NET_TCP_ACK, NULL, 0);
-                netCloseTcpSession(s);
+                    // HALF-CLOSE. Tell the guest the peer is done, but keep the
+                    // session: its in-flight segments still need acking, and a
+                    // connection we have forgotten drops them as "unknown",
+                    // which is what drove the guest to RST.
+                    netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                       s->hostSeq, s->guestSeq, NET_TCP_FIN | NET_TCP_ACK, NULL, 0);
+                    s->hostSeq += 1;              // our FIN consumes a sequence number
+                    s->state = NET_TCP_PEER_CLOSED;
+                    if (s->sock != NETSOCK_INVALID) { netCloseSocket(s->sock); s->sock = NETSOCK_INVALID; }
+                }
+                break;   // n < 0: nothing more available right now
             }
-            // n < 0: non-blocking socket, no data available right now -- nothing to do.
         }
     }
 }
