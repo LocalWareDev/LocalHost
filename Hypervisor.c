@@ -5172,6 +5172,15 @@ typedef struct {
     UINT32 hostSeq;  // next sequence number we send
 } NetTcpSession;
 NetTcpSession g_tcpSessions[NET_MAX_TCP_SESSIONS];
+// TCP NAT was completely uninstrumented, so "no TCP in the log" meant nothing at
+// all -- absence of logging, not absence of traffic. These separate the failures
+// that look identical from the guest: never attempted / table full / connect
+// refused / connected but no data / data flowing.
+long g_tcpSyn = 0, g_tcpTableFull = 0, g_tcpSockFail = 0, g_tcpEstablished = 0;
+long g_tcpRefused = 0, g_tcpClosed = 0, g_tcpUnknown = 0;
+long g_tcpBytesToHost = 0, g_tcpBytesToGuest = 0;
+long g_tcpLogged = 0, g_tcpSegLogged = 0;
+long g_tcpDupSegments = 0, g_tcpOutOfOrder = 0;
 
 // Closes the real socket and frees the session slot. Does not notify the
 // guest -- callers that need the guest informed (RST/FIN) send that
@@ -5215,6 +5224,14 @@ void netSendTcpSegment(WHV_PARTITION_HANDLE partition, UINT32 srcIp, UINT16 srcP
     if (payloadLen) memcpy(seg + 20, payload, payloadLen);
     UINT32 seed = netL4ChecksumSeed(srcIp, dstIp, 6 /* TCP */, (UINT16)tcpLen);
     netWr16(seg + 16, netChecksum(seg, tcpLen, seed));
+    if (g_tcpSegLogged < 40) {
+        g_tcpSegLogged++;
+        printf("[net-tcp] -> guest:%u  %s%s%s%s%s seq=%u ack=%u len=%u\n", dstPort,
+               (flags & NET_TCP_SYN) ? "SYN " : "", (flags & NET_TCP_ACK) ? "ACK " : "",
+               (flags & NET_TCP_PSH) ? "PSH " : "", (flags & NET_TCP_FIN) ? "FIN " : "",
+               (flags & NET_TCP_RST) ? "RST " : "", seq, ack, payloadLen);
+        fflush(stdout);
+    }
     netSendIpFrame(partition, netGatewayMac, srcIp, dstIp, 6, seg, tcpLen);
 }
 
@@ -5229,6 +5246,15 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
     const unsigned char *payload = tcp + hdrLen;
     UINT32 payloadLen = tcpLen - hdrLen;
 
+    if (g_tcpSegLogged < 40) {
+        g_tcpSegLogged++;
+        printf("[net-tcp] <- guest:%u  %s%s%s%s%s seq=%u ack=%u len=%u\n", srcPort,
+               (flags & NET_TCP_SYN) ? "SYN " : "", (flags & NET_TCP_ACK) ? "ACK " : "",
+               (flags & NET_TCP_PSH) ? "PSH " : "", (flags & NET_TCP_FIN) ? "FIN " : "",
+               (flags & NET_TCP_RST) ? "RST " : "", seq, netRd32(tcp + 8), payloadLen);
+        fflush(stdout);
+    }
+
     NetTcpSession *s = netFindTcpSession(srcPort);
 
     if (flags & NET_TCP_RST) {
@@ -5237,21 +5263,41 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
     }
 
     if ((flags & NET_TCP_SYN) && !s) {
+        g_tcpSyn++;
         int i;
         for (i = 0; i < NET_MAX_TCP_SESSIONS; i++) {
             if (!g_tcpSessions[i].inUse) { s = &g_tcpSessions[i]; break; }
         }
-        if (!s) return; // session table full
+        if (!s) { g_tcpTableFull++; return; } // session table full
 
         netsock_t sock = netCreateNonBlockingSocket(SOCK_STREAM, IPPROTO_TCP);
-        if (sock == NETSOCK_INVALID) return;
-        struct sockaddr_in dst = netMakeSockAddr(dstIp, dstPort);
+        if (sock == NETSOCK_INVALID) { g_tcpSockFail++; return; }
+
+        // Same DNS relay translation the UDP path does. Without it a resolver
+        // falling back to DNS-over-TCP (which happens for answers too large for
+        // UDP) tries to open a connection to 10.0.2.3:53 -- a virtual address
+        // nothing listens on -- and gets refused. Measured: SYN guest:49518 ->
+        // 10.0.2.3:53 followed immediately by REFUSED.
+        UINT32 realDstIp = (dstIp == NET_DNS_IP && dstPort == 53) ? NET_UPSTREAM_DNS_IP : dstIp;
+
+        if (g_tcpLogged < 24) {
+            g_tcpLogged++;
+            printf("[net-tcp] SYN guest:%u -> %d.%d.%d.%d:%u%s\n", srcPort,
+                   (dstIp >> 24) & 0xFF, (dstIp >> 16) & 0xFF, (dstIp >> 8) & 0xFF, dstIp & 0xFF,
+                   dstPort, (realDstIp != dstIp) ? " [DNS relay]" : "");
+            fflush(stdout);
+        }
+        struct sockaddr_in dst = netMakeSockAddr(realDstIp, dstPort);
         connect(sock, (struct sockaddr *)&dst, sizeof(dst)); // non-blocking: completes async, polled below
 
         memset(s, 0, sizeof(*s));
         s->inUse = 1;
         s->state = NET_TCP_CONNECTING;
         s->guestPort = srcPort;
+        // The GUEST-facing address, deliberately not the one we connected to.
+        // Reply segments are built with this as their source, so a relayed DNS
+        // connection must still appear to come from 10.0.2.3 or the guest's TCP
+        // stack will not match it to the connection it opened.
         s->realDstIp = dstIp;
         s->realDstPort = dstPort;
         s->sock = sock;
@@ -5260,11 +5306,41 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
         return;
     }
 
-    if (!s) return; // packet for a connection we don't know about -- drop rather than RST, out of scope
+    if (!s) { g_tcpUnknown++; return; } // packet for a connection we don't know about
 
     if (payloadLen > 0) {
-        send(s->sock, (const char *)payload, (int)payloadLen, 0);
-        s->guestSeq += payloadLen;
+        // HONOUR THE SEQUENCE NUMBER. This used to append every payload to the
+        // socket and add its length to guestSeq unconditionally, which is wrong
+        // whenever the guest retransmits or sends an overlapping segment -- and
+        // Windows does exactly that during the TLS handshake:
+        //
+        //   <- seq=658911454 len=6      (forwarded)
+        //   <- seq=658911454 len=214    SAME seq, containing those 6 bytes again
+        //
+        // The real server then received 220 bytes where only 214 existed, with 6
+        // duplicated at the front. That corrupts the ClientHello, so no reply
+        // ever comes back -- measured as bytes out=657 in=0. We also acked
+        // 658911674 when the guest had only sent up to 658911668, i.e. we
+        // acknowledged data that was never transmitted.
+        //
+        // Forward only the genuinely new bytes, and never ack past what arrived.
+        INT32 delta = (INT32)(seq - s->guestSeq);   // signed: wrap-safe comparison
+        if (delta <= 0) {
+            UINT32 alreadyHave = (UINT32)(-delta);
+            if (alreadyHave < payloadLen) {
+                UINT32 newLen = payloadLen - alreadyHave;
+                g_tcpBytesToHost += newLen;
+                send(s->sock, (const char *)payload + alreadyHave, (int)newLen, 0);
+                s->guestSeq += newLen;
+            } else {
+                g_tcpDupSegments++;   // entirely a retransmission of what we have
+            }
+        } else {
+            // Ahead of what we expect: a gap we cannot fill, because this model
+            // has no reassembly queue. Drop it and re-ack guestSeq so the guest
+            // retransmits from there rather than us stitching a hole together.
+            g_tcpOutOfOrder++;
+        }
         netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
                            s->hostSeq, s->guestSeq, NET_TCP_ACK, NULL, 0);
     }
@@ -5297,10 +5373,49 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
             tv.tv_usec = 0;
             if (select(0, NULL, &writeSet, &exceptSet, &tv) > 0) {
                 if (FD_ISSET(s->sock, &exceptSet)) {
+                    g_tcpRefused++;
+                    if (g_tcpLogged < 24) {
+                        g_tcpLogged++;
+                        printf("[net-tcp] REFUSED guest:%u -> %d.%d.%d.%d:%u\n", s->guestPort,
+                               (s->realDstIp >> 24) & 0xFF, (s->realDstIp >> 16) & 0xFF,
+                               (s->realDstIp >> 8) & 0xFF, s->realDstIp & 0xFF, s->realDstPort);
+                        fflush(stdout);
+                    }
                     netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
                                        s->hostSeq, s->guestSeq, NET_TCP_RST | NET_TCP_ACK, NULL, 0);
                     netCloseTcpSession(s);
                 } else if (FD_ISSET(s->sock, &writeSet)) {
+                    // A writable socket is NOT proof the connect succeeded --
+                    // SO_ERROR is. Without this check a failed connect is taken
+                    // for an established one, the first recv() then returns 0,
+                    // and we send the guest a FIN before it has even sent its
+                    // request (observed: SYN/SYN-ACK/ACK then an unprompted FIN,
+                    // with the guest's ClientHello arriving afterwards).
+                    int soErr = 0, soLen = (int)sizeof(soErr);
+                    if (getsockopt(s->sock, SOL_SOCKET, SO_ERROR, (char *)&soErr, &soLen) == 0 && soErr != 0) {
+                        g_tcpRefused++;
+                        if (g_tcpLogged < 24) {
+                            g_tcpLogged++;
+                            printf("[net-tcp] CONNECT FAILED guest:%u -> %d.%d.%d.%d:%u (SO_ERROR=%d)\n",
+                                   s->guestPort,
+                                   (s->realDstIp >> 24) & 0xFF, (s->realDstIp >> 16) & 0xFF,
+                                   (s->realDstIp >> 8) & 0xFF, s->realDstIp & 0xFF,
+                                   s->realDstPort, soErr);
+                            fflush(stdout);
+                        }
+                        netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
+                                           s->hostSeq, s->guestSeq, NET_TCP_RST | NET_TCP_ACK, NULL, 0);
+                        netCloseTcpSession(s);
+                        continue;
+                    }
+                    g_tcpEstablished++;
+                    if (g_tcpLogged < 24) {
+                        g_tcpLogged++;
+                        printf("[net-tcp] CONNECTED guest:%u -> %d.%d.%d.%d:%u\n", s->guestPort,
+                               (s->realDstIp >> 24) & 0xFF, (s->realDstIp >> 16) & 0xFF,
+                               (s->realDstIp >> 8) & 0xFF, s->realDstIp & 0xFF, s->realDstPort);
+                        fflush(stdout);
+                    }
                     s->state = NET_TCP_ESTABLISHED;
                     netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
                                        s->hostSeq, s->guestSeq, NET_TCP_SYN | NET_TCP_ACK, NULL, 0);
@@ -5314,10 +5429,21 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
             unsigned char buf[1400];
             int n = recv(s->sock, (char *)buf, sizeof(buf), 0);
             if (n > 0) {
+                g_tcpBytesToGuest += n;
                 netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
                                    s->hostSeq, s->guestSeq, NET_TCP_PSH | NET_TCP_ACK, buf, (UINT32)n);
                 s->hostSeq += (UINT32)n;
             } else if (n == 0) {
+                g_tcpClosed++;
+                if (g_tcpLogged < 24) {
+                    g_tcpLogged++;
+                    printf("[net-tcp] PEER CLOSED guest:%u -> %d.%d.%d.%d:%u after %ld bytes in\n",
+                           s->guestPort,
+                           (s->realDstIp >> 24) & 0xFF, (s->realDstIp >> 16) & 0xFF,
+                           (s->realDstIp >> 8) & 0xFF, s->realDstIp & 0xFF, s->realDstPort,
+                           g_tcpBytesToGuest);
+                    fflush(stdout);
+                }
                 netSendTcpSegment(partition, s->realDstIp, s->realDstPort, NET_GUEST_IP, s->guestPort,
                                    s->hostSeq, s->guestSeq, NET_TCP_FIN | NET_TCP_ACK, NULL, 0);
                 netCloseTcpSession(s);
@@ -5335,6 +5461,21 @@ void netHandleIpv4(WHV_PARTITION_HANDLE partition, const unsigned char *frame, U
     const unsigned char *ip = frame + 14;
     UINT32 ipLen = len - 14;
     if (ipLen < 20) return;
+
+    // TRUST THE IP HEADER'S TOTAL LENGTH, not the frame length. An Ethernet frame
+    // is padded up to 60 bytes, and a bare TCP ACK is only 54 (14 + 20 + 20), so
+    // the frame carries 6 bytes of padding after the real packet. Deriving the L4
+    // length by subtracting from the FRAME length handed those 6 padding bytes to
+    // TCP as though they were payload -- we forwarded them to the real server
+    // ahead of the TLS ClientHello, the server saw a corrupt stream and closed
+    // the connection, and browsing could never work. Measured as repeated
+    // "len=6" segments followed immediately by the server's FIN.
+    //
+    // DNS never hit this: its payloads are large enough that the frames were
+    // never padded, which is exactly why UDP looked healthy while TCP did not.
+    UINT32 ipTotalLen = netRd16(ip + 2);
+    if (ipTotalLen >= 20 && ipTotalLen < ipLen) ipLen = ipTotalLen;
+
     UINT32 ihl = (ip[0] & 0x0F) * 4;
     if (ihl < 20 || ipLen < ihl) return;
 
@@ -12254,6 +12395,13 @@ int main(int argc, char *argv[]) {
                        (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession);
+                printf("[heartbeat]   net TCP: syn=%ld connected=%ld refused=%ld tableFull=%ld"
+                       " sockFail=%ld closed=%ld unknown=%ld | bytes out=%ld in=%ld"
+                       " dup=%ld ooo=%ld\n",
+                       g_tcpSyn, g_tcpEstablished, g_tcpRefused, g_tcpTableFull,
+                       g_tcpSockFail, g_tcpClosed, g_tcpUnknown,
+                       g_tcpBytesToHost, g_tcpBytesToGuest,
+                       g_tcpDupSegments, g_tcpOutOfOrder);
                 printf("[heartbeat]   net TX: total=%ld arp=%ld ipv4=%ld ipv6=%ld other=%ld"
                        " | RX offered=%ld delivered=%ld dropped(noRE=%ld noBuf=%ld size=%ld)"
                        " arpReplies=%ld padded=%ld\n",
