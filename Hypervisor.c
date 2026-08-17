@@ -4617,6 +4617,7 @@ long g_netTxFrames = 0, g_netRxFrames = 0;
 long g_netRxOffered = 0, g_netRxDropNoRe = 0, g_netRxDropNoBuf = 0, g_netRxDropSize = 0;
 long g_netRxPadded = 0;   // runts padded up to the 60-byte Ethernet minimum
 long g_netTxArp = 0, g_netTxIpv4 = 0, g_netTxIpv6 = 0, g_netTxOther = 0;
+long g_nicIrqInjected = 0, g_nicIrqLatched = 0, g_nicIrqMaskedOff = 0;
 long g_netArpLogged = 0, g_netArpReplies = 0;
 long g_netRingReEnables = 0, g_netRingResetSkipped = 0;
 
@@ -4695,10 +4696,18 @@ int pendingRtl8139Irq = 0;    // same latch-until-IF=1 pattern as pendingAtaIrq
 void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
     UINT16 isr = *(UINT16 *)&rtl8139Regs[0x3E];
     UINT16 imr = *(UINT16 *)&rtl8139Regs[0x3C];
-    if ((isr & imr) == 0) return; // nothing enabled is actually pending
+    if ((isr & imr) == 0) {
+        // Pending but MASKED. Counted separately because this is the state that
+        // used to strand a received frame: the cause stays set in ISR, no
+        // interrupt is raised, and nothing re-checked when the mask was lifted.
+        if (isr) g_nicIrqMaskedOff++;
+        return;
+    }
     if (guestInterruptsEnabled(partition)) {
+        g_nicIrqInjected++;
         injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: routed, was hardcoded 0x73
     } else {
+        g_nicIrqLatched++;
         pendingRtl8139Irq = 1;
     }
 }
@@ -4946,6 +4955,10 @@ void netHandleIcmp(WHV_PARTITION_HANDLE partition, UINT32 srcIp, UINT32 dstIp,
     netSendIpFrame(partition, replyMac, dstIp, srcIp, 1 /* ICMP */, reply, icmpLen);
 }
 
+// Declared here rather than with the UDP NAT globals further down, because
+// netSendUdp below is defined before them.
+long g_netUdpCksumChecked = 0;
+
 // Builds a UDP header around payload, computes the pseudo-header checksum,
 // and hands off to netSendIpFrame. Shared by DHCP, the DNS relay, and
 // general UDP NAT (all added below).
@@ -4963,6 +4976,22 @@ void netSendUdp(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac, UIN
     UINT16 cksum = netChecksum(udp, udpLen, seed);
     if (cksum == 0) cksum = 0xFFFF; // UDP: a computed 0 means "no checksum"; avoid emitting a literal zero
     netWr16(udp + 6, cksum);
+
+    // SELF-CHECK. The guest reports DNS timeouts while we measure a reply
+    // delivered for every query in under 50ms with no drops -- so it is receiving
+    // these and rejecting them, and a bad checksum is the usual reason a host
+    // discards a UDP datagram in silence. Verifying over the completed header
+    // must yield zero; if it does not, our arithmetic is wrong and every reply we
+    // have ever "delivered" was garbage on arrival.
+    if (g_netUdpCksumChecked < 4) {
+        g_netUdpCksumChecked++;
+        UINT16 verify = netChecksum(udp, udpLen, seed);
+        printf("[net-udp] checksum self-check: wrote 0x%04X, verify-over-complete=0x%04X %s"
+               " (udpLen=%u srcPort=%u dstPort=%u)\n",
+               cksum, verify, (verify == 0) ? "OK" : "*** BAD ***",
+               udpLen, srcPort, dstPort);
+        fflush(stdout);
+    }
     netSendIpFrame(partition, srcMac, srcIp, dstIp, 17, udp, udpLen);
 }
 
@@ -7727,6 +7756,33 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
                 rtl8139Regs[offset + i] &= ~(unsigned char)((written >> (i * 8)) & 0xFF);
             }
+            // The interrupt line is LEVEL-triggered. If the driver acknowledged
+            // some causes but others are still pending and unmasked, the line is
+            // still asserted and must fire again. Without this, a frame that
+            // arrived while the driver was inside its ISR was acknowledged away
+            // and never re-signalled.
+            rtl8139MaybeInjectIrq(partition);
+        } else if (offset == 0x3C) {
+            // IMR. Re-evaluate the interrupt line on every mask change.
+            //
+            // THIS IS THE BUG behind the DNS timeouts. The driver masks
+            // interrupts (IMR=0) while it works and re-enables them afterwards --
+            // both values were observed at different heartbeat samples. We only
+            // evaluated (ISR & IMR) at the instant a frame was delivered, so any
+            // frame that arrived during a masked window raised nothing at all,
+            // and re-enabling the mask did not re-check. The frame then sat in
+            // the ring, complete and undropped, until some unrelated interrupt
+            // happened to wake the driver -- which is exactly the shape of the
+            // evidence: replies relayed in 9-32ms, RX delivered with zero drops,
+            // ring reporting data present, and the guest reporting 2s timeouts.
+            //
+            // Real hardware holds the line asserted while (ISR & IMR) is nonzero,
+            // so unmasking an already-pending cause fires immediately.
+            UINT32 i;
+            for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
+                rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
+            }
+            rtl8139MaybeInjectIrq(partition);
         } else if ((offset == 0x10 || offset == 0x14 || offset == 0x18 || offset == 0x1C) && accessSize >= 4) {
             // TSDx: the real "submit this frame" trigger. Store the write
             // first, then synchronously DMA-read the frame via the
@@ -12506,6 +12562,9 @@ int main(int argc, char *argv[]) {
                     printf("[heartbeat]   net RX ring: reEnables=%ld (would have wiped a"
                            " non-empty ring %ld times)\n",
                            g_netRingReEnables, g_netRingResetSkipped);
+                    printf("[heartbeat]   net NIC irq: injected=%ld latched=%ld"
+                           " pendingButMasked=%ld\n",
+                           g_nicIrqInjected, g_nicIrqLatched, g_nicIrqMaskedOff);
                 }
                 // U68: the two halves of the pipe bridge, so "the guest is
                 // transmitting" can be told apart from "the debugger is hearing it".
