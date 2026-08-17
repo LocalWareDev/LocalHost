@@ -5032,10 +5032,16 @@ typedef struct {
     int inUse;
     UINT16 guestPort;
     netsock_t sock;
+    // When the guest's query went out. The guest reports DNS timeouts while our
+    // relay shows a reply for nearly every query, so the question is whether the
+    // answer is LOST or merely LATE -- and those need opposite fixes. We only
+    // poll these sockets once per vCPU exit, so a slow loop delays every reply.
+    LARGE_INTEGER sentAt;
 } NetUdpSession;
 NetUdpSession g_udpSessions[NET_MAX_UDP_SESSIONS];
 long g_netUdpOut = 0, g_netUdpOutFail = 0, g_netUdpIn = 0, g_netUdpNoSession = 0;
-long g_netUdpLogged = 0;
+long g_netUdpLogged = 0, g_netUdpOver2s = 0;
+double g_netUdpWorstMs = 0.0;
 
 // Looks up the session for guestPort, opening a new real UDP socket for it
 // if none exists yet. Returns NULL if the table is full or socket()
@@ -5081,6 +5087,7 @@ void netHandleUdpGuestPacket(UINT32 dstIp, const unsigned char *udp, UINT32 udpL
     int sent = sendto(sess->sock, (const char *)payload, (int)payloadLen, 0,
                       (struct sockaddr *)&dst, sizeof(dst));
     if (sent < 0) g_netUdpOutFail++; else g_netUdpOut++;
+    QueryPerformanceCounter(&sess->sentAt);
 
     // DNS is the open failure, and the four ways it can break are
     // indistinguishable from outside: the guest never asks; we fail to send; the
@@ -5122,13 +5129,22 @@ void netPollUdpSessions(WHV_PARTITION_HANDLE partition) {
             // virtual DNS proxy the guest actually queried.
             UINT32 replySrcIp = (fromIp == NET_UPSTREAM_DNS_IP && fromPort == 53) ? NET_DNS_IP : fromIp;
             g_netUdpIn++;
+            // How long the guest waited. nslookup gives up at 2000ms, so anything
+            // near that is a latency problem in our polling, not packet loss.
+            double waitedMs = 0.0;
+            if (perfFrequency.QuadPart && g_udpSessions[i].sentAt.QuadPart) {
+                LARGE_INTEGER nowQpc; QueryPerformanceCounter(&nowQpc);
+                waitedMs = (double)(nowQpc.QuadPart - g_udpSessions[i].sentAt.QuadPart) * 1000.0
+                           / (double)perfFrequency.QuadPart;
+                if (waitedMs > g_netUdpWorstMs) g_netUdpWorstMs = waitedMs;
+                if (waitedMs > 2000.0) g_netUdpOver2s++;
+            }
             if (g_netUdpLogged < 40) {
                 g_netUdpLogged++;
-                printf("[net-udp] IN  %d.%d.%d.%d:%u -> guest:%u (%d bytes), presented as %d.%d.%d.%d\n",
+                printf("[net-udp] IN  %d.%d.%d.%d:%u -> guest:%u (%d bytes) after %.0f ms%s\n",
                        (fromIp >> 24) & 0xFF, (fromIp >> 16) & 0xFF, (fromIp >> 8) & 0xFF, fromIp & 0xFF,
-                       fromPort, g_udpSessions[i].guestPort, n,
-                       (replySrcIp >> 24) & 0xFF, (replySrcIp >> 16) & 0xFF,
-                       (replySrcIp >> 8) & 0xFF, replySrcIp & 0xFF);
+                       fromPort, g_udpSessions[i].guestPort, n, waitedMs,
+                       waitedMs > 2000.0 ? "   *** PAST THE GUEST'S 2s TIMEOUT ***" : "");
                 fflush(stdout);
             }
             // Answer from the MAC the guest ARPed for. It asked for 10.0.2.3 and
@@ -12457,8 +12473,10 @@ int main(int argc, char *argv[]) {
                        g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
                        usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
                        (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
-                printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld\n",
-                       g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession);
+                printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
+                       " | reply latency worst=%.0f ms, over-2s=%ld\n",
+                       g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
+                       g_netUdpWorstMs, g_netUdpOver2s);
                 printf("[heartbeat]   net TCP: syn=%ld connected=%ld refused=%ld tableFull=%ld"
                        " sockFail=%ld closed=%ld unknown=%ld | bytes out=%ld in=%ld"
                        " dup=%ld ooo=%ld\n",
