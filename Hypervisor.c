@@ -4616,6 +4616,8 @@ int g_nicMmioClobbered = 0;   // set if a scratch page ever got mapped over BAR1
 long g_netTxFrames = 0, g_netRxFrames = 0;
 long g_netRxOffered = 0, g_netRxDropNoRe = 0, g_netRxDropNoBuf = 0, g_netRxDropSize = 0;
 long g_netRxPadded = 0;   // runts padded up to the 60-byte Ethernet minimum
+long g_netRxDropRingFull = 0;   // dropped rather than overwrite unread ring data
+long g_tcpRingBackpressure = 0; // times we left data in the host socket instead
 long g_netTxArp = 0, g_netTxIpv4 = 0, g_netTxIpv6 = 0, g_netTxOther = 0;
 long g_nicIrqInjected = 0, g_nicIrqLatched = 0, g_nicIrqMaskedOff = 0;
 long g_netArpLogged = 0, g_netArpReplies = 0;
@@ -4719,10 +4721,39 @@ void deliverPendingRtl8139Irq(WHV_PARTITION_HANDLE partition) {
     }
 }
 
+// Bytes of ring the guest has NOT yet consumed, derived from CAPR (its own read
+// pointer). Needed because nothing ever checked for space: rtl8139ReceiveFrame
+// wraps to offset 0 when a frame will not fit, happily overwriting data the
+// driver has not read. With the TCP drain loop pushing up to 8 x 1400 bytes per
+// poll that is easy to hit, and a single clobbered segment breaks the stream
+// permanently -- we have no retransmission, so the guest can never recover the
+// missing bytes. Observed as TLS flights arriving incomplete: the guest gets the
+// ServerHello, never answers, and the server closes.
+UINT32 rtl8139RxRingUsed(void);
 UINT32 rtl8139RxRingSize(void) {
     UINT32 rcr = *(UINT32 *)&rtl8139Regs[0x44];
     UINT32 rblen = (rcr >> 11) & 0x3;
     return 8192u << rblen; // RBLEN 00/01/10/11 -> 8K/16K/32K/64K
+}
+
+UINT32 rtl8139RxRingUsed(void) {
+    UINT32 ringSize = rtl8139RxRingSize();
+    if (ringSize == 0) return 0;
+    // CAPR is conventionally (read offset - 16).
+    UINT16 capr = *(UINT16 *)&rtl8139Regs[0x38];
+    UINT32 readPos = ((UINT32)capr + 16) % ringSize;
+    UINT32 writePos = rtl8139RxWritePos % ringSize;
+    return (writePos - readPos) % ringSize;
+}
+
+// Headroom before the ring would overwrite unread data. A generous margin is
+// kept free so a maximum-size frame can never straddle the read pointer.
+UINT32 rtl8139RxRingFree(void) {
+    UINT32 ringSize = rtl8139RxRingSize();
+    UINT32 used = rtl8139RxRingUsed();
+    if (ringSize <= used) return 0;
+    UINT32 freeBytes = ringSize - used;
+    return (freeBytes > 4096u) ? (freeBytes - 4096u) : 0u;
 }
 
 void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
@@ -4865,6 +4896,8 @@ UINT32 netL4ChecksumSeed(UINT32 srcIp, UINT32 dstIp, unsigned char proto, UINT16
 // the device via rtl8139ReceiveFrame. Fills in and checksums the IP header;
 // the caller is responsible for its own L4 checksum (UDP/TCP need the
 // pseudo-header, ICMP doesn't) before calling this.
+long g_netIpFrameLogged = 0;
+
 void netSendIpFrame(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac, UINT32 srcIp,
                      UINT32 dstIp, unsigned char proto, const unsigned char *l4, UINT32 l4Len) {
     if (!netGuestMacKnown) return;
@@ -4890,6 +4923,26 @@ void netSendIpFrame(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac,
     netWr16(ip + 10, netChecksum(ip, 20, 0));
 
     memcpy(frame + 34, l4, l4Len);
+
+    // The UDP checksum was self-checked and proved correct, but the IP HEADER
+    // checksum never was -- and a bad one is discarded at the IP layer before
+    // anything looks at UDP, which would look identical from outside: relayed,
+    // delivered, undropped, and ignored. Verify over the completed header (must
+    // be zero) and dump the first few frames so the wire format can be read
+    // rather than reasoned about.
+    if (g_netIpFrameLogged < 3) {
+        g_netIpFrameLogged++;
+        UINT16 ipVerify = netChecksum(ip, 20, 0);
+        printf("[net-ip] frame %ld: proto=%u len=%u ipcksum-verify=0x%04X %s\n",
+               g_netIpFrameLogged, proto, ipLen, ipVerify,
+               (ipVerify == 0) ? "OK" : "*** BAD IP CHECKSUM ***");
+        printf("[net-ip]   eth+ip+l4[0:48]:");
+        UINT32 di;
+        for (di = 0; di < 48 && di < 14 + ipLen; di++) printf(" %02X", frame[di]);
+        printf("\n");
+        fflush(stdout);
+    }
+
     rtl8139ReceiveFrame(partition, frame, 14 + ipLen);
 }
 
@@ -5053,7 +5106,14 @@ void netHandleDhcp(WHV_PARTITION_HANDLE partition, const unsigned char *dhcp, UI
 // a single socket can talk to multiple real destinations if the guest
 // reuses one source port for several flows -- recvfrom's fromaddr tells us
 // which real peer a given reply came from. ---
-#define NET_MAX_UDP_SESSIONS 32
+// 32, and nothing ever freed a slot -- the same leak just fixed for TCP, but far
+// more damaging here. Windows picks a FRESH ephemeral source port for every DNS
+// query, so each lookup consumed a slot permanently. After 32 lookups the table
+// was full and every subsequent query was dropped with no session at all, which
+// is why Edge reports DNS_PROBE_FINISHED_NO_INTERNET while our relay looks
+// healthy: the queries it does log are the lucky early ones. (An earlier run
+// recorded noSession=8, already climbing.)
+#define NET_MAX_UDP_SESSIONS 128
 #define NET_UPSTREAM_DNS_IP 0x08080808U // 8.8.8.8 -- fixed, since there's no portable way to
                                          // discover "the host's configured DNS server" without
                                          // platform-specific APIs (see the portability note above)
@@ -5069,6 +5129,7 @@ typedef struct {
 } NetUdpSession;
 NetUdpSession g_udpSessions[NET_MAX_UDP_SESSIONS];
 long g_netUdpOut = 0, g_netUdpOutFail = 0, g_netUdpIn = 0, g_netUdpNoSession = 0;
+long g_netUdpReclaimed = 0;
 long g_netUdpLogged = 0, g_netUdpOver2s = 0;
 double g_netUdpWorstMs = 0.0;
 
@@ -5087,7 +5148,29 @@ NetUdpSession *netFindOrCreateUdpSession(UINT16 guestPort) {
             g_udpSessions[i].inUse = 1;
             g_udpSessions[i].guestPort = guestPort;
             g_udpSessions[i].sock = s;
+            g_udpSessions[i].sentAt.QuadPart = 0;
             return &g_udpSessions[i];
+        }
+    }
+    // RECLAIM the least recently used slot rather than refusing. A DNS exchange
+    // is over in milliseconds, so the oldest entry is certainly finished with --
+    // whereas refusing means the guest's lookup simply vanishes.
+    {
+        NetUdpSession *victim = NULL;
+        for (i = 0; i < NET_MAX_UDP_SESSIONS; i++) {
+            if (!victim || g_udpSessions[i].sentAt.QuadPart < victim->sentAt.QuadPart)
+                victim = &g_udpSessions[i];
+        }
+        if (victim) {
+            g_netUdpReclaimed++;
+            if (victim->sock != NETSOCK_INVALID) netCloseSocket(victim->sock);
+            netsock_t s = netCreateNonBlockingSocket(SOCK_DGRAM, IPPROTO_UDP);
+            if (s == NETSOCK_INVALID) { victim->inUse = 0; return NULL; }
+            victim->inUse = 1;
+            victim->guestPort = guestPort;
+            victim->sock = s;
+            victim->sentAt.QuadPart = 0;
+            return victim;
         }
     }
     return NULL; // session table full
@@ -5198,7 +5281,11 @@ void netPollUdpSessions(WHV_PARTITION_HANDLE partition) {
 // keep things reasonable), and teardown just sends our FIN and frees the
 // session rather than tracking the full close handshake. All acceptable
 // simplifications for "reach the Internet," not full protocol compliance.
-#define NET_MAX_TCP_SESSIONS 16
+// 16 was far too few and nothing ever reclaimed a slot: measured syn=91 with
+// tableFull=72, i.e. four out of five connection attempts refused outright. A
+// browser opens dozens of connections for a single page, so this alone would
+// stall any real browsing regardless of how well the transport works.
+#define NET_MAX_TCP_SESSIONS 64
 #define NET_TCP_FIN  0x01
 #define NET_TCP_SYN  0x02
 #define NET_TCP_RST  0x04
@@ -5225,6 +5312,9 @@ typedef struct {
     // than this may be dropped by the guest rather than reassembled, so we cap
     // what we hand it instead of assuming our 1400-byte buffer is acceptable.
     UINT32 guestMss;
+    // When this session last carried traffic. Slots were never reclaimed, so a
+    // half-closed or abandoned connection held its slot forever.
+    LARGE_INTEGER lastActive;
 } NetTcpSession;
 NetTcpSession g_tcpSessions[NET_MAX_TCP_SESSIONS];
 // TCP NAT was completely uninstrumented, so "no TCP in the log" meant nothing at
@@ -5235,7 +5325,7 @@ long g_tcpSyn = 0, g_tcpTableFull = 0, g_tcpSockFail = 0, g_tcpEstablished = 0;
 long g_tcpRefused = 0, g_tcpClosed = 0, g_tcpUnknown = 0;
 long g_tcpBytesToHost = 0, g_tcpBytesToGuest = 0;
 long g_tcpLogged = 0, g_tcpSegLogged = 0;
-long g_tcpDupSegments = 0, g_tcpOutOfOrder = 0;
+long g_tcpDupSegments = 0, g_tcpOutOfOrder = 0, g_tcpReclaimed = 0, g_tcpAged = 0;
 
 // Closes the real socket and frees the session slot. Does not notify the
 // guest -- callers that need the guest informed (RST/FIN) send that
@@ -5323,7 +5413,35 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
         for (i = 0; i < NET_MAX_TCP_SESSIONS; i++) {
             if (!g_tcpSessions[i].inUse) { s = &g_tcpSessions[i]; break; }
         }
-        if (!s) { g_tcpTableFull++; return; } // session table full
+        if (!s) {
+            // RECLAIM before refusing. Prefer a half-closed session (the peer is
+            // already gone), otherwise the least recently active one. Refusing a
+            // guest's SYN because we are hoarding dead slots is far worse than
+            // dropping the stalest connection.
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            NetTcpSession *victim = NULL;
+            int j;
+            for (j = 0; j < NET_MAX_TCP_SESSIONS; j++) {
+                NetTcpSession *c = &g_tcpSessions[j];
+                if (c->state == NET_TCP_PEER_CLOSED) {
+                    if (!victim || victim->state != NET_TCP_PEER_CLOSED ||
+                        c->lastActive.QuadPart < victim->lastActive.QuadPart) victim = c;
+                } else if (!victim && c->state != NET_TCP_PEER_CLOSED) {
+                    victim = c;
+                } else if (victim && victim->state != NET_TCP_PEER_CLOSED &&
+                           c->lastActive.QuadPart < victim->lastActive.QuadPart) {
+                    victim = c;
+                }
+            }
+            if (victim) {
+                g_tcpReclaimed++;
+                netCloseTcpSession(victim);
+                s = victim;
+            } else {
+                g_tcpTableFull++;
+                return;
+            }
+        }
 
         netsock_t sock = netCreateNonBlockingSocket(SOCK_STREAM, IPPROTO_TCP);
         if (sock == NETSOCK_INVALID) { g_tcpSockFail++; return; }
@@ -5379,6 +5497,7 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
     }
 
     if (!s) { g_tcpUnknown++; return; } // packet for a connection we don't know about
+    QueryPerformanceCounter(&s->lastActive);
 
     // The peer is gone but the guest may still be talking. Acknowledge whatever
     // it sends so it closes cleanly rather than retransmitting into a void, and
@@ -5453,6 +5572,15 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
         NetTcpSession *s = &g_tcpSessions[i];
         if (!s->inUse) continue;
 
+        // Age out half-closed sessions the guest never finished closing. Without
+        // this they hold their slot until something else evicts them.
+        if (s->state == NET_TCP_PEER_CLOSED && perfFrequency.QuadPart && s->lastActive.QuadPart) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            double idleMs = (double)(now.QuadPart - s->lastActive.QuadPart) * 1000.0
+                            / (double)perfFrequency.QuadPart;
+            if (idleMs > 15000.0) { g_tcpAged++; netCloseTcpSession(s); continue; }
+        }
+
         if (s->state == NET_TCP_CONNECTING) {
             fd_set writeSet, exceptSet;
             FD_ZERO(&writeSet);
@@ -5526,6 +5654,14 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
             for (;;) {
                 unsigned char buf[1400];
                 UINT32 chunk = (s->guestMss && s->guestMss < sizeof(buf)) ? s->guestMss : (UINT32)sizeof(buf);
+                // BACKPRESSURE. Do not pull data out of the host socket unless the
+                // guest's ring can actually hold it. Draining regardless meant we
+                // overwrote frames the driver had not read yet, and with no
+                // retransmission a single clobbered segment breaks the stream for
+                // good. Leaving the bytes in the host socket buffer instead lets
+                // the real peer's own TCP flow control slow the sender down --
+                // which is what a real NIC's finite FIFO does.
+                if (rtl8139RxRingFree() < chunk + 64) { g_tcpRingBackpressure++; break; }
                 int n = recv(s->sock, (char *)buf, (int)chunk, 0);
                 if (n > 0) {
                     g_tcpBytesToGuest += n;
@@ -5628,6 +5764,22 @@ void netSlirpTransmit(WHV_PARTITION_HANDLE partition, const unsigned char *frame
     if (!netGuestMacKnown) {
         memcpy(netGuestMac, frame + 6, 6);
         netGuestMacKnown = 1;
+        // THE MAC THE GUEST ACTUALLY USES, against the one we put in the EEPROM.
+        // The guest reads its address by bit-banging our emulated 93C46, so if
+        // that read yields anything else, every unicast reply we send is
+        // addressed to a station that does not exist -- while BROADCAST traffic
+        // still works. That is exactly the observed split: DHCP (broadcast)
+        // succeeds, DNS (unicast) times out despite being relayed, delivered,
+        // checksummed correctly and interrupt-signalled.
+        int macMatches = (memcmp(netGuestMac, rtl8139Mac, 6) == 0);
+        printf("[net] guest MAC learned: %02X:%02X:%02X:%02X:%02X:%02X | "
+               "EEPROM says %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
+               netGuestMac[0], netGuestMac[1], netGuestMac[2],
+               netGuestMac[3], netGuestMac[4], netGuestMac[5],
+               rtl8139Mac[0], rtl8139Mac[1], rtl8139Mac[2],
+               rtl8139Mac[3], rtl8139Mac[4], rtl8139Mac[5],
+               macMatches ? "MATCH" : "*** MISMATCH -- unicast cannot reach the guest ***");
+        fflush(stdout);
     }
 
     UINT16 ethertype = netRd16(frame + 12);
@@ -5732,13 +5884,42 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     UINT32 totalLen = 4 + len + 4;
     UINT32 alignedLen = (totalLen + 3) & ~3u; // next packet is 4-byte aligned
     if (totalLen > avail || rxBase + avail > guestMemSize) { g_netRxDropSize++; return; }
-    g_netRxFrames++;   // actually delivered into the ring
+
+    // NEVER overwrite what the guest has not read. The wrap below used to reset to
+    // offset 0 unconditionally, clobbering unread frames -- and with no
+    // retransmission anywhere, a single lost segment stalls a TCP stream forever.
+    // Real hardware drops the frame and flags an overflow instead; do that.
+    if (rtl8139RxRingUsed() + totalLen + 64 >= ringSize) {
+        g_netRxDropRingFull++;
+        *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0010; // ISR: RXOVW
+        rtl8139MaybeInjectIrq(partition);
+        return;
+    }
+
+    g_netRxFrames++;   // past every guard: this frame really does go into the ring
 
     UINT32 pos = rtl8139RxWritePos % ringSize;
     if (pos + totalLen > avail) pos = 0; // wouldn't fit before the pad ends -- wrap to start
 
     unsigned char *ring = (unsigned char *)guestMemory + rxBase;
+    // RX status. ROK alone is NOT what real hardware reports: the upper bits say
+    // WHY the frame was accepted -- BAR (bit 13) broadcast, PAM (bit 14) physical
+    // address matched, MAR (bit 15) multicast. We reported none of them, so every
+    // frame arrived looking like it matched no filter at all.
+    //
+    // This is the last structural difference between our receive path and real
+    // silicon, and it fits the DNS symptom precisely: the wire format, checksums,
+    // MAC, latency, interrupts and ring pointers are all now verified correct, yet
+    // the guest ignores unicast replies while broadcast DHCP has always worked --
+    // and PAM is exactly the bit that distinguishes those two cases.
     UINT16 rxStatus = 0x0001; // ROK
+    {
+        int isBroadcast = (frame[0] & frame[1] & frame[2] & frame[3] & frame[4] & frame[5]) == 0xFF;
+        int isMulticast = (frame[0] & 0x01) != 0;
+        if (isBroadcast)                              rxStatus |= 0x2000; // BAR
+        else if (isMulticast)                         rxStatus |= 0x8000; // MAR
+        else if (memcmp(frame, rtl8139Regs + 0x00, 6) == 0) rxStatus |= 0x4000; // PAM
+    }
     UINT16 rxLen = (UINT16)(len + 4); // real hardware includes the 4-byte CRC
     ring[pos + 0] = (unsigned char)(rxStatus & 0xFF);
     ring[pos + 1] = (unsigned char)(rxStatus >> 8);
@@ -7528,6 +7709,12 @@ void rtl8139InitRegs(void) {
     // they all read back as zero, which is a valid value for none of them.
     *(UINT32 *)(rtl8139Regs + 0x40) = RTL8139_TCR_HWVERID; // TCR: chip version
     *(UINT32 *)(rtl8139Regs + 0x44) = 0x0000000E;          // RCR: accept broadcast/multicast/mine
+    // CAPR must start such that readPos == writePos == 0, i.e. an EMPTY ring.
+    // The convention is CAPR = readPos - 16, so a freshly-zeroed CAPR implies
+    // readPos = 16 while writePos = 0 -- and the unsigned difference then wraps to
+    // nearly a whole ring, making an empty ring look completely full. That made
+    // the new overflow check drop every single received frame.
+    *(UINT16 *)&rtl8139Regs[0x38] = (UINT16)(rtl8139RxRingSize() - 16);
     rtl8139Regs[0x50] = 0x00;   // CR9346: config registers locked (normal state)
     rtl8139Regs[0x51] = 0x00;   // CONFIG0
     rtl8139Regs[0x52] = 0x10;   // CONFIG1: driver-loaded bit, not sleeping
@@ -12530,23 +12717,23 @@ int main(int argc, char *argv[]) {
                        usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
                        (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
-                       " | reply latency worst=%.0f ms, over-2s=%ld\n",
+                       " reclaimed=%ld | reply latency worst=%.0f ms, over-2s=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
-                       g_netUdpWorstMs, g_netUdpOver2s);
+                       g_netUdpReclaimed, g_netUdpWorstMs, g_netUdpOver2s);
                 printf("[heartbeat]   net TCP: syn=%ld connected=%ld refused=%ld tableFull=%ld"
                        " sockFail=%ld closed=%ld unknown=%ld | bytes out=%ld in=%ld"
-                       " dup=%ld ooo=%ld\n",
+                       " dup=%ld ooo=%ld reclaimed=%ld aged=%ld\n",
                        g_tcpSyn, g_tcpEstablished, g_tcpRefused, g_tcpTableFull,
                        g_tcpSockFail, g_tcpClosed, g_tcpUnknown,
                        g_tcpBytesToHost, g_tcpBytesToGuest,
-                       g_tcpDupSegments, g_tcpOutOfOrder);
+                       g_tcpDupSegments, g_tcpOutOfOrder, g_tcpReclaimed, g_tcpAged);
                 printf("[heartbeat]   net TX: total=%ld arp=%ld ipv4=%ld ipv6=%ld other=%ld"
                        " | RX offered=%ld delivered=%ld dropped(noRE=%ld noBuf=%ld size=%ld)"
-                       " arpReplies=%ld padded=%ld\n",
+                       " arpReplies=%ld padded=%ld ringFull=%ld backpressure=%ld\n",
                        g_netTxFrames, g_netTxArp, g_netTxIpv4, g_netTxIpv6, g_netTxOther,
                        g_netRxOffered, g_netRxFrames,
                        g_netRxDropNoRe, g_netRxDropNoBuf, g_netRxDropSize, g_netArpReplies,
-                       g_netRxPadded);
+                       g_netRxPadded, g_netRxDropRingFull, g_tcpRingBackpressure);
                 // Written-into-the-ring is NOT the same as consumed-by-the-guest.
                 // CAPR is the driver's read pointer; if it stops advancing while our
                 // write pointer moves, the guest has stopped draining the ring and
