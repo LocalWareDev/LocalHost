@@ -4614,9 +4614,14 @@ int g_nicMmioClobbered = 0;   // set if a scratch page ever got mapped over BAR1
 // Frame counts at the device layer, so "the guest never transmitted" can be told
 // apart from "we transmitted and the backend dropped it".
 long g_netTxFrames = 0, g_netRxFrames = 0;
-long g_netRxOffered = 0, g_netRxDropNoRe = 0, g_netRxDropNoBuf = 0, g_netRxDropSize = 0;
+long g_netRxOffered = 0, g_netRxDropSize = 0;
 long g_netRxPadded = 0;   // runts padded up to the 60-byte Ethernet minimum
-long g_netRxDropRingFull = 0;   // dropped rather than overwrite unread ring data
+// Frames the device could not take RIGHT NOW but which are not lost: they go on
+// the pending queue and are delivered when the driver is ready again. These are
+// deferrals, not drops -- the distinction matters, because a drop here is
+// unrecoverable (see the queue's own comment).
+long g_netRxDeferNoRe = 0, g_netRxDeferNoBuf = 0, g_netRxDeferRingFull = 0;
+long g_netRxQueuePeak = 0, g_netRxQueueOverflow = 0;
 long g_tcpRingBackpressure = 0; // times we left data in the host socket instead
 long g_netTxArp = 0, g_netTxIpv4 = 0, g_netTxIpv6 = 0, g_netTxOther = 0;
 long g_nicIrqInjected = 0, g_nicIrqLatched = 0, g_nicIrqMaskedOff = 0;
@@ -4757,6 +4762,43 @@ UINT32 rtl8139RxRingFree(void) {
 }
 
 void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
+void rtl8139FlushRxQueue(WHV_PARTITION_HANDLE partition);
+
+// --- Pending RX queue ------------------------------------------------------
+// By the time a frame reaches the device layer it has ALREADY been taken out of
+// the host socket, so dropping it here is unrecoverable: this model has no
+// retransmission, and one missing segment stalls a TCP stream permanently --
+// the exact shape of the long-running symptom (the guest takes in a whole
+// server flight, then says nothing).
+//
+// Three separate paths used to drop such a frame outright, and all three fire
+// during NORMAL operation, not just under stress:
+//   * RE clear -- the driver toggles RE off and on constantly (W37=4 -> W37=C
+//     observed repeatedly); every frame handed to us inside one of those
+//     windows was destroyed.
+//   * RBSTART not yet programmed -- a race at driver init.
+//   * ring momentarily full -- the driver simply had not drained yet.
+// None of those mean "this frame is bad", they mean "not right now", so queue
+// it and deliver it when the driver is ready. Only genuinely undeliverable
+// frames (oversized, no guest memory) and a full queue drop.
+#define RTL8139_RX_QUEUE_DEPTH 64
+#define RTL8139_RX_QUEUE_FRAME 1792
+typedef struct {
+    UINT32 len;
+    unsigned char data[RTL8139_RX_QUEUE_FRAME];
+} Rtl8139RxQueued;
+Rtl8139RxQueued rtl8139RxQueue[RTL8139_RX_QUEUE_DEPTH];
+UINT32 rtl8139RxQueueHead = 0;    // index of the oldest queued frame
+UINT32 rtl8139RxQueueCount = 0;
+
+// True when the device can take a frame of this size immediately. Used by the
+// TCP drain loop: with the queue in place, "the ring is full" no longer loses
+// data, but pulling more out of the host socket than the guest can absorb just
+// moves the backlog into our queue instead of leaving it where the real peer's
+// own flow control can see it. Keep it in the socket.
+int rtl8139RxCanAccept(UINT32 bytes) {
+    return rtl8139RxQueueCount == 0 && rtl8139RxRingFree() >= bytes;
+}
 
 // =====================================================================
 // Phase 3: slirp-style NAT networking backend.
@@ -5315,6 +5357,29 @@ typedef struct {
     // When this session last carried traffic. Slots were never reclaimed, so a
     // half-closed or abandoned connection held its slot forever.
     LARGE_INTEGER lastActive;
+    // The highest sequence number the guest has ACKNOWLEDGED receiving from us.
+    // Everything measured so far covers guest->us (dup, ooo) or our own delivery
+    // into the ring; nothing has ever checked whether the guest actually RECEIVED
+    // what we sent. If this trails hostSeq when a connection ends, our host->guest
+    // stream had a hole -- and with no retransmission that stalls TLS exactly as
+    // observed: the guest takes in a whole server flight and then says nothing.
+    UINT32 guestAcked;
+    // The guest's advertised receive window, taken from the window field of its
+    // most recent segment. NOTHING has ever read that field: the drain loop in
+    // netPollTcpSessions paced itself purely by RX ring space, which is not flow
+    // control at all. Ring space says what the DRIVER can take, and the driver
+    // empties the ring into its own buffers at its own rate, entirely
+    // independently of what the guest's TCP STACK is willing to accept. Only the
+    // second one governs whether the bytes survive, so on any sustained transfer
+    // we ran past the window, Windows silently discarded everything outside it,
+    // and -- with no retransmission anywhere in this model -- the stream was dead
+    // from that point on. That is exactly the long-running symptom: the guest
+    // takes in a whole server flight and then says nothing.
+    //
+    // Window scaling needs no handling here. Our SYN-ACK goes out with data
+    // offset 5 and no options at all, so per RFC 7323 scaling is disabled in BOTH
+    // directions and this raw 16-bit value is the true window.
+    UINT32 guestWindow;
 } NetTcpSession;
 NetTcpSession g_tcpSessions[NET_MAX_TCP_SESSIONS];
 // TCP NAT was completely uninstrumented, so "no TCP in the log" meant nothing at
@@ -5326,6 +5391,16 @@ long g_tcpRefused = 0, g_tcpClosed = 0, g_tcpUnknown = 0;
 long g_tcpBytesToHost = 0, g_tcpBytesToGuest = 0;
 long g_tcpLogged = 0, g_tcpSegLogged = 0;
 long g_tcpDupSegments = 0, g_tcpOutOfOrder = 0, g_tcpReclaimed = 0, g_tcpAged = 0;
+long g_tcpClosedUnacked = 0; INT32 g_tcpWorstUnacked = 0;
+// Flow control, host->guest. windowStalled = polls where the guest's window was
+// entirely full so we sent nothing; windowClamped = sends cut short to fit it.
+// Both were previously invisible because both were previously not happening --
+// we just overran the window and lost the excess.
+long g_tcpWindowStalled = 0, g_tcpWindowClamped = 0;
+// Flow control, guest->host. shortSend = send() took only part of the buffer;
+// sendBlocked = it took none (WSAEWOULDBLOCK). Both used to be counted as fully
+// delivered and acknowledged to the guest.
+long g_tcpShortSend = 0, g_tcpSendBlocked = 0;
 
 // Closes the real socket and frees the session slot. Does not notify the
 // guest -- callers that need the guest informed (RST/FIN) send that
@@ -5476,6 +5551,18 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
         s->sock = sock;
         s->guestSeq = seq + 1; // SYN consumes one sequence number
         s->hostSeq = 1000;     // arbitrary ISN
+        // Acknowledgements from the guest are counted from OUR ISN, so seed
+        // guestAcked with it rather than leaving it at the 0 the memset above
+        // wrote. Otherwise inFlight (hostSeq - guestAcked) reads 1001 rather
+        // than 1 for the whole window between our SYN-ACK and the guest's first
+        // ACK -- a phantom kilobyte of in-flight data. It is normally just
+        // conservative, but a guest opening with a window of <= 1001 has that
+        // window computed as CLOSED and the drain loop stalls the connection
+        // before one byte of payload has moved.
+        s->guestAcked = s->hostSeq;
+        // The window the guest opens with. Unscaled by definition in a SYN, and
+        // unscaled thereafter too, since we never negotiate scaling back.
+        s->guestWindow = netRd16(tcp + 14);
 
         // Read the guest's MSS out of the SYN options (kind 2, length 4). Options
         // live between the fixed 20-byte header and hdrLen.
@@ -5498,6 +5585,17 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
 
     if (!s) { g_tcpUnknown++; return; } // packet for a connection we don't know about
     QueryPerformanceCounter(&s->lastActive);
+
+    // Track how much of our stream the guest has acknowledged.
+    if (flags & NET_TCP_ACK) {
+        UINT32 gack = netRd32(tcp + 8);
+        if ((INT32)(gack - s->guestAcked) > 0) s->guestAcked = gack;
+    }
+    // ...and how much more it is willing to take. Updated from EVERY segment the
+    // guest sends, deliberately not just ACK-bearing ones: a bare window update is
+    // how a guest reopens a window it had closed, and missing one would leave the
+    // session stalled for good.
+    s->guestWindow = netRd16(tcp + 14);
 
     // The peer is gone but the guest may still be talking. Acknowledge whatever
     // it sends so it closes cleanly rather than retransmitting into a void, and
@@ -5539,9 +5637,29 @@ void netHandleTcpGuestPacket(WHV_PARTITION_HANDLE partition, UINT32 dstIp, const
             UINT32 alreadyHave = (UINT32)(-delta);
             if (alreadyHave < payloadLen) {
                 UINT32 newLen = payloadLen - alreadyHave;
-                g_tcpBytesToHost += newLen;
-                send(s->sock, (const char *)payload + alreadyHave, (int)newLen, 0);
-                s->guestSeq += newLen;
+                // HONOUR WHAT send() ACTUALLY TOOK. This socket is non-blocking
+                // (netCreateNonBlockingSocket), so send() may accept only part of
+                // the buffer, or none of it at all with WSAEWOULDBLOCK once the
+                // host send buffer fills. The return value was discarded and
+                // guestSeq advanced by the whole newLen regardless -- and the ACK
+                // built at the end of this function carries guestSeq, so we then
+                // told the guest we had every byte. Those bytes were therefore
+                // acknowledged AND thrown away, and an acknowledged byte is one
+                // nothing will ever retransmit: unrecoverable, in the same way
+                // and for the same reason as every other silent discard here.
+                //
+                // Advance only by what was accepted. The trailing ACK then carries
+                // the shorter guestSeq and the guest retransmits the remainder on
+                // its own, which is precisely what TCP is for.
+                int sent = send(s->sock, (const char *)payload + alreadyHave, (int)newLen, 0);
+                if (sent > 0) {
+                    g_tcpBytesToHost += (long)sent;
+                    s->guestSeq += (UINT32)sent;
+                    if ((UINT32)sent < newLen) g_tcpShortSend++;
+                } else {
+                    // Nothing taken. Ack nothing new, and the guest resends.
+                    g_tcpSendBlocked++;
+                }
             } else {
                 g_tcpDupSegments++;   // entirely a retransmission of what we have
             }
@@ -5654,14 +5772,40 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
             for (;;) {
                 unsigned char buf[1400];
                 UINT32 chunk = (s->guestMss && s->guestMss < sizeof(buf)) ? s->guestMss : (UINT32)sizeof(buf);
+                // FLOW CONTROL -- the check that was missing entirely. Never put
+                // more unacknowledged data in flight than the guest has said it can
+                // hold. This is the counterpart to the ring backpressure just below
+                // and the two are NOT interchangeable: ring space is what the
+                // DRIVER can take right now, the window is what the guest's TCP
+                // stack can take, and only the second decides whether the bytes
+                // survive. The driver drains the ring into its own buffers at its
+                // own rate, so a ring with room tells us nothing about a window
+                // that has closed. Overrun it and Windows discards the excess
+                // without a word -- and nothing here retransmits, so that stream is
+                // finished. It fits the symptom the way nothing else has: it needs
+                // VOLUME to trigger, which is why control frames and short replies
+                // always looked fine while real page loads died partway in.
+                {
+                    UINT32 inFlight = s->hostSeq - s->guestAcked;
+                    UINT32 windowLeft = (s->guestWindow > inFlight) ? s->guestWindow - inFlight : 0;
+                    // Window full. Leave the bytes in the host socket, exactly as
+                    // the backpressure path does, so the real peer's own TCP sees
+                    // the backlog and slows down. The guest reopens the window with
+                    // an ACK or a bare window update -- both of which now refresh
+                    // guestWindow -- and the next poll carries on from there.
+                    if (windowLeft == 0) { g_tcpWindowStalled++; break; }
+                    if (chunk > windowLeft) { chunk = windowLeft; g_tcpWindowClamped++; }
+                }
                 // BACKPRESSURE. Do not pull data out of the host socket unless the
                 // guest's ring can actually hold it. Draining regardless meant we
                 // overwrote frames the driver had not read yet, and with no
                 // retransmission a single clobbered segment breaks the stream for
                 // good. Leaving the bytes in the host socket buffer instead lets
                 // the real peer's own TCP flow control slow the sender down --
-                // which is what a real NIC's finite FIFO does.
-                if (rtl8139RxRingFree() < chunk + 64) { g_tcpRingBackpressure++; break; }
+                // which is what a real NIC's finite FIFO does. The device-side
+                // queue would absorb a burst, but absorbing it there only hides
+                // the backlog from the sender's own flow control.
+                if (!rtl8139RxCanAccept(chunk + 64)) { g_tcpRingBackpressure++; break; }
                 int n = recv(s->sock, (char *)buf, (int)chunk, 0);
                 if (n > 0) {
                     g_tcpBytesToGuest += n;
@@ -5673,6 +5817,23 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
                 }
                 if (n == 0) {
                     g_tcpClosed++;
+                    // Did the guest actually RECEIVE everything we sent? An unacked
+                    // tail is a hole in the host->guest stream, which this model
+                    // cannot repair (no retransmission) and which stalls the guest
+                    // permanently -- the shape we keep seeing, where it takes in a
+                    // whole server flight and then says nothing.
+                    {
+                        UINT32 unacked = s->hostSeq - s->guestAcked;
+                        if ((INT32)unacked > 0) {
+                            g_tcpClosedUnacked++;
+                            if ((INT32)unacked > g_tcpWorstUnacked) g_tcpWorstUnacked = (INT32)unacked;
+                        }
+                        if (g_tcpLogged < 24) {
+                            printf("[net-tcp]   at close: hostSeq=%u guestAcked=%u -> %d UNACKED%s\n",
+                                   s->hostSeq, s->guestAcked, (int)(INT32)unacked,
+                                   ((INT32)unacked > 0) ? "  *** guest never got the tail ***" : "");
+                        }
+                    }
                 if (g_tcpLogged < 24) {
                     g_tcpLogged++;
                     printf("[net-tcp] PEER CLOSED guest:%u -> %d.%d.%d.%d:%u after %ld bytes in\n",
@@ -5839,16 +6000,36 @@ void rtl8139TransmitFrame(WHV_PARTITION_HANDLE partition, const unsigned char *f
 // what the guest actually allocated; this is a simplification of the exact
 // hardware wraparound corner case (undocumented without a spec on hand)
 // made in favor of never writing outside guest memory.
-void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
-    // Counted per REASON, not once at entry. Counting attempts here (as this
-    // first did) makes "we delivered 52 frames" indistinguishable from "we were
-    // asked to deliver 52 and dropped them all", which is exactly the ambiguity
-    // that matters when the guest keeps re-ARPing: it looks like we are answering.
-    g_netRxOffered++;
+// How far past the end of the ring the chip may write when RCR's WRAP bit is
+// set. The driver allocates this pad for exactly that purpose (the Linux
+// 8139too driver calls it RX_BUF_WRAP_PAD and sizes it 2048).
+#define RTL8139_RX_WRAP_PAD 2048
+
+// Copies a packet into the ring at `pos`, honouring the chosen wrap behaviour.
+// `linear` = write straight past the end of the ring into the wrap pad;
+// otherwise the packet is split and its tail continues at offset 0. Either way
+// the CALLER advances the write pointer by (pos + alignedLen) % ringSize --
+// which is what the driver independently computes, and the reason neither mode
+// is visible to it.
+void rtl8139RingPut(unsigned char *ring, UINT32 ringSize, UINT32 pos,
+                    const unsigned char *src, UINT32 n, int linear) {
+    UINT32 first;
+    if (linear || pos + n <= ringSize) { memcpy(ring + pos, src, n); return; }
+    first = ringSize - pos;
+    memcpy(ring + pos, src, first);
+    memcpy(ring, src + first, n - first);
+}
+
+// Attempts to put one frame in the RX ring right now.
+// Returns  1 = delivered, 0 = not possible YET (caller should queue/retry),
+//         -1 = undeliverable, drop it.
+int rtl8139DeliverFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
     unsigned char cr = rtl8139Regs[0x37];
-    if (!(cr & 0x08)) { g_netRxDropNoRe++; return; }   // RE (receiver enable) not set
+    if (!(cr & 0x08)) { g_netRxDeferNoRe++; return 0; }   // RE (receiver enable) not set
     UINT32 rxBase = *(UINT32 *)&rtl8139Regs[0x30];
-    if (rxBase == 0 || !guestMemory) { g_netRxDropNoBuf++; return; }
+    if (!guestMemory) return -1;                          // nothing to write into, ever
+    if (rxBase == 0) { g_netRxDeferNoBuf++; return 0; }   // RBSTART not programmed yet
+    if (len > RTL8139_RX_QUEUE_FRAME) { g_netRxDropSize++; return -1; }
 
     // Pad runts to the 60-byte Ethernet minimum. A real NIC pads short frames
     // before they ever go on the wire, so a receiver never sees one shorter than
@@ -5862,7 +6043,7 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     // of times. Frame size, not the ring pointers, was the actual defect.
     unsigned char padded[64];
     if (len < 60) {
-        if (len > sizeof(padded)) { g_netRxDropSize++; return; }
+        if (len > sizeof(padded)) { g_netRxDropSize++; return -1; }
         memset(padded, 0, sizeof(padded));
         memcpy(padded, frame, len);
         frame = padded;
@@ -5871,7 +6052,6 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     }
 
     UINT32 ringSize = rtl8139RxRingSize();
-    UINT32 avail = ringSize + 16;
     // Header + frame + the 4-byte FCS. The FCS is NOT optional bookkeeping: we
     // report it in the length field below (rxLen = len + 4, which is what real
     // hardware does), and the driver derives the NEXT packet's offset from that
@@ -5883,23 +6063,43 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     // could not arrive. The guest wedged outright.
     UINT32 totalLen = 4 + len + 4;
     UINT32 alignedLen = (totalLen + 3) & ~3u; // next packet is 4-byte aligned
-    if (totalLen > avail || rxBase + avail > guestMemSize) { g_netRxDropSize++; return; }
+    if (totalLen > ringSize || totalLen > RTL8139_RX_WRAP_PAD ||
+        (UINT64)rxBase + ringSize > guestMemSize) { g_netRxDropSize++; return -1; }
 
-    // NEVER overwrite what the guest has not read. The wrap below used to reset to
-    // offset 0 unconditionally, clobbering unread frames -- and with no
-    // retransmission anywhere, a single lost segment stalls a TCP stream forever.
-    // Real hardware drops the frame and flags an overflow instead; do that.
+    // NEVER overwrite what the guest has not read. With no retransmission
+    // anywhere, a single clobbered segment stalls a TCP stream forever. Real
+    // hardware would drop the frame and flag RXOVW here, but a drop is exactly
+    // what we cannot afford: defer instead and let the caller queue it, and only
+    // report a real overflow once that queue is genuinely full.
     if (rtl8139RxRingUsed() + totalLen + 64 >= ringSize) {
-        g_netRxDropRingFull++;
-        *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0010; // ISR: RXOVW
-        rtl8139MaybeInjectIrq(partition);
-        return;
+        g_netRxDeferRingFull++;
+        return 0;
     }
 
-    g_netRxFrames++;   // past every guard: this frame really does go into the ring
-
     UINT32 pos = rtl8139RxWritePos % ringSize;
-    if (pos + totalLen > avail) pos = 0; // wouldn't fit before the pad ends -- wrap to start
+
+    // THIS IS THE BUG behind "the guest accepts payload-free SYN-ACKs and ignores
+    // every payload-bearing segment". Real silicon never skips to offset 0
+    // because a frame did not fit: the driver derives the next packet's offset
+    // as (pos + alignedLen) % ringSize and has NO WAY to learn about such a jump,
+    // so from the first wrap onwards it read every subsequent packet out of the
+    // wrong place -- garbage headers, garbage lengths, and eventually a software
+    // reset. It is size-dependent for the obvious reason: 1400-byte data segments
+    // reach the ring boundary far sooner than 60-byte control frames do, which is
+    // precisely the asymmetry the U104 size ramp measured.
+    //
+    // Two behaviours are legal, selected by RCR's WRAP bit (bit 7):
+    //   WRAP=1, ring < 64K: write the frame CONTIGUOUSLY past the end of the
+    //     ring into the pad the driver allocated for it.
+    //   WRAP=0, or a 64K ring (no room for a pad in a 16-bit offset): SPLIT the
+    //     frame -- its tail continues at offset 0.
+    // In both cases the write pointer advances by alignedLen modulo ringSize,
+    // which is what the driver expects either way.
+    UINT32 rcr = *(UINT32 *)&rtl8139Regs[0x44];
+    int linearPad = ((rcr & 0x80) != 0) && ringSize < 65536 &&
+                    (UINT64)rxBase + ringSize + RTL8139_RX_WRAP_PAD <= guestMemSize;
+
+    g_netRxFrames++;   // past every guard: this frame really does go into the ring
 
     unsigned char *ring = (unsigned char *)guestMemory + rxBase;
     // RX status. ROK alone is NOT what real hardware reports: the upper bits say
@@ -5921,15 +6121,38 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
         else if (memcmp(frame, rtl8139Regs + 0x00, 6) == 0) rxStatus |= 0x4000; // PAM
     }
     UINT16 rxLen = (UINT16)(len + 4); // real hardware includes the 4-byte CRC
-    ring[pos + 0] = (unsigned char)(rxStatus & 0xFF);
-    ring[pos + 1] = (unsigned char)(rxStatus >> 8);
-    ring[pos + 2] = (unsigned char)(rxLen & 0xFF);
-    ring[pos + 3] = (unsigned char)(rxLen >> 8);
-    memcpy(ring + pos + 4, frame, len);
+    // Assembled contiguously first, then handed to the ring writer -- the header
+    // itself can straddle the ring boundary in split mode, so it cannot be poked
+    // in directly.
+    unsigned char pkt[8 + RTL8139_RX_QUEUE_FRAME];
+    pkt[0] = (unsigned char)(rxStatus & 0xFF);
+    pkt[1] = (unsigned char)(rxStatus >> 8);
+    pkt[2] = (unsigned char)(rxLen & 0xFF);
+    pkt[3] = (unsigned char)(rxLen >> 8);
+    memcpy(pkt + 4, frame, len);
     // Occupy the 4 FCS bytes we just claimed in rxLen. Zeros: the driver has ROK
     // and does not re-check the checksum, but the SPACE has to be reserved or the
     // next packet lands where the driver expects the CRC to be.
-    memset(ring + pos + 4 + len, 0, 4);
+    memset(pkt + 4 + len, 0, 4);
+    // PUBLISH THE BODY BEFORE THE HEADER. The 4-byte header carries ROK and the
+    // length -- it is the marker that says "a packet is here" -- so writing it
+    // first advertises a frame whose bytes have not landed yet. The guest vCPU
+    // runs on ANOTHER THREAD, concurrently: if the driver reads the ring inside
+    // that window it takes a header claiming 1458 bytes and copies whatever stale
+    // ring content is still underneath, then discards the result at the IP/TCP
+    // checksum with no dup-ACK to tell us. Real silicon DMAs the payload and
+    // commits the status word last, which is why this ordering matters.
+    //
+    // It fits every measurement: the tear window is the length of the memcpy, so
+    // a 1400-byte segment loses the race almost always while a 60-byte SYN-ACK
+    // almost always wins it -- and capping segments at 300 bytes made guestAcked
+    // advance for the first time without ever making it reliable. One 1440-byte
+    // segment did get ACKed (ack=2441), which a hard size limit cannot explain
+    // but a race can.
+    UINT32 bodyPos = linearPad ? (pos + 4) : ((pos + 4) % ringSize);
+    rtl8139RingPut(ring, ringSize, bodyPos, pkt + 4, totalLen - 4, linearPad);
+    MemoryBarrier(); // body must be visible to the vCPU before the marker is
+    rtl8139RingPut(ring, ringSize, pos, pkt, 4, linearPad);
 
     rtl8139RxWritePos = (pos + alignedLen) % ringSize;
     *(UINT16 *)&rtl8139Regs[0x3A] = (UINT16)rtl8139RxWritePos; // CBR
@@ -5938,8 +6161,62 @@ void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fr
     *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0001; // ISR: ROK
     rtl8139MaybeInjectIrq(partition);
 
-    printf("[rtl8139] RX %u bytes at ring offset 0x%X\n", len, pos);
-    fflush(stdout);
+
+    // Per-frame logging is bounded: this path now runs at real throughput
+    // (thousands of frames per transfer), and an fflush'd printf per frame was
+    // itself enough to pace the receive path.
+    if (g_netRxFrames <= 32) {
+        printf("[rtl8139] RX %u bytes at ring offset 0x%X%s\n", len, pos,
+               (pos + totalLen > ringSize) ? (linearPad ? " (into wrap pad)" : " (split at ring end)") : "");
+        fflush(stdout);
+    }
+    return 1;
+}
+
+// Delivers as much of the pending queue as the device will currently take,
+// oldest first. Order matters: a TCP stream reordered here looks to the guest
+// exactly like the loss we are trying to avoid.
+void rtl8139FlushRxQueue(WHV_PARTITION_HANDLE partition) {
+    while (rtl8139RxQueueCount) {
+        Rtl8139RxQueued *q = &rtl8139RxQueue[rtl8139RxQueueHead];
+        if (rtl8139DeliverFrame(partition, q->data, q->len) == 0) break; // still not ready
+        rtl8139RxQueueHead = (rtl8139RxQueueHead + 1) % RTL8139_RX_QUEUE_DEPTH;
+        rtl8139RxQueueCount--;
+    }
+}
+
+// Backend -> device. Delivers immediately when the device is ready, and queues
+// rather than drops when it is not (see the queue's comment for why a drop here
+// is unrecoverable).
+void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    // Counted per REASON, not once at entry. Counting attempts here (as this
+    // first did) makes "we delivered 52 frames" indistinguishable from "we were
+    // asked to deliver 52 and dropped them all", which is exactly the ambiguity
+    // that matters when the guest keeps re-ARPing: it looks like we are answering.
+    g_netRxOffered++;
+
+    // Drain what is already waiting first, or this frame would overtake it.
+    rtl8139FlushRxQueue(partition);
+    if (rtl8139RxQueueCount == 0 && rtl8139DeliverFrame(partition, frame, len) != 0) {
+        return;  // delivered, or rejected for a reason retrying cannot fix
+    }
+    if (len > RTL8139_RX_QUEUE_FRAME) { g_netRxDropSize++; return; }
+    if (rtl8139RxQueueCount >= RTL8139_RX_QUEUE_DEPTH) {
+        // A real overflow at last: the driver has not drained for long enough to
+        // fill the whole queue. THIS is what RXOVW is for -- report it the way
+        // hardware would, and let the driver recover.
+        g_netRxQueueOverflow++;
+        *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0010; // ISR: RXOVW
+        rtl8139MaybeInjectIrq(partition);
+        return;
+    }
+    {
+        UINT32 slot = (rtl8139RxQueueHead + rtl8139RxQueueCount) % RTL8139_RX_QUEUE_DEPTH;
+        rtl8139RxQueue[slot].len = len;
+        memcpy(rtl8139RxQueue[slot].data, frame, len);
+        rtl8139RxQueueCount++;
+        if ((long)rtl8139RxQueueCount > g_netRxQueuePeak) g_netRxQueuePeak = (long)rtl8139RxQueueCount;
+    }
 }
 // PxIS is architecturally RWC (spec 3.3.16) -- clearable by the guest
 // writing 1 to a set bit. Our ABAR is plain, untrapped guest RAM (no MMIO
@@ -7714,7 +7991,21 @@ void rtl8139InitRegs(void) {
     // readPos = 16 while writePos = 0 -- and the unsigned difference then wraps to
     // nearly a whole ring, making an empty ring look completely full. That made
     // the new overflow check drop every single received frame.
-    *(UINT16 *)&rtl8139Regs[0x38] = (UINT16)(rtl8139RxRingSize() - 16);
+    //
+    // U103: but ringSize-16 only satisfies readPos==0 for the ring size in effect
+    // AT THIS INSTANT -- and at this instant RCR still holds the 8K default set
+    // two lines above, giving CAPR=0x1FF0. The driver's very next move is to
+    // program RBLEN for 64K (W44=5E0E) WITHOUT rewriting CAPR, so readPos becomes
+    // (0x1FF0+16) % 65536 = 8192 while writePos is 0: an empty ring reporting
+    // 57344 bytes used, with every frame we wrote landing at 0 while the driver
+    // looked for it at 8192. It read garbage, wedged, and issued a software reset.
+    // Measured over one boot: CAPR=0x1FF0 was the single most common sampled value
+    // (339 hits, >2x any other) alongside 14 driver-issued resets, TCP data frames
+    // sitting unread with CAPR frozen, and checksums verifying OK the whole time.
+    //
+    // -16 as a 16-bit value is what real hardware leaves here, and it is correct
+    // for EVERY ring size: (0xFFF0 + 16) mod any power-of-two ringSize == 0.
+    *(UINT16 *)&rtl8139Regs[0x38] = (UINT16)-16;
     rtl8139Regs[0x50] = 0x00;   // CR9346: config registers locked (normal state)
     rtl8139Regs[0x51] = 0x00;   // CONFIG0
     rtl8139Regs[0x52] = 0x10;   // CONFIG1: driver-loaded bit, not sleeping
@@ -7925,9 +8216,14 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
                     // transition either; only a software RESET does that.
                     g_netRingReEnables++;
                     if (rtl8139RxWritePos != 0) g_netRingResetSkipped++;
-                    printf("[rtl8139] receiver enabled (ring kept: writePos=0x%X)\n",
-                           rtl8139RxWritePos);
+                    printf("[rtl8139] receiver enabled (ring kept: writePos=0x%X,"
+                           " %u frames queued)\n",
+                           rtl8139RxWritePos, rtl8139RxQueueCount);
                     fflush(stdout);
+                    // Anything that arrived while RE was off is waiting, not lost.
+                    // Hand it over now -- the driver toggles RE constantly, and
+                    // every one of those windows used to destroy frames.
+                    rtl8139FlushRxQueue(partition);
                 }
             }
         } else if (offset == 0x50) {
@@ -8017,6 +8313,11 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             if (consumedPos == writePos || ahead <= 8) {
                 rtl8139Regs[0x37] |= 0x01; // BUFE set -- caught up
             }
+            // The driver just freed ring space. If frames were deferred for want
+            // of it, this is the moment they fit -- and delivering here rather
+            // than waiting for the next poll keeps the ROK interrupt coming while
+            // the driver is still in its receive path.
+            rtl8139FlushRxQueue(partition);
         } else {
             UINT32 i;
             for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
@@ -12722,18 +13023,35 @@ int main(int argc, char *argv[]) {
                        g_netUdpReclaimed, g_netUdpWorstMs, g_netUdpOver2s);
                 printf("[heartbeat]   net TCP: syn=%ld connected=%ld refused=%ld tableFull=%ld"
                        " sockFail=%ld closed=%ld unknown=%ld | bytes out=%ld in=%ld"
-                       " dup=%ld ooo=%ld reclaimed=%ld aged=%ld\n",
+                       " dup=%ld ooo=%ld reclaimed=%ld aged=%ld closedUnacked=%ld worstUnacked=%d\n",
                        g_tcpSyn, g_tcpEstablished, g_tcpRefused, g_tcpTableFull,
                        g_tcpSockFail, g_tcpClosed, g_tcpUnknown,
                        g_tcpBytesToHost, g_tcpBytesToGuest,
-                       g_tcpDupSegments, g_tcpOutOfOrder, g_tcpReclaimed, g_tcpAged);
+                       g_tcpDupSegments, g_tcpOutOfOrder, g_tcpReclaimed, g_tcpAged,
+                       g_tcpClosedUnacked, g_tcpWorstUnacked);
+                // TCP flow control, both directions. Before these limits were
+                // enforced at all we simply overran them and lost the excess in
+                // silence, so every one of these counters reading 0 previously
+                // meant nothing whatsoever. A non-zero windowStalled or
+                // windowClamped is the proof that the guest's receive window, and
+                // not the RX ring, was the binding constraint all along.
+                printf("[heartbeat]   net TCP flow: windowStalled=%ld windowClamped=%ld"
+                       " | to host: shortSend=%ld sendBlocked=%ld\n",
+                       g_tcpWindowStalled, g_tcpWindowClamped,
+                       g_tcpShortSend, g_tcpSendBlocked);
+                // Deferrals and drops are reported separately on purpose: a
+                // deferred frame is still on its way, a dropped one is gone for
+                // good and (with no retransmission) has broken a stream.
                 printf("[heartbeat]   net TX: total=%ld arp=%ld ipv4=%ld ipv6=%ld other=%ld"
-                       " | RX offered=%ld delivered=%ld dropped(noRE=%ld noBuf=%ld size=%ld)"
-                       " arpReplies=%ld padded=%ld ringFull=%ld backpressure=%ld\n",
+                       " | RX offered=%ld delivered=%ld deferred(noRE=%ld noBuf=%ld ringFull=%ld)"
+                       " queued=%u peak=%ld DROPPED(size=%ld overflow=%ld)"
+                       " arpReplies=%ld padded=%ld backpressure=%ld\n",
                        g_netTxFrames, g_netTxArp, g_netTxIpv4, g_netTxIpv6, g_netTxOther,
                        g_netRxOffered, g_netRxFrames,
-                       g_netRxDropNoRe, g_netRxDropNoBuf, g_netRxDropSize, g_netArpReplies,
-                       g_netRxPadded, g_netRxDropRingFull, g_tcpRingBackpressure);
+                       g_netRxDeferNoRe, g_netRxDeferNoBuf, g_netRxDeferRingFull,
+                       rtl8139RxQueueCount, g_netRxQueuePeak,
+                       g_netRxDropSize, g_netRxQueueOverflow,
+                       g_netArpReplies, g_netRxPadded, g_tcpRingBackpressure);
                 // Written-into-the-ring is NOT the same as consumed-by-the-guest.
                 // CAPR is the driver's read pointer; if it stops advancing while our
                 // write pointer moves, the guest has stopped draining the ring and
@@ -12891,6 +13209,10 @@ int main(int argc, char *argv[]) {
         // was already tried once for a different stall and made things
         // worse (see the "2026-07-17 update" section of that doc).
         ahciProcessPendingCommands(partition);
+        // Backstop for the two event-driven flush points (RE enable, CAPR write):
+        // if the driver freed space without touching either, deferred frames
+        // still go out on the next iteration rather than sitting indefinitely.
+        rtl8139FlushRxQueue(partition);
         netPollUdpSessions(partition);
         netPollTcpSessions(partition);
 
