@@ -27,3 +27,8 @@ Desktop.ini
 
 # Intermediate AML from iasl; dsdt_aml.h is the committed generated artifact
 acpi/*.aml
+
+# Visual Studio private per-user state: solution DBs, Copilot indices,
+# IntelliSense caches. Tracked by accident; Browse.VC.db alone churns tens of
+# megabytes per build and git history never forgets a blob.
+.vs/
