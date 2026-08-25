@@ -1912,6 +1912,7 @@ class LocalHostWindow(QMainWindow):
         self._loading = False  # guard so load_library() doesn't trigger saves
         self.processes = {}  # vm name -> running Hypervisor.exe PID (detached, not QProcess-owned)
         self.embedded_hwnds = {}  # vm name -> hypervisor window HWND, reparented into preview_frame
+        self.detached_hwnds = {}  # vm name -> HWND deliberately popped out to its own desktop window
         self.fullscreen_vm = None  # vm name currently popped out to a fullscreen window, if any
         self._f11_down = False  # debounces key-repeat in the keyboard hook (see below)
         self.suspended_vms = set()  # vm names currently thread-frozen (best-effort suspend)
@@ -2000,6 +2001,15 @@ class LocalHostWindow(QMainWindow):
         self.restart_toolbar_action = QAction("Restart", self)
         self.restart_toolbar_action.triggered.connect(self.on_restart_vm)
         toolbar.addAction(self.restart_toolbar_action)
+        toolbar.addSeparator()
+
+        self.detach_toolbar_action = QAction("Detach", self)
+        self.detach_toolbar_action.setToolTip(
+            "Pop this VM's console out of the preview pane into its own "
+            "window (and back again)."
+        )
+        self.detach_toolbar_action.triggered.connect(self.on_toggle_detach)
+        toolbar.addAction(self.detach_toolbar_action)
         toolbar.addSeparator()
 
         self.snapshot_toolbar_action = QAction("Snapshot", self)
@@ -2447,6 +2457,7 @@ class LocalHostWindow(QMainWindow):
         if pid is not None:
             _terminate_process(pid)
         self.embedded_hwnds.pop(vm_name, None)
+        self.detached_hwnds.pop(vm_name, None)
         self.suspended_vms.discard(vm_name)
         self._pending_restart.discard(vm_name)
         if self.fullscreen_vm == vm_name:
@@ -2595,12 +2606,15 @@ class LocalHostWindow(QMainWindow):
                         # reasoning as _detach_from_preview: if this VM is
                         # about to be suspended too, the hide has to land
                         # before its owning thread is frozen.
-                        hwnd = self.embedded_hwnds.get(vm_name)
-                        if hwnd:
-                            t = threading.Thread(target=_user32.ShowWindow, args=(hwnd, SW_HIDE), daemon=True)
-                            t.start()
-                            t.join(timeout=2.0)
+                        self._hide_window_blocking(self.embedded_hwnds.get(vm_name))
                         self.fullscreen_vm = None
+                    elif vm_name in self.detached_hwnds:
+                        # Deliberately detached (see on_toggle_detach), so
+                        # it's already a top-level window that survives this
+                        # one closing -- but it still has to be hidden, same
+                        # as the fullscreen case, or it's left floating on
+                        # the desktop with no manager left to control it.
+                        self._hide_window_blocking(self.detached_hwnds.pop(vm_name))
                     elif vm_name in self.embedded_hwnds:
                         self._detach_from_preview(vm_name, blocking=True, show=False)
                 if choice == "suspend":
@@ -2627,6 +2641,18 @@ class LocalHostWindow(QMainWindow):
             _user32.UnhookWindowsHookEx(self._keyboard_hook)
             self._keyboard_hook = None
         super().closeEvent(event)
+
+    @staticmethod
+    def _hide_window_blocking(hwnd):
+        """Hide a VM window and wait for it to actually happen (up to 2s).
+        Off-thread for the usual reason (see _win32_async), blocking
+        because callers on the close path need it done before the window
+        underneath is torn down or the guest's threads are frozen."""
+        if not hwnd:
+            return
+        t = threading.Thread(target=_user32.ShowWindow, args=(hwnd, SW_HIDE), daemon=True)
+        t.start()
+        t.join(timeout=2.0)
 
     def _prompt_running_vms_on_close(self, running_vms):
         box = QMessageBox(self)
@@ -3251,6 +3277,7 @@ class LocalHostWindow(QMainWindow):
     def on_vm_process_finished(self, vm_name):
         self.processes.pop(vm_name, None)
         self.embedded_hwnds.pop(vm_name, None)  # the window died with the process
+        self.detached_hwnds.pop(vm_name, None)  # ...detached or not
         self.suspended_vms.discard(vm_name)
         if self.fullscreen_vm == vm_name:
             self.fullscreen_vm = None
@@ -3318,6 +3345,11 @@ class LocalHostWindow(QMainWindow):
         self.suspend_toolbar_action.setText("Resume" if suspended else "Suspend")
         self.suspend_toolbar_action.setEnabled(running)
         self.restart_toolbar_action.setEnabled(True)
+        detached = self.current_vm.name in self.detached_hwnds
+        self.detach_toolbar_action.setText("Reattach" if detached else "Detach")
+        # Reattach stays available for a VM whose process died while
+        # detached only in theory -- on_vm_process_finished clears both.
+        self.detach_toolbar_action.setEnabled(running)
         self.edit_settings_link.setEnabled(not running)
         self.edit_settings_link.setCursor(
             Qt.ArrowCursor if running else Qt.PointingHandCursor
@@ -3336,6 +3368,12 @@ class LocalHostWindow(QMainWindow):
         leaving it as a floating window."""
         if vm_name not in self.processes:
             return  # powered off again before its window ever showed up
+        if vm_name in self.detached_hwnds:
+            # The user deliberately popped this one out (see
+            # on_toggle_detach) -- every automatic embed path funnels
+            # through here, so one check keeps that choice from being
+            # undone by a VM selection change, a resume, or a retry.
+            return
 
         hwnd = _user32.FindWindowW(None, f"LocalHost Hypervisor -- {vm_name}")
         if not hwnd:
@@ -3358,6 +3396,8 @@ class LocalHostWindow(QMainWindow):
         # Back on the Qt thread: safe to touch our own state and QWidgets.
         if vm_name not in self.processes:
             return  # powered off again while the reparent was in flight
+        if vm_name in self.detached_hwnds:
+            return  # detached again while the reparent was in flight
         self.embedded_hwnds[vm_name] = hwnd
         if self.current_vm and self.current_vm.name == vm_name:
             self._resize_embedded_window(vm_name)
@@ -3406,6 +3446,106 @@ class LocalHostWindow(QMainWindow):
             t.join(timeout=2.0)
         else:
             _win32_async(do_detach)
+
+    # ------------------------------------------------------------------
+    # Detach / reattach (toolbar button) -- run a VM's console as its own
+    # ordinary desktop window instead of inside the preview pane. Unlike
+    # the internal _detach_from_preview calls (suspend, close), this one is
+    # a state the user chose and it has to *stick*: every automatic
+    # embedding path checks detached_hwnds before pulling a window back in.
+    # ------------------------------------------------------------------
+    def on_toggle_detach(self):
+        if not self.current_vm:
+            self.statusBar().showMessage("Select a VM first.", 3000)
+            return
+        vm_name = self.current_vm.name
+
+        if vm_name in self.detached_hwnds:
+            self._reattach_to_preview(vm_name)
+            self.statusBar().showMessage(f"Reattached {vm_name} to the preview pane.", 3000)
+        else:
+            if vm_name not in self.processes:
+                self.statusBar().showMessage(f"'{vm_name}' isn't running.", 3000)
+                return
+            if vm_name in self.suspended_vms:
+                # A suspended guest can't answer the window messages a
+                # reparent involves (see on_suspend_vm) -- its window is
+                # already outside the pane anyway.
+                self.statusBar().showMessage(f"Resume '{vm_name}' before detaching its window.", 4000)
+                return
+            if not self._pop_out_hypervisor_window(vm_name):
+                self.statusBar().showMessage(f"No console window found for '{vm_name}'.", 4000)
+                return
+            self.statusBar().showMessage(f"Detached {vm_name} into its own window.", 3000)
+
+        self._update_power_ui()
+
+    def _pop_out_hypervisor_window(self, vm_name):
+        """Pop a VM's console out to a normal decorated top-level window,
+        centred on this screen, and remember it as detached so nothing
+        drags it back into the preview pane behind the user's back.
+        Returns False if there's no window to pop out."""
+        hwnd = self.embedded_hwnds.pop(vm_name, None)
+        if not hwnd:
+            # Not currently in the pane: it may be fullscreened (still
+            # tracked) or hidden after a background/close cycle -- find it
+            # the same way the initial embed does.
+            hwnd = _user32.FindWindowW(None, f"LocalHost Hypervisor -- {vm_name}")
+        if not hwnd:
+            return False
+
+        if self.fullscreen_vm == vm_name:
+            # Already a borderless top-level window; the reparent below is
+            # a no-op for it, but the style/geometry reset still applies.
+            self.fullscreen_vm = None
+
+        # Size it like the preview pane it came out of. Qt reports logical
+        # pixels and raw Win32 wants physical ones -- same DPI conversion
+        # as toggle_vm_fullscreen.
+        screen = self.screen() or QApplication.primaryScreen()
+        geo = screen.geometry()
+        dpr = screen.devicePixelRatio()
+        rect = self.preview_frame.rect()
+        w = max(int(rect.width() * dpr), 640)
+        h = max(int(rect.height() * dpr), 480)
+        screen_w, screen_h = int(geo.width() * dpr), int(geo.height() * dpr)
+        x = int(geo.x() * dpr) + max((screen_w - w) // 2, 0)
+        y = int(geo.y() * dpr) + max((screen_h - h) // 2, 0)
+
+        def do_pop_out():
+            style = _user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+            style = (style & ~WS_CHILD) | WS_POPUP | WS_DECORATIONS
+            _user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            _user32.SetParent(hwnd, None)
+            _user32.SetWindowPos(hwnd, None, x, y, w, h, SWP_FRAMECHANGED)
+            _user32.ShowWindow(hwnd, SW_SHOW)
+
+        _win32_async(do_pop_out)
+        self.detached_hwnds[vm_name] = hwnd
+        return True
+
+    def _reattach_to_preview(self, vm_name):
+        """Inverse of _pop_out_hypervisor_window: pull a detached console
+        back in as a WS_CHILD of the preview pane. Reuses the HWND we kept
+        rather than looking it up again, so it also works for a guest too
+        busy to answer FindWindowW's cross-process title read."""
+        hwnd = self.detached_hwnds.pop(vm_name, None)
+        if not hwnd:
+            return False
+        preview_hwnd = int(self.preview_frame.winId())
+
+        def do_reattach():
+            style = _user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+            style = (style & ~(WS_POPUP | WS_DECORATIONS)) | WS_CHILD
+            _user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style)
+            _user32.SetParent(hwnd, preview_hwnd)
+            _user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED)
+            # Back to the Qt thread for the state update + show/resize,
+            # exactly as the initial embed does.
+            self._embed_ready.emit(vm_name, hwnd)
+
+        _win32_async(do_reattach)
+        return True
 
     def _show_embedded_window_for_current_vm(self):
         """Only one VM's console can occupy the shared preview pane at a
@@ -3459,6 +3599,16 @@ class LocalHostWindow(QMainWindow):
     def toggle_vm_fullscreen(self):
         if self.fullscreen_vm is not None:
             self._exit_vm_fullscreen()
+            return
+
+        if self.current_vm and self.current_vm.name in self.detached_hwnds:
+            # Fullscreen is defined as a round trip out of and back into the
+            # preview pane (see _exit_vm_fullscreen), so it has nothing to
+            # return a detached window to -- it's already its own window,
+            # and Windows' own maximise button covers this case.
+            self.statusBar().showMessage(
+                f"'{self.current_vm.name}' is detached -- reattach it first, "
+                "or maximise its own window.", 4000)
             return
 
         if not self.current_vm or self.current_vm.name not in self.embedded_hwnds:
