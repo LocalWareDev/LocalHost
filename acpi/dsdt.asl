@@ -179,6 +179,35 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "LCLHST", "LHVMDSDT", 0x00000001)
                         IRQNoFlags () { 3 }
                     })
                 }
+
+                /*
+                 * COM3 at 0x3E8, IRQ4 -- the LocalHost Guest Tools channel.
+                 *
+                 * This node is what makes the whole no-driver design work.
+                 * serial.sys binds to a port that ACPI/PnP enumerated; without
+                 * a PNP0501 device here Windows creates no COM port at all and
+                 * the guest agent's CreateFile("\\.\COM3") fails with
+                 * ERROR_FILE_NOT_FOUND. In UEFI mode there is no ISA PnP BIOS
+                 * to fall back on, so this namespace entry is the ONLY
+                 * enumeration path.
+                 *
+                 * IRQ4 is shared with COM1 by convention. That is harmless
+                 * here, but harmless by accident and worth stating: COM1 in
+                 * this hypervisor is output-only (its RBR returns 0x00
+                 * unconditionally, see uartHandleAccess), so it never raises a
+                 * receive interrupt and never contends for the line.
+                 */
+                Device (UAR3)
+                {
+                    Name (_HID, EisaId ("PNP0501"))
+                    Name (_UID, 0x03)
+                    Name (_STA, 0x0F)
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x03E8, 0x03E8, 0x01, 0x08)
+                        IRQNoFlags () { 4 }
+                    })
+                }
             }
         }
 

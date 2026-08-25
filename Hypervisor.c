@@ -2222,6 +2222,51 @@ unsigned char kdTxBuf[4096];
 volatile int kdTxHead = 0, kdTxTail = 0; // ring buffer: guest THR writes -> pipe writer thread
 volatile int kdClientConnected = 0; // set by the reader thread once WinDbg attaches
 
+// --- COM3 (0x3E8-0x3EF): the LocalHost Guest Tools channel -----------------
+// A third UART, bridged to the host named pipe \.\pipe\LocalHostGT, carrying
+// the Guest Tools protocol between the manager on the host and an agent
+// running inside the guest.
+//
+// WHY A UART, RATHER THAN A BACKDOOR PORT OR A SOCKET
+//   * A VMware-style magic I/O port has to be driven with IN/OUT, which on x64
+//     Windows means ring 0, which means a SIGNED kernel driver in the guest and
+//     a permanently test-signed install. A serial port is reachable from an
+//     ordinary usermode program via CreateFile("\\.\COM3") through Windows'
+//     in-box serial.sys, so the agent needs no driver at all.
+//   * It does not depend on the NIC, DHCP, or the NAT backend, so it works in
+//     early boot, during Setup, and while the network path is being changed
+//     underneath it -- and a Guest Tools bug can never masquerade as a
+//     networking one.
+//
+// HOW THIS DIFFERS FROM COM2, on which it is otherwise closely modelled:
+// COM2 is POLLED-ONLY. Its IIR reports "no interrupt pending" unconditionally,
+// which is harmless there because the kernel debugger drives the UART registers
+// itself and polls them. serial.sys does NOT poll -- it attaches an ISR and
+// waits on it. A COM3 that never asserted IRQ4 would enumerate correctly, open
+// correctly, and then hang forever on the agent's first ReadFile. So this one
+// implements real 16550 interrupt semantics; see uart3UpdateIrq.
+unsigned char uart3Ier = 0, uart3Lcr = 0, uart3Mcr = 0, uart3Scr = 0;
+unsigned char uart3FifoEnabled = 0;
+unsigned char uart3DivisorLow = 0, uart3DivisorHigh = 0;
+// THR-empty interrupt pending. Our transmit completes synchronously, so the
+// underlying condition is permanently true; a real 16550 reports it as an EDGE
+// and clears it when the CPU reads IIR or writes THR. Modelling it as a level
+// would leave IRQ4 asserted forever and livelock the guest's ISR.
+volatile int uart3ThreInt = 0;
+HANDLE gtPipe = INVALID_HANDLE_VALUE;
+CRITICAL_SECTION gtRxLock;
+unsigned char gtRxBuf[8192];
+volatile int gtRxHead = 0, gtRxTail = 0;  // pipe reader thread -> guest RBR reads
+CRITICAL_SECTION gtTxLock;
+HANDLE gtTxEvent = NULL;                  // wakes the writer thread to drain gtTxBuf
+unsigned char gtTxBuf[8192];
+volatile int gtTxHead = 0, gtTxTail = 0;  // guest THR writes -> pipe writer thread
+volatile int gtClientConnected = 0;       // a host-side tools client is attached
+long g_gtTxToPipe = 0, g_gtTxDropped = 0, g_gtTxWriteFail = 0;
+DWORD g_gtTxLastErr = 0;
+long g_gtRxFromPipe = 0, g_gtRxToGuest = 0, g_gtRxDropped = 0;
+long g_gtIrqRaised = 0;
+
 // --- EFI runtime instrumentation ---
 // Inline hooks on bootmgfw.efi's own EfiOpenProtocol/EfiLocateHandleBuffer
 // wrapper functions (RVAs found via real PDB symbols, see the scratchpad
@@ -9667,6 +9712,266 @@ void uart2HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
     WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
 }
 
+// --- COM3 / Guest Tools UART (ports 0x3E8-0x3EF) ---------------------------
+// Register layout is the same 16550 as COM1/COM2. The interrupt handling is
+// not: see the uart3* globals for why this port needs it and COM2 does not.
+
+#define UART3_GSI          4
+#define UART3_LEGACY_VEC   0x0C   // legacy PIC mapping: IRQ4 -> 0x08 + 4
+
+// True when the RX ring holds a byte the guest has not consumed yet.
+static int uart3RxPending(void) {
+    int pending;
+    EnterCriticalSection(&gtRxLock);
+    pending = (gtRxTail != gtRxHead);
+    LeaveCriticalSection(&gtRxLock);
+    return pending;
+}
+
+// The highest-priority pending AND enabled interrupt source, in 16550 IIR
+// encoding. 0x00 means nothing is pending.
+static unsigned char uart3PendingIir(void) {
+    if ((uart3Ier & 0x01) && uart3RxPending()) return 0x04; // received data available
+    if ((uart3Ier & 0x02) && uart3ThreInt)     return 0x02; // transmit holding register empty
+    return 0x00;
+}
+
+// Asserts IRQ4 when an enabled source is pending.
+//
+// Called from the main loop rather than from the pipe reader thread on purpose.
+// Interrupt injection ends in WHvSetVirtualProcessorRegisters, which must not be
+// issued from another thread while the VP is running -- the reader thread only
+// fills the ring, and the interrupt is raised here, on the thread that owns the
+// vCPU. (rtcCancelThread is the one cross-thread exception in this file, and it
+// calls WHvCancelRunVirtualProcessor, which IS documented safe.)
+//
+// Safe to call every iteration: queueInterrupt coalesces per vector, so a burst
+// of received bytes raises one interrupt rather than one per byte.
+static void uart3UpdateIrq(WHV_PARTITION_HANDLE partition) {
+    // MCR bit 3 (OUT2) gates the interrupt line on a real 16550 -- it is wired
+    // to the tri-state buffer between the UART and the PIC. serial.sys sets it
+    // as part of opening the port, so honouring it keeps us from interrupting a
+    // driver that has not finished attaching yet.
+    if (!(uart3Mcr & 0x08)) return;
+    if (uart3PendingIir() == 0x00) return;
+    if (injectDeviceIrq(partition, UART3_GSI, UART3_LEGACY_VEC)) g_gtIrqRaised++;
+}
+
+// Host -> guest. Accepts one tools client on the pipe and feeds everything it
+// sends into the RX ring. Overlapped for the same reason the KD bridge is: a
+// synchronous handle lets a blocked pipe call park this thread forever.
+DWORD WINAPI gtPipeReaderThread(LPVOID param) {
+    (void)param;
+    unsigned char buf[1024];
+    OVERLAPPED ov;
+    DWORD i;
+    HANDLE ovEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ovEvent) return 1;
+    for (;;) {
+        BOOL connected;
+        DWORD err;
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = ovEvent;
+        ResetEvent(ovEvent);
+        connected = ConnectNamedPipe(gtPipe, &ov);
+        err = GetLastError();
+        if (!connected && err == ERROR_IO_PENDING) {
+            DWORD dummy;
+            WaitForSingleObject(ovEvent, INFINITE);
+            connected = GetOverlappedResult(gtPipe, &ov, &dummy, FALSE);
+        } else if (!connected && err == ERROR_PIPE_CONNECTED) {
+            connected = TRUE;
+        }
+        if (!connected) { Sleep(100); continue; }
+
+        gtClientConnected = 1;
+        printf("[gt] tools client connected\n");
+        fflush(stdout);
+
+        for (;;) {
+            DWORD bytesRead = 0;
+            BOOL ok;
+            ZeroMemory(&ov, sizeof(ov));
+            ov.hEvent = ovEvent;
+            ResetEvent(ovEvent);
+            ok = ReadFile(gtPipe, buf, sizeof(buf), &bytesRead, &ov);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                WaitForSingleObject(ovEvent, INFINITE);
+                ok = GetOverlappedResult(gtPipe, &ov, &bytesRead, FALSE);
+            }
+            if (!ok || bytesRead == 0) break;
+
+            EnterCriticalSection(&gtRxLock);
+            for (i = 0; i < bytesRead; i++) {
+                int next = (gtRxHead + 1) % (int)sizeof(gtRxBuf);
+                if (next != gtRxTail) { gtRxBuf[gtRxHead] = buf[i]; gtRxHead = next; g_gtRxFromPipe++; }
+                else g_gtRxDropped++;
+            }
+            LeaveCriticalSection(&gtRxLock);
+        }
+
+        gtClientConnected = 0;
+        printf("[gt] tools client disconnected\n");
+        fflush(stdout);
+        DisconnectNamedPipe(gtPipe);
+    }
+}
+
+// Guest -> host. Drains gtTxBuf (filled by the guest's COM3 transmit-register
+// writes) onto the pipe from a DEDICATED thread, never from the VM thread.
+// This is the discipline the KD bridge had to learn the hard way: a synchronous
+// WriteFile against a pipe whose client has stopped reading blocks forever, and
+// doing that on the thread servicing WHvRunVirtualProcessor freezes the whole
+// guest. Bounded wait, then cancel and count the bytes as a transmit overrun --
+// which is what a real 16550 does when the far end never asserts CTS.
+DWORD WINAPI gtPipeWriterThread(LPVOID param) {
+    (void)param;
+    unsigned char buf[1024];
+    OVERLAPPED ov;
+    HANDLE ovEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!ovEvent) return 1;
+    for (;;) {
+        WaitForSingleObject(gtTxEvent, INFINITE);
+        for (;;) {
+            int count = 0;
+            DWORD written = 0;
+            BOOL ok;
+            EnterCriticalSection(&gtTxLock);
+            while (gtTxTail != gtTxHead && count < (int)sizeof(buf)) {
+                buf[count++] = gtTxBuf[gtTxTail];
+                gtTxTail = (gtTxTail + 1) % (int)sizeof(gtTxBuf);
+            }
+            LeaveCriticalSection(&gtTxLock);
+            if (count == 0) break;
+
+            // No agent running is the NORMAL case, not an error: nothing is
+            // listening during boot, during Setup, or on any guest without the
+            // tools installed. The host must never block or fail loudly for it.
+            if (!gtClientConnected) { g_gtTxDropped += count; continue; }
+
+            ZeroMemory(&ov, sizeof(ov));
+            ov.hEvent = ovEvent;
+            ResetEvent(ovEvent);
+            ok = WriteFile(gtPipe, buf, count, &written, &ov);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(ovEvent, 250) == WAIT_OBJECT_0) {
+                    ok = GetOverlappedResult(gtPipe, &ov, &written, FALSE);
+                } else {
+                    CancelIoEx(gtPipe, &ov);
+                    // Reap the cancelled request so the OVERLAPPED can be reused.
+                    GetOverlappedResult(gtPipe, &ov, &written, TRUE);
+                    ok = FALSE;
+                    SetLastError(WAIT_TIMEOUT);
+                }
+            }
+            if (ok) {
+                g_gtTxToPipe += (long)written;
+            } else {
+                g_gtTxWriteFail++;
+                g_gtTxLastErr = GetLastError();
+            }
+        }
+    }
+}
+
+void uart3HandleAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext) {
+    WHV_X64_IO_PORT_ACCESS_CONTEXT *io = &exitContext->IoPortAccess;
+    UINT16 port = io->PortNumber;
+    UINT64 rax = io->Rax;
+    int dlab = (uart3Lcr & 0x80) != 0;
+
+    if (io->AccessInfo.IsWrite) {
+        unsigned char val = (unsigned char)io->Rax;
+        switch (port) {
+            case 0x3E8:
+                if (dlab) {
+                    uart3DivisorLow = val;
+                } else {
+                    if (gtPipe != INVALID_HANDLE_VALUE) {
+                        int next;
+                        EnterCriticalSection(&gtTxLock);
+                        next = (gtTxHead + 1) % (int)sizeof(gtTxBuf);
+                        if (next != gtTxTail) { gtTxBuf[gtTxHead] = val; gtTxHead = next; }
+                        else g_gtTxDropped++;
+                        LeaveCriticalSection(&gtTxLock);
+                        SetEvent(gtTxEvent);
+                    }
+                    // The byte is gone -- queued, or dropped because nobody is
+                    // listening. Either way the holding register is free again,
+                    // so re-arm the THRE edge.
+                    uart3ThreInt = 1;
+                }
+                break;
+            case 0x3E9:
+                if (dlab) {
+                    uart3DivisorHigh = val;
+                } else {
+                    uart3Ier = val;
+                    // Enabling the THRE interrupt while the transmitter is
+                    // already idle has to raise it: serial.sys enables it and
+                    // then waits, so without this the first write never starts.
+                    if (val & 0x02) uart3ThreInt = 1;
+                }
+                break;
+            case 0x3EA: uart3FifoEnabled = (val & 0x01) ? 1 : 0; break;
+            case 0x3EB: uart3Lcr = val; break;
+            case 0x3EC: uart3Mcr = val; break;
+            case 0x3EF: uart3Scr = val; break;
+            default: break;
+        }
+    } else {
+        switch (port) {
+            case 0x3E8:
+                if (dlab) {
+                    rax = uart3DivisorLow;
+                } else {
+                    rax = 0x00;
+                    EnterCriticalSection(&gtRxLock);
+                    if (gtRxTail != gtRxHead) {
+                        rax = gtRxBuf[gtRxTail];
+                        gtRxTail = (gtRxTail + 1) % (int)sizeof(gtRxBuf);
+                        g_gtRxToGuest++;
+                    }
+                    LeaveCriticalSection(&gtRxLock);
+                }
+                break;
+            case 0x3E9: rax = dlab ? uart3DivisorHigh : uart3Ier; break;
+            case 0x3EA: {
+                // IIR. Reading it reports the highest-priority pending source
+                // AND clears a pending THRE -- that is what turns our
+                // permanently-empty transmitter into an edge rather than a
+                // level that would never deassert.
+                unsigned char pending = uart3PendingIir();
+                rax = (pending == 0x00) ? 0x01 : pending;  // bit0 set = none pending
+                if (pending == 0x02) uart3ThreInt = 0;
+                if (uart3FifoEnabled) rax |= 0xC0;         // 16550A signature
+                break;
+            }
+            case 0x3EB: rax = uart3Lcr; break;
+            case 0x3EC: rax = uart3Mcr; break;
+            case 0x3ED: {
+                unsigned char lsr = 0x60;   // THRE|TEMT: our transmit is synchronous
+                EnterCriticalSection(&gtRxLock);
+                if (gtRxTail != gtRxHead) lsr |= 0x01;   // DR: data ready
+                LeaveCriticalSection(&gtRxLock);
+                rax = lsr;
+                break;
+            }
+            case 0x3EE: rax = 0xB0; break;  // MSR: CTS|DSR|DCD asserted
+            case 0x3EF: rax = uart3Scr; break;
+            default: rax = 0xFF; break;
+        }
+    }
+
+    {
+        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+        WHV_REGISTER_VALUE values[2] = { 0 };
+        values[0].Reg64 = rax;
+        values[1].Reg64 = exitContext->VpContext.Rip + exitContext->VpContext.InstructionLength;
+        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+    }
+}
+
 // --- fw_cfg device (ports 0x510 selector / 0x511 data) + minimal ACPI ---
 // OVMF does not synthesize ACPI tables itself -- it only builds them from
 // data supplied by the platform via fw_cfg (OvmfPkg's QemuFwCfgAcpi /
@@ -12743,6 +13048,30 @@ int main(int argc, char *argv[]) {
     unsigned char debugLastVal = 0;
 
     g_watchdogPartition = partition;
+
+    // --- Guest Tools channel (COM3) ----------------------------------------
+    // Created unconditionally, unlike the KD pipe: the tools channel has to
+    // exist for every guest, not only a UEFI one being debugged. A guest with
+    // no agent installed simply never opens the far end, which the writer
+    // thread treats as a normal state rather than an error.
+    InitializeCriticalSection(&gtRxLock);
+    InitializeCriticalSection(&gtTxLock);
+    gtTxEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    gtPipe = CreateNamedPipeA("\\\\.\\pipe\\LocalHostGT",
+                              PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                              PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                              1, 8192, 8192, 0, NULL);
+    if (gtPipe != INVALID_HANDLE_VALUE) {
+        HANDLE gtReader = CreateThread(NULL, 0, gtPipeReaderThread, NULL, 0, NULL);
+        HANDLE gtWriter;
+        if (gtReader) CloseHandle(gtReader);
+        gtWriter = CreateThread(NULL, 0, gtPipeWriterThread, NULL, 0, NULL);
+        if (gtWriter) CloseHandle(gtWriter);
+        printf("[gt] Guest Tools channel ready (COM3, ports 0x3E8-0x3EF)\n");
+    } else {
+        printf("[gt] failed to create the Guest Tools pipe, GetLastError=%lu\n", GetLastError());
+    }
+    fflush(stdout);
     CreateThread(NULL, 0, stallWatchdogThread, NULL, 0, NULL);
 
     // The RTC periodic interrupt (see deliverRtcPeriodicIrq) can only be
@@ -13213,6 +13542,10 @@ int main(int argc, char *argv[]) {
         // if the driver freed space without touching either, deferred frames
         // still go out on the next iteration rather than sitting indefinitely.
         rtl8139FlushRxQueue(partition);
+        // COM3 receive/transmit interrupts. Raised from this thread, not from
+        // the pipe reader, because injection writes vCPU registers -- see
+        // uart3UpdateIrq.
+        uart3UpdateIrq(partition);
         netPollUdpSessions(partition);
         netPollTcpSessions(partition);
 
@@ -13716,6 +14049,11 @@ int main(int argc, char *argv[]) {
 
                 if (port >= 0x2F8 && port <= 0x2FF) {
                     uart2HandleAccess(partition, &exitContext);
+                    break;
+                }
+
+                if (port >= 0x3E8 && port <= 0x3EF) {
+                    uart3HandleAccess(partition, &exitContext);
                     break;
                 }
 
