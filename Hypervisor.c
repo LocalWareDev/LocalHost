@@ -6882,17 +6882,27 @@ static const unsigned char usbTabletConfigDesc[34] = {
     // is LOGARITHMIC, not a plain frame count: the period is
     // 2^(bInterval-1) microframes x 125us.
     //   10 -> 2^9  = 512 microframes = 64ms  ->  ~15 position updates/sec
+    //    8 -> 2^7  = 128 microframes = 16ms  ->  ~62/sec
     //    7 -> 2^6  =  64 microframes =  8ms  ->  ~125/sec
-    // 15/sec is why the pointer tracked correctly but felt sluggish -- the
-    // position was right, it just could not be refreshed more than fifteen times
-    // a second. (Read as a full-speed frame count 10 would mean 100/sec, which is
-    // presumably how it was chosen; on high speed it means something six times
-    // slower.)
     //
-    // 125/sec is a normal HID pointer rate and stays well under the ~300/sec that
-    // previously drowned the guest's HID queue -- though note that was caused by
-    // re-servicing already-retired qTDs, not by an honestly higher poll rate.
-    7                       // bInterval
+    // MEASURED, with the pointer being moved continuously: the HOST supplies
+    // ~79 position updates/sec (g_tabletMoves). That is the ceiling on anything
+    // useful -- polling faster only re-sends a position the guest already has.
+    //   at 10: sampling a 79/sec source 15 times a second discards ~80% of the
+    //          motion, which is why the pointer tracked correctly but felt slow
+    //   at  7: 150 reports/sec against 79 real changes = 1.9x duplicates, and
+    //          every poll is an EHCI schedule walk on a vCPU thread that is
+    //          ALREADY SATURATED (halted=0ms, 0.0% idle). Exits went 6242 -> 9264
+    //          per second, and the guest felt WORSE, not better -- the extra
+    //          polling stole more time than the extra samples were worth.
+    // 8 is the compromise the measurement points to: 4x the original sample rate,
+    // still above what the eye needs for smooth motion, at half the polling cost
+    // of 7. The field is logarithmic so there is nothing between 62 and 125.
+    //
+    // If this ever needs to go higher, make the guest cheaper to poll first --
+    // the constraint is vCPU time, not the HID stack. (The old ~300/sec that
+    // "drowned the HID queue" was re-servicing retired qTDs, a different fault.)
+    8                       // bInterval
 };
 
 // 6-byte report: buttons(1) + X(2, LE) + Y(2, LE) + wheel(1).
@@ -6974,6 +6984,20 @@ long g_usbReportLogged = 0;
 volatile LONG g_tabletX = 16384, g_tabletY = 16384;
 volatile LONG g_tabletButtons = 0, g_tabletWheel = 0;
 volatile LONG g_tabletDirty = 0;
+
+// U110: measure the position stream itself rather than inferring from rates.
+// "Still skips" can mean two very different things and the fix differs:
+//   a long GAP between position changes  -> we are not sampling often enough,
+//                                           or something stalls the poll
+//   a large JUMP per change              -> positions are being lost upstream,
+//                                           and a higher rate will not help
+// Recorded per heartbeat window so a burst of movement is not averaged away.
+double g_tabMaxGapMs = 0.0;      // worst interval between two CHANGED positions
+double g_tabSumGapMs = 0.0;      // for the mean
+long   g_tabChanges = 0;         // reports whose coordinates actually differed
+long   g_tabMaxJump = 0;         // worst single-step distance, in 0..32767 units
+long   g_tabSumJump = 0;
+LARGE_INTEGER g_tabLastChange;
 volatile LONG g_tabletMoves = 0;
 
 static UINT32 usbMin32(UINT32 a, UINT32 b) { return a < b ? a : b; }
@@ -7279,6 +7303,63 @@ static int ehciRunQueueHead(UINT64 qh) {
                     // duplicate absolute coordinates are idempotent for the guest.
                     // Revisit if the transfer model ever grows real NAK handling.
                     InterlockedExchange(&g_tabletDirty, 0);
+                    // Sample the pointer HERE, at report time, instead of trusting
+                    // the position cached by the last WM_MOUSEMOVE.
+                    //
+                    // WM_MOUSEMOVE is COALESCED: Windows keeps only the most recent
+                    // position per message pump, so however fast the mouse reports,
+                    // the window sees one position per pump -- and the UI thread is
+                    // busy doing a full StretchDIBits every frame. Measured 79
+                    // moves/sec from a mouse that reports far more often, which is
+                    // motion being thrown away before we ever see it. The tablet
+                    // then faithfully reports those few widely-spaced positions,
+                    // which is exactly what "the cursor skips" looks like.
+                    //
+                    // GetCursorPos is not coalesced and does not touch the message
+                    // queue, so this samples the CURRENT pointer at our own poll
+                    // rate regardless of how backed up the UI thread is.
+                    if (g_hwnd) {
+                        POINT pt;
+                        RECT rc;
+                        if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt) &&
+                            GetClientRect(g_hwnd, &rc)) {
+                            int w = rc.right - rc.left, h = rc.bottom - rc.top;
+                            // Only while the pointer is actually over the guest's
+                            // display -- otherwise moving away across the host
+                            // desktop would keep dragging the guest cursor along.
+                            if (w > 0 && h > 0 &&
+                                pt.x >= 0 && pt.y >= 0 && pt.x < w && pt.y < h) {
+                                InterlockedExchange(&g_tabletX,
+                                    (LONG)(((LONGLONG)pt.x * 32767) / (w - 1 > 0 ? w - 1 : 1)));
+                                InterlockedExchange(&g_tabletY,
+                                    (LONG)(((LONGLONG)pt.y * 32767) / (h - 1 > 0 ? h - 1 : 1)));
+                            }
+                        }
+                    }
+                    // U110: characterise the stream -- gap between changes, and
+                    // how far the pointer moved in each one.
+                    {
+                        static LONG prevX = -1, prevY = -1;
+                        LONG nx = g_tabletX, ny = g_tabletY;
+                        if (prevX >= 0 && (nx != prevX || ny != prevY)) {
+                            LARGE_INTEGER now;
+                            LONG dx = nx > prevX ? nx - prevX : prevX - nx;
+                            LONG dy = ny > prevY ? ny - prevY : prevY - ny;
+                            LONG jump = dx > dy ? dx : dy;
+                            QueryPerformanceCounter(&now);
+                            if (g_tabLastChange.QuadPart && perfFrequency.QuadPart) {
+                                double gap = (double)(now.QuadPart - g_tabLastChange.QuadPart)
+                                             * 1000.0 / (double)perfFrequency.QuadPart;
+                                if (gap > g_tabMaxGapMs) g_tabMaxGapMs = gap;
+                                g_tabSumGapMs += gap;
+                            }
+                            g_tabLastChange = now;
+                            g_tabChanges++;
+                            if (jump > g_tabMaxJump) g_tabMaxJump = jump;
+                            g_tabSumJump += jump;
+                        }
+                        prevX = nx; prevY = ny;
+                    }
                     unsigned char rep[6];
                     rep[0] = (unsigned char)g_tabletButtons;
                     rep[1] = (unsigned char)(g_tabletX & 0xFF);
@@ -13642,6 +13723,17 @@ int main(int argc, char *argv[]) {
                        g_usbSetupPackets, g_usbDescriptorReads, g_usbStalls, g_usbReportsSent,
                        usbTabletAddress, usbTabletConfigured, ehciAsyncBase, g_ehciIrqCount,
                        (long)g_tabletMoves, ehciPeriodicBase, g_usbShortReports, g_tabletEnabled);
+                // U110: the position stream itself. Reset each window so a burst
+                // of movement is not diluted by the idle time around it.
+                if (g_tabChanges > 0) {
+                    printf("[heartbeat]   tablet motion: changes=%ld gap avg=%.1fms max=%.1fms |"
+                           " step avg=%ld max=%ld (of 32767, so 1%% = 328)\n",
+                           g_tabChanges,
+                           g_tabSumGapMs / (double)g_tabChanges, g_tabMaxGapMs,
+                           g_tabSumJump / g_tabChanges, g_tabMaxJump);
+                    g_tabChanges = 0; g_tabSumGapMs = 0.0; g_tabMaxGapMs = 0.0;
+                    g_tabSumJump = 0; g_tabMaxJump = 0;
+                }
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
                        " reclaimed=%ld | reply latency worst=%.0f ms, over-2s=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
@@ -13788,7 +13880,15 @@ int main(int argc, char *argv[]) {
                 double sincePaintMs = lastPaint.QuadPart
                     ? (double)(nowPaint.QuadPart - lastPaint.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart
                     : 1e9;
-                if (sincePaintMs >= 33.0) {   // ~30fps
+                // ~60fps, not 30. The guest draws its own cursor INTO the
+                // framebuffer, so the pointer can never look smoother than the
+                // rate at which this window repaints -- 30fps put up to 33ms of
+                // purely visual lag on top of the tablet's poll interval, and
+                // that stack is what still felt laggy after the input rate was
+                // fixed. The halted-loop repaint below already uses ~60Hz; this
+                // path was the odd one out, and it is the ONLY one that runs,
+                // because the guest never halts (measured: halted=0ms, 0.0%).
+                if (sincePaintMs >= 16.0) {   // ~60fps
                     lastPaint = nowPaint;
                     InvalidateRect(g_hwnd, NULL, FALSE);
                 }
