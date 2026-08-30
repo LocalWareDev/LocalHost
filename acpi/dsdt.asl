@@ -20,6 +20,8 @@
  *   PCI bus 0, device 1 func 0  PIIX-style ISA bridge      (pciIsaBridgeConfig)
  *   PCI bus 0, device 2 func 0  AHCI controller            (pciAhciConfig)
  *   PCI bus 0, device 3 func 0  RTL8139 NIC                (pciRtl8139Config)
+ *   PCI bus 0, device 4 func 0  EHCI USB 2.0               (pciEhciConfig)
+ *   PCI bus 0, device 5 func 0  Intel 82540EM (e1000 backup) (pciE1000Config)
  *   Guest RAM      3 GB in UEFI mode (UEFI_GUEST_RAM_SIZE), so the PCI MMIO
  *                  hole starts at 0xC0000000 (where the AHCI ABAR is mapped)
  *   I/O APIC       0xFEC00000, GSI 0-23   (second one at 0xFEC01000, GSI 24-47)
@@ -98,11 +100,12 @@ DefinitionBlock ("dsdt.aml", "DSDT", 2, "LCLHST", "LHVMDSDT", 0x00000001)
              */
             Name (_PRT, Package ()
             {
-                Package () { 0x0002FFFF, Zero, Zero, 16 },   /* dev 2, AHCI  INTA# -> GSI 16 */
-                Package () { 0x0003FFFF, Zero, Zero, 17 },   /* dev 3, NIC   INTA# -> GSI 17 */
-                Package () { 0x0001FFFF, Zero, Zero, 18 },   /* dev 1, ISA   INTA# -> GSI 18 */
-                Package () { 0x0000FFFF, Zero, Zero, 19 },   /* dev 0, host  INTA# -> GSI 19 */
-                Package () { 0x0004FFFF, Zero, Zero, 20 }    /* dev 4, EHCI  INTA# -> GSI 20 */
+                Package () { 0x0002FFFF, Zero, Zero, 16 },   /* dev 2, AHCI   INTA# -> GSI 16 */
+                Package () { 0x0003FFFF, Zero, Zero, 17 },   /* dev 3, RTL8139 INTA# -> GSI 17 */
+                Package () { 0x0001FFFF, Zero, Zero, 18 },   /* dev 1, ISA    INTA# -> GSI 18 */
+                Package () { 0x0000FFFF, Zero, Zero, 19 },   /* dev 0, host   INTA# -> GSI 19 */
+                Package () { 0x0004FFFF, Zero, Zero, 20 },   /* dev 4, EHCI   INTA# -> GSI 20 */
+                Package () { 0x0005FFFF, Zero, Zero, 21 }    /* dev 5, e1000  INTA# -> GSI 21 */
             })
 
             /*

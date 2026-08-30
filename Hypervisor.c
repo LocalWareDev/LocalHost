@@ -1344,13 +1344,14 @@ UINT64 ioapicRteFor(int gsi);
 // outranks storage, which outranks the timer: a late timer tick is invisible, a
 // lost keystroke is not.
 // GSIs for the devices we emulate. The PCI ones match the _PRT in acpi/dsdt.asl
-// (device 2 = AHCI -> GSI 16, device 3 = NIC -> GSI 17); the ISA ones are their
+// (device 2 = AHCI -> GSI 16, device 3 = RTL8139 -> GSI 17, device 5 = e1000 backup -> GSI 21); the ISA ones are their
 // classic IRQ numbers. Declared here because the interrupt queue below needs them
 // to decide priority.
 #define GSI_KEYBOARD 1
 #define GSI_MOUSE    12
 #define GSI_AHCI     16
-#define GSI_NIC      17
+#define GSI_NIC      17   // PCI 0:3.0 RTL8139 (primary NIC)
+#define GSI_E1000    21   // PCI 0:5.0 Intel 82540EM backup NIC
 
 #define IRQ_PRIO_INPUT   0
 #define IRQ_PRIO_DEVICE  1
@@ -4071,6 +4072,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KEYUP: {
             int ext = 0;
             unsigned char sc = vkToScancode((int)wParam, &ext);
+            // Log the BREAK code too. Only makes were logged, so a log full of
+            // WM_KEYDOWN and no WM_KEYUP reads exactly like "we never send break
+            // codes and the guest is holding every key down" -- a wrong diagnosis
+            // this very log led to. Make/break pairing is now visible directly.
+            printf("[ps2-key] #%ld WM_KEYUP   vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
+                   g_kbVkLogged, (unsigned)wParam, (unsigned char)(sc | 0x80),
+                   ext ? " (E0)" : "",
+                   (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
+            fflush(stdout);
             if (sc != 0) {
                 // Break codes carry the same 0xE0 prefix as their make codes; a
                 // release without it leaves the guest holding the key down.
@@ -4534,7 +4544,8 @@ unsigned char pciHostBridgeConfig[256] = { 0 }; // 0:0.0 -- i440fx host bridge
 unsigned char pciIsaBridgeConfig[256] = { 0 };  // 0:1.0 -- PIIX3 ISA bridge
 unsigned char pciPmConfig[256] = { 0 };         // 0:1.3 -- PIIX4 power management
 unsigned char pciAhciConfig[256] = { 0 };       // 0:2.0 -- AHCI (SATA) controller
-unsigned char pciRtl8139Config[256] = { 0 };    // 0:3.0 -- RTL8139 NIC
+unsigned char pciRtl8139Config[256] = { 0 };    // 0:3.0 -- RTL8139 (primary NIC)
+unsigned char pciE1000Config[256] = { 0 };      // 0:5.0 -- Intel 82540EM (backup NIC)
 unsigned char pciEhciConfig[256] = { 0 };       // 0:4.0 -- EHCI USB 2.0 controller
 
 // --- EHCI (USB 2.0) host controller ---------------------------------------
@@ -4714,6 +4725,7 @@ unsigned char g_rtlPciRev = 0x20;
 // own emulated NICs use for exactly this purpose -- a safe, real-hardware-
 // conflict-free address for an emulated device).
 unsigned char rtl8139Mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+unsigned char e1000Mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 };
 
 // --- RTL8139 Phase 2: TX descriptor handling, RX ring buffer, and
 // interrupt generation. Deliberately kept separate from the networking
@@ -4745,6 +4757,23 @@ unsigned char rtl8139Mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
 UINT32 rtl8139RxWritePos = 0; // our own tracked ring write offset (mirrored into CBR)
 int pendingRtl8139Irq = 0;    // same latch-until-IF=1 pattern as pendingAtaIrq
 
+// U108: every [u106-reset] capture found a HEALTHY adapter -- ISR=0x0000, no error
+// flags, ring drained, pointers in sync -- so the driver is not reacting to anything
+// we reported. That leaves a watchdog, and a watchdog is identifiable by WHAT went
+// quiet before it fired. Register READS cannot be observed (BAR1 is mapped read-only
+// so the CPU serves them from our page without trapping) and unmapping to trap them
+// routes every read through an instruction decoder that can fail -- too risky to run
+// unattended. Timestamping the paths we DO own gives the same discrimination safely:
+//   TX quiet  -> send watchdog          RX quiet  -> receive watchdog
+//   IRQ quiet -> interrupt starvation   none quiet-> a timer, not activity-driven
+LARGE_INTEGER g_u108LastTx, g_u108LastRx, g_u108LastIrq, g_u108LastCapr;
+double u108MsSince(LARGE_INTEGER then) {
+    LARGE_INTEGER now;
+    if (!then.QuadPart || !perfFrequency.QuadPart) return -1.0;
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - then.QuadPart) * 1000.0 / (double)perfFrequency.QuadPart;
+}
+
 void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
     UINT16 isr = *(UINT16 *)&rtl8139Regs[0x3E];
     UINT16 imr = *(UINT16 *)&rtl8139Regs[0x3C];
@@ -4756,8 +4785,8 @@ void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
         return;
     }
     if (guestInterruptsEnabled(partition)) {
-        g_nicIrqInjected++;
-        injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: routed, was hardcoded 0x73
+        g_nicIrqInjected++; QueryPerformanceCounter(&g_u108LastIrq);
+        injectDeviceIrq(partition, GSI_NIC, 0x73);
     } else {
         g_nicIrqLatched++;
         pendingRtl8139Irq = 1;
@@ -4766,7 +4795,7 @@ void rtl8139MaybeInjectIrq(WHV_PARTITION_HANDLE partition) {
 
 void deliverPendingRtl8139Irq(WHV_PARTITION_HANDLE partition) {
     if (pendingRtl8139Irq && guestInterruptsEnabled(partition)) {
-        injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: routed, was hardcoded 0x73
+        injectDeviceIrq(partition, GSI_NIC, 0x73);
         pendingRtl8139Irq = 0;
     }
 }
@@ -4808,6 +4837,15 @@ UINT32 rtl8139RxRingFree(void) {
 
 void rtl8139ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
 void rtl8139FlushRxQueue(WHV_PARTITION_HANDLE partition);
+void e1000ReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len);
+void e1000Reset(void);
+int e1000RxEnabled(void);
+int e1000RxCanAccept(UINT32 bytes);
+int e1000HandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext);
+void e1000HandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset, UINT32 accessSize, UINT64 *rax);
+void e1000HandleBar1Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset, UINT32 accessSize, UINT64 *rax);
+void e1000HandleIoAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exitContext);
+void deliverPendingE1000Irq(WHV_PARTITION_HANDLE partition);
 
 // --- Pending RX queue ------------------------------------------------------
 // By the time a frame reaches the device layer it has ALREADY been taken out of
@@ -4843,6 +4881,20 @@ UINT32 rtl8139RxQueueCount = 0;
 // own flow control can see it. Keep it in the socket.
 int rtl8139RxCanAccept(UINT32 bytes) {
     return rtl8139RxQueueCount == 0 && rtl8139RxRingFree() >= bytes;
+}
+
+void netReceiveFrame(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
+    // RTL8139 is the primary NIC. The e1000 only sees host RX while the
+    // Realtek receiver is off, so the backup Intel card can still DHCP if
+    // 8139too is unbound.
+    if (rtl8139Regs[0x37] & 0x08) rtl8139ReceiveFrame(partition, frame, len);
+    else e1000ReceiveFrame(partition, frame, len);
+}
+
+int netRxCanAccept(UINT32 bytes) {
+    if (rtl8139Regs[0x37] & 0x08) return rtl8139RxCanAccept(bytes);
+    if (e1000RxEnabled()) return e1000RxCanAccept(bytes);
+    return rtl8139RxCanAccept(bytes);
 }
 
 // =====================================================================
@@ -4980,7 +5032,7 @@ UINT32 netL4ChecksumSeed(UINT32 srcIp, UINT32 dstIp, unsigned char proto, UINT16
 
 // Builds a complete Ethernet+IPv4 frame around an already-built L4 payload
 // (ICMP, or a UDP/TCP header+payload the caller assembled) and hands it to
-// the device via rtl8139ReceiveFrame. Fills in and checksums the IP header;
+// the device via netReceiveFrame. Fills in and checksums the IP header;
 // the caller is responsible for its own L4 checksum (UDP/TCP need the
 // pseudo-header, ICMP doesn't) before calling this.
 long g_netIpFrameLogged = 0;
@@ -5030,7 +5082,7 @@ void netSendIpFrame(WHV_PARTITION_HANDLE partition, const unsigned char *srcMac,
         fflush(stdout);
     }
 
-    rtl8139ReceiveFrame(partition, frame, 14 + ipLen);
+    netReceiveFrame(partition, frame, 14 + ipLen);
 }
 
 void netHandleArp(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UINT32 len) {
@@ -5071,7 +5123,7 @@ void netHandleArp(WHV_PARTITION_HANDLE partition, const unsigned char *frame, UI
                replyMac[0], replyMac[1], replyMac[2], replyMac[3], replyMac[4], replyMac[5]);
         fflush(stdout);
     }
-    rtl8139ReceiveFrame(partition, reply, sizeof(reply));
+    netReceiveFrame(partition, reply, sizeof(reply));
 }
 
 // ICMP echo (ping) only -- the minimum needed for a guest to consider the
@@ -5850,7 +5902,7 @@ void netPollTcpSessions(WHV_PARTITION_HANDLE partition) {
                 // which is what a real NIC's finite FIFO does. The device-side
                 // queue would absorb a burst, but absorbing it there only hides
                 // the backlog from the sender's own flow control.
-                if (!rtl8139RxCanAccept(chunk + 64)) { g_tcpRingBackpressure++; break; }
+                if (!netRxCanAccept(chunk + 64)) { g_tcpRingBackpressure++; break; }
                 int n = recv(s->sock, (char *)buf, (int)chunk, 0);
                 if (n > 0) {
                     g_tcpBytesToGuest += n;
@@ -5977,11 +6029,14 @@ void netSlirpTransmit(WHV_PARTITION_HANDLE partition, const unsigned char *frame
         // still works. That is exactly the observed split: DHCP (broadcast)
         // succeeds, DNS (unicast) times out despite being relayed, delivered,
         // checksummed correctly and interrupt-signalled.
-        int macMatches = (memcmp(netGuestMac, rtl8139Mac, 6) == 0);
+        int macMatches = (memcmp(netGuestMac, e1000Mac, 6) == 0)
+                      || (memcmp(netGuestMac, rtl8139Mac, 6) == 0);
         printf("[net] guest MAC learned: %02X:%02X:%02X:%02X:%02X:%02X | "
-               "EEPROM says %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
+               "e1000 %02X:%02X:%02X:%02X:%02X:%02X rtl %02X:%02X:%02X:%02X:%02X:%02X -> %s\n",
                netGuestMac[0], netGuestMac[1], netGuestMac[2],
                netGuestMac[3], netGuestMac[4], netGuestMac[5],
+               e1000Mac[0], e1000Mac[1], e1000Mac[2],
+               e1000Mac[3], e1000Mac[4], e1000Mac[5],
                rtl8139Mac[0], rtl8139Mac[1], rtl8139Mac[2],
                rtl8139Mac[3], rtl8139Mac[4], rtl8139Mac[5],
                macMatches ? "MATCH" : "*** MISMATCH -- unicast cannot reach the guest ***");
@@ -6144,7 +6199,7 @@ int rtl8139DeliverFrame(WHV_PARTITION_HANDLE partition, const unsigned char *fra
     int linearPad = ((rcr & 0x80) != 0) && ringSize < 65536 &&
                     (UINT64)rxBase + ringSize + RTL8139_RX_WRAP_PAD <= guestMemSize;
 
-    g_netRxFrames++;   // past every guard: this frame really does go into the ring
+    g_netRxFrames++; QueryPerformanceCounter(&g_u108LastRx);   // past every guard: this frame really does go into the ring
 
     unsigned char *ring = (unsigned char *)guestMemory + rxBase;
     // RX status. ROK alone is NOT what real hardware reports: the upper bits say
@@ -6313,6 +6368,20 @@ void pciInitConfigSpaces(void) {
     // INTA# matches the _PRT entry for device 2 in acpi/dsdt.asl (-> GSI 16).
     pciAhciConfig[0x3D] = 0x01; // interrupt pin: INTA#
 
+    // 0:5.0 -- Intel 82540EM backup NIC. Inbox Windows driver (e1i65x64/e1k).
+    // Device ID 0x100E is the QEMU/Bochs e1000 identity. Subsystem 8086:001E
+    // is the copper 82540EM board ID the same driver matches.
+    pciE1000Config[0x00] = 0x86; pciE1000Config[0x01] = 0x80; // vendor 0x8086
+    pciE1000Config[0x02] = 0x0E; pciE1000Config[0x03] = 0x10; // device 0x100E
+    pciE1000Config[0x08] = 0x03; // revision
+    pciE1000Config[0x0A] = 0x00; // subclass: ethernet
+    pciE1000Config[0x0B] = 0x02; // base class: network
+    pciE1000Config[0x0E] = 0x00;
+    pciE1000Config[0x2C] = 0x86; pciE1000Config[0x2D] = 0x80; // subsys vendor
+    pciE1000Config[0x2E] = 0x1E; pciE1000Config[0x2F] = 0x00; // subsys 0x001E
+    pciE1000Config[0x3D] = 0x01; // INTA# -> GSI 21 via the _PRT
+    e1000Reset();
+
     // 0:4.0 -- EHCI USB 2.0 controller (ICH9 USB2 EHCI #1). Class 0C/03/20 is
     // what makes Windows load usbehci.sys against it; prog-IF 0x20 specifically
     // means EHCI (0x00 UHCI, 0x10 OHCI, 0x30 xHCI).
@@ -6359,6 +6428,7 @@ unsigned char *pciSelectConfigSpace(UINT32 bus, UINT32 dev, UINT32 func) {
     if (dev == 2 && func == 0) return pciAhciConfig;
     if (dev == 3 && func == 0) return pciRtl8139Config;
     if (dev == 4 && func == 0) return pciEhciConfig;
+    if (dev == 5 && func == 0) return pciE1000Config;
     return NULL;
 }
 
@@ -8055,6 +8125,31 @@ void rtl8139InitRegs(void) {
     rtl8139Regs[0x51] = 0x00;   // CONFIG0
     rtl8139Regs[0x52] = 0x10;   // CONFIG1: driver-loaded bit, not sleeping
     rtl8139Regs[0x58] = 0x40;   // MSR: link up, 100Mbps, not in low-power
+    // U107: THE PHY BLOCK. BMSR (0x64) was never populated, so it read 0x0000 --
+    // bit 2 is Link Status and bit 5 is Auto-Negotiation Complete, so every poll
+    // told the driver the cable was unplugged and autoneg had never finished.
+    // BAR1 is mapped read-only (WHvMapGpaRangeFlagRead), so register READS run
+    // natively out of this very buffer and never trap: the driver was reading
+    // "link down" straight from us and nothing in any log could show it. That is
+    // why every [u106-reset] capture found a perfectly healthy adapter with ISR=0
+    // and no error flags -- the trigger was never an error we raised, it was a
+    // status we failed to report.
+    //
+    // The map here had drifted: 0x62 is BMCR (was commented CONFIG3, which is
+    // really 0x59) and 0x64 is BMSR (a value was being written to 0x76 instead).
+    // Toggleable ONLY so the A/B can run from one build at identical guest RAM:
+    // set LOCALHOST_U107_PHY=0 to restore the old (unpopulated PHY) behaviour.
+    // Comparing a PHY-on run against a differently-sized baseline proves nothing,
+    // and guest RAM is currently dictated by whatever the host has spare.
+    {
+        const char *off = getenv("LOCALHOST_U107_PHY");
+        if (!(off && off[0] == '0')) {
+            *(UINT16 *)&rtl8139Regs[0x62] = 0x3100; // BMCR: autoneg on, 100Mbps, full duplex
+            *(UINT16 *)&rtl8139Regs[0x64] = 0x782D; // BMSR: ExtCap|LINK UP|ANegAble|ANEG DONE|10H,10F,100H,100F
+            *(UINT16 *)&rtl8139Regs[0x66] = 0x01E1; // ANAR: advertise 100F/100H/10F/10H, 802.3
+            *(UINT16 *)&rtl8139Regs[0x68] = 0x45E1; // ANLPAR: link partner advertises same, with ACK
+        }
+    }
     rtl8139Regs[0x62] = 0x00;   // CONFIG3
     rtl8139Regs[0x69] = 0x00;   // CONFIG4
     rtl8139RxWritePos = 0;
@@ -8240,6 +8335,48 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             // preserve whatever we currently have there.
             unsigned char val = (unsigned char)written;
             if (val & 0x10) {
+                // U106: WHY does the driver reset? This is the one causal link we
+                // have never seen. NDIS restarts the adapter ~1.3x/min and every
+                // restart discards in-flight RX, which is what leaves guestAcked
+                // frozen at ISN+1 -- but nothing has ever captured the state that
+                // triggers it. Dump everything BEFORE rtl8139InitRegs() wipes it,
+                // plus the register writes that led here.
+                {
+                    UINT16 isr = *(UINT16 *)&rtl8139Regs[0x3E];
+                    UINT16 imr = *(UINT16 *)&rtl8139Regs[0x3C];
+                    UINT32 rcr = *(UINT32 *)&rtl8139Regs[0x44];
+                    UINT16 capr = *(UINT16 *)&rtl8139Regs[0x38];
+                    UINT16 cbr = *(UINT16 *)&rtl8139Regs[0x3A];
+                    long total = g_nicRingCount;
+                    long have = total < NIC_RING_MAX ? total : NIC_RING_MAX;
+                    long i3;
+                    printf("[u106-reset] ISR=0x%04X IMR=0x%04X CR=0x%02X RCR=0x%08X"
+                           " CAPR=0x%04X CBR=0x%04X writePos=0x%X ringSize=%u"
+                           " used=%u queued=%u\n",
+                           isr, imr, rtl8139Regs[0x37], rcr, capr, cbr,
+                           rtl8139RxWritePos, rtl8139RxRingSize(),
+                           rtl8139RxRingUsed(), (unsigned)rtl8139RxQueueCount);
+                    // ISR bits that matter: RER(0x02) TER(0x08) RXOVW(0x10)
+                    // FOVW(0x40) TimeOut(0x4000) SERR(0x8000). If the driver is
+                    // resetting because we reported an error, it is in here.
+                    // U108: what went QUIET before the watchdog fired.
+                    printf("[u108-quiet]   msSinceTX=%.0f msSinceRX=%.0f"
+                           " msSinceIRQ=%.0f msSinceCAPR=%.0f  (-1 = never)\n",
+                           u108MsSince(g_u108LastTx), u108MsSince(g_u108LastRx),
+                           u108MsSince(g_u108LastIrq), u108MsSince(g_u108LastCapr));
+                    printf("[u106-reset]   flags:%s%s%s%s%s%s\n",
+                           (isr & 0x0002) ? " RER" : "", (isr & 0x0008) ? " TER" : "",
+                           (isr & 0x0010) ? " RXOVW" : "", (isr & 0x0040) ? " FOVW" : "",
+                           (isr & 0x4000) ? " TIMEOUT" : "", (isr & 0x8000) ? " SERR" : "");
+                    printf("[u106-reset]   last %ld regs:", have);
+                    for (i3 = total - have; i3 < total; i3++) {
+                        int s3 = (int)(i3 % NIC_RING_MAX);
+                        printf(" %s%02X=%X", g_nicRingWrite[s3] ? "W" : "R",
+                               g_nicRingOff[s3], g_nicRingVal[s3]);
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
                 rtl8139InitRegs();
                 printf("[rtl8139] software reset (CR)\n"); fflush(stdout);
             } else {
@@ -8321,6 +8458,17 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             UINT32 i;
             for (i = 0; i < 4; i++) rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
 
+            // U109: the driver clearing OWN in TSD is it HANDING the descriptor to
+            // us, so the matching TSAD completion bits must go stale immediately --
+            // otherwise a stale TOK from the previous packet reads as if this new
+            // send had already finished.
+            {
+                UINT32 d = (offset - 0x10) / 4;
+                UINT16 tsad = *(UINT16 *)&rtl8139Regs[0x60];
+                tsad &= (UINT16)~(1u << d);          // OWNd: ours now, not complete
+                tsad &= (UINT16)~(1u << (12 + d));   // TOKd: this send has not succeeded yet
+                *(UINT16 *)&rtl8139Regs[0x60] = tsad;
+            }
             UINT32 tsd = *(UINT32 *)&rtl8139Regs[offset];
             UINT32 size = tsd & 0x1FFF; // bits 0-12
             UINT32 txAddr = *(UINT32 *)&rtl8139Regs[offset + 0x10]; // TSADx
@@ -8328,8 +8476,34 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             if (size > 0 && size <= 1792 && guestMemory && (UINT64)txAddr + size <= guestMemSize) {
                 unsigned char frameBuf[1792];
                 memcpy(frameBuf, (unsigned char *)guestMemory + txAddr, size);
+                QueryPerformanceCounter(&g_u108LastTx);
                 rtl8139TransmitFrame(partition, frameBuf, size);
                 *(UINT32 *)&rtl8139Regs[offset] = (tsd & ~(UINT32)0x1FFF) | size | 0x8000 /* TOK */ | 0x2000 /* OWN */;
+                // U109: ALSO publish completion in TSAD (0x60), the aggregate
+                // "Transmit Status of All Descriptors" register. Marking only the
+                // per-descriptor TSD is not enough: the driver polls TSAD to find
+                // which sends finished, and it was never written, so it read
+                // 0x0000 forever -- "nothing has ever completed". BAR1 is mapped
+                // read-only, so that poll runs natively and never trapped; no log
+                // could show it, exactly like BMSR.
+                //
+                // Measured signature that led here: at EVERY software reset the
+                // adapter was healthy (ISR=0, no error flags, ring drained) but
+                // msSinceTX clustered at 22-24s, while msSinceRX scattered. That
+                // is a transmit watchdog firing on a completion that never
+                // appears where the driver looks for it.
+                //
+                // Layout: OWN0-3 in bits 0-3, TABT0-3 in 4-7, TUN0-3 in 8-11,
+                // TOK0-3 in bits 12-15.
+                {
+                    UINT32 d = (offset - 0x10) / 4;          // which of the 4 descriptors
+                    UINT16 tsad = *(UINT16 *)&rtl8139Regs[0x60];
+                    tsad |= (UINT16)(1u << d);               // OWNd: DMA complete
+                    tsad |= (UINT16)(1u << (12 + d));        // TOKd: transmitted OK
+                    tsad &= (UINT16)~(1u << (4 + d));        // not aborted
+                    tsad &= (UINT16)~(1u << (8 + d));        // no underrun
+                    *(UINT16 *)&rtl8139Regs[0x60] = tsad;
+                }
                 *(UINT16 *)&rtl8139Regs[0x3E] |= 0x0004; // ISR: TOK
                 rtl8139MaybeInjectIrq(partition);
             }
@@ -8337,6 +8511,10 @@ void rtl8139RegWrite(WHV_PARTITION_HANDLE partition, UINT32 offset, UINT32 acces
             // CAPR: guest's RX read pointer, conventionally written as
             // (consumed_offset - 16). If that catches up to our write
             // pointer, the ring is drained -- set BUFE.
+            //
+            // U108: this write is the guest PROVING it consumed a frame, which is
+            // the cleanest "the driver is alive and processing RX" signal we have.
+            QueryPerformanceCounter(&g_u108LastCapr);
             UINT32 i;
             for (i = 0; i < accessSize && offset + i < RTL8139_IO_SIZE; i++) {
                 rtl8139Regs[offset + i] = (unsigned char)((written >> (i * 8)) & 0xFF);
@@ -8739,6 +8917,8 @@ int rtl8139HandleBar1Mmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEX
     return 1;
 }
 
+#include "e1000_dev.c"
+
 // Handles I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC-0xCFF (CONFIG_DATA) --
 // see pciSelectConfigSpace above for what this stub does and doesn't model.
 int pciConfigAccessLogCount = 0;
@@ -8780,6 +8960,10 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
 
         if (cfg == pciAhciConfig && baseOffset >= 0x24 && baseOffset <= 0x27) {
             ahciHandleBar5Access(partition, io, baseOffset, accessSize, &rax);
+        } else if (cfg == pciE1000Config && baseOffset >= 0x10 && baseOffset <= 0x13) {
+            e1000HandleBar0Access(io, baseOffset, accessSize, &rax);
+        } else if (cfg == pciE1000Config && baseOffset >= 0x14 && baseOffset <= 0x17) {
+            e1000HandleBar1Access(io, baseOffset, accessSize, &rax);
         } else if (cfg == pciRtl8139Config && baseOffset >= 0x10 && baseOffset <= 0x13) {
             rtl8139HandleBar0Access(io, baseOffset, accessSize, &rax);
         } else if (cfg == pciRtl8139Config && baseOffset >= 0x14 && baseOffset <= 0x17) {
@@ -8834,7 +9018,7 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         // almost certainly the normal func=1..7 multifunction probe, where
         // all-ones IS the correct answer. Logging a value without the context
         // that makes it interpretable has produced three wrong readings today.
-        if (g_bpModuleBase && dev == 3 && g_nicCfgLogged < 80) {
+        if (g_bpModuleBase && (dev == 3 || dev == 5) && g_nicCfgLogged < 80) {
             g_nicCfgLogged++;
             printf("[nic-cfg] func=%u off=0x%02X size=%u write=%d val=0x%llX cfg=%s\n",
                    func, baseOffset, accessSize, io->AccessInfo.IsWrite,
@@ -13174,11 +13358,13 @@ int main(int argc, char *argv[]) {
                 // IRQ11 - RTL8139 NIC. Needed here (not just the outer
                 // loop's deliverPendingRtl8139Irq) so a packet arriving
                 // while the guest is parked in HLT waiting for one -- the
-                // whole point of interrupt-driven RX -- actually wakes it,
-                // the same reason kbHasData/auxHasData are checked here
-                // rather than only after the loop exits.
-                injectDeviceIrq(partition, GSI_NIC, 0x73); // U53: NIC, routed
+                // whole point of interrupt-driven RX -- actually wakes it.
+                injectDeviceIrq(partition, GSI_NIC, 0x73);
                 pendingRtl8139Irq = 0;
+                injected = 1;
+            } else if (pendingE1000Irq) {
+                injectDeviceIrq(partition, GSI_E1000, 0x7B);
+                pendingE1000Irq = 0;
                 injected = 1;
             } else {
                 LARGE_INTEGER now;
@@ -13500,6 +13686,7 @@ int main(int argc, char *argv[]) {
         }
 
         deliverPendingAtaIrq(partition);
+        deliverPendingE1000Irq(partition);
         deliverPendingRtl8139Irq(partition);
         // REVERTED: delivering PS/2 keyboard/mouse bytes from here (in addition to
         // the halted-CPU wait branch) looked like the fix for hover feeling
@@ -14065,6 +14252,14 @@ int main(int argc, char *argv[]) {
                 if (port == 0x510 || port == 0x511) {
                     fwCfgHandleAccess(partition, &exitContext, guestMemory);
                     break;
+                }
+
+                if (e1000IoBase != 0) {
+                    UINT32 ebase = e1000IoBase & ~3u;
+                    if (port >= ebase && port < ebase + E1000_IO_SIZE) {
+                        e1000HandleIoAccess(partition, &exitContext);
+                        break;
+                    }
                 }
 
                 // RTL8139 register file, at whatever I/O base the guest
@@ -14904,6 +15099,9 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 if (ehciHandleMmio(partition, &exitContext)) { // USB 2.0 controller
+                    break;
+                }
+                if (e1000HandleMmio(partition, &exitContext)) { // Intel 82540EM
                     break;
                 }
                 if (rtl8139HandleBar1Mmio(partition, &exitContext)) { // NIC memory window

@@ -1,0 +1,33 @@
+﻿TSAD (0x60) fix - evidence captured 2026-08-29
+==============================================
+
+ROOT CAUSE: the RTL8139 driver polls TSAD (0x60, Transmit Status of All
+Descriptors) to learn which sends completed. We set completion only in the
+per-descriptor TSD regs (0x10/0x14/0x18/0x1C) and never wrote 0x60, so it read
+0x0000 = 'nothing ever completed'. After ~23s the driver declared the
+transmitter hung and reset the adapter; each reset discarded in-flight RX,
+freezing guestAcked at ISN+1.
+
+AFTER THE FIX (1400 MB guest):
+[heartbeat]   net TCP: syn=1116 connected=1063 refused=0 tableFull=0 sockFail=0 closed=140 unknown=17 | bytes out=1728059 in=2757443 dup=0 ooo=99 reclaimed=868 aged=33 closedUnacked=31 worstUnacked=658
+[heartbeat]   net TX: total=10937 arp=36 ipv4=10877 ipv6=24 other=0 | RX offered=10371 delivered=10371 deferred(noRE=0 noBuf=0 ringFull=0) queued=0 peak=0 DROPPED(size=0 overflow=0) arpReplies=29 padded=6931 backpressure=9450
+[heartbeat]   net UDP: out=60 outFail=0 in=38 noSession=0 reclaimed=0 | reply latency worst=142 ms, over-2s=0
+software resets in 17.31 min: 1 (the driver's own init reset)
+
+BEFORE (same 1400 MB): 1.65 resets/min, 7 connections, 4,000 bytes to guest,
+guestAcked never left 1001, 77-86% of data-carrying closes stalled.
+
+The reset-trigger capture that led here (adapter always healthy, no error flags):
+[u106-reset] ISR=0x0000 IMR=0x405F CR=0x0D RCR=0x00005E00 CAPR=0xFFF0 CBR=0x0000 writePos=0x0 ringSize=65536 used=0 queued=0
+
+The timing capture that identified a TRANSMIT watchdog (msSinceTX clustered
+at 22-24s while msSinceRX scattered) - from the previous run:
+  [u108-quiet] msSinceTX=22538 msSinceRX=-1    msSinceIRQ=22538
+  [u108-quiet] msSinceTX=21755 msSinceRX=21780 msSinceIRQ=21755
+  [u108-quiet] msSinceTX=23670 msSinceRX=23649 msSinceIRQ=23649
+  [u108-quiet] msSinceTX=23542 msSinceRX=23542 msSinceIRQ=23542
+
+BLIND SPOT: BAR1 is mapped WHvMapGpaRangeFlagRead and rtl8139Regs IS the mapped
+page, so register READS run natively and never trap. Registers the driver only
+reads are invisible in every log. Two root causes hid there: BMSR (0x64) and
+TSAD (0x60).
