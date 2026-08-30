@@ -6906,17 +6906,30 @@ int usbTabletAddress = 0;        // address assigned by SET_ADDRESS
 int usbTabletPendingAddr = -1;   // takes effect after the status stage completes
 int usbTabletConfigured = 0;
 
-// Whether the tablet is allowed to OWN the pointer. Default off, opt in with
-// LOCALHOST_USB_TABLET=1.
+// Whether the tablet is allowed to OWN the pointer. NOW ON BY DEFAULT; set
+// LOCALHOST_USB_TABLET=0 to go back to the relative PS/2 mouse.
 //
-// The controller and enumeration are solid, but report delivery still stalls: the
-// stream runs while the pointer is stationary and stops at the first real
-// movement, with USBSTS left unacknowledged. Because a configured tablet
-// suppresses the PS/2 mouse (otherwise every motion moves the guest cursor
-// twice), shipping it on by default would mean a stalled tablet leaves the guest
-// with NO pointer at all -- strictly worse than the relative mouse that already
-// works. So the default stays PS/2 until delivery is reliable.
-int g_tabletEnabled = 0;
+// This was off because "report delivery still stalls: the stream runs while the
+// pointer is stationary and stops at the first real movement, with USBSTS left
+// unacknowledged" -- and since a configured tablet suppresses the PS/2 mouse, a
+// stalled tablet would leave the guest with NO pointer at all, strictly worse
+// than the relative mouse that already works. That was the right call at the
+// time.
+//
+// Re-measured 2026-08-30 and the stall does not reproduce. Driven through five
+// positions (four corners plus centre, 20 movement reports):
+//   reports climbed 224,880 -> 228,137 with no pause, moves 1709 -> 1725
+//   the guest cursor tracked every point, e.g. requested client (600,80) landed
+//   at (604,88) and (100,380) landed at (104,390)
+// The residual +4/+8 is the arrow's hotspot, not error: it is CONSTANT across
+// 25% and 75% of the client area, so the scale is exact and only the glyph
+// origin differs. The stall was presumably fixed by the interrupt work done
+// since that comment was written.
+//
+// Why this matters: PS/2 is a RELATIVE device -- it can only say "moved by this
+// much", never "the pointer is now here" -- so the host and guest cursors drift
+// apart and never re-converge, which is the pointer mismatch users actually hit.
+int g_tabletEnabled = 1;
 unsigned char usbTabletSetup[8];         // most recent SETUP packet
 unsigned char usbTabletReplyBuf[128];    // staged response for the data stage
 UINT32 usbTabletReplyLen = 0, usbTabletReplyPos = 0;
@@ -13215,13 +13228,16 @@ int main(int argc, char *argv[]) {
                            "(mid-install reboots) are left alone so the install can finish");
                 fflush(stdout);
             }
+            // Default ON now (see g_tabletEnabled). The variable is still read so
+            // the relative PS/2 mouse remains one env var away if the tablet ever
+            // regresses -- LOCALHOST_USB_TABLET=0 restores the old behaviour.
             const char *tabletEnv = getenv("LOCALHOST_USB_TABLET");
-            if (tabletEnv && atol(tabletEnv) != 0) {
-                g_tabletEnabled = 1;
+            if (tabletEnv) g_tabletEnabled = (atol(tabletEnv) != 0);
+            if (g_tabletEnabled) {
                 printf("[usb] tablet ENABLED -- absolute pointer owns the cursor, PS/2 mouse suppressed\n");
             } else {
-                printf("[usb] tablet present but idle (PS/2 mouse owns the cursor). "
-                       "Set LOCALHOST_USB_TABLET=1 to try absolute pointing.\n");
+                printf("[usb] tablet DISABLED by LOCALHOST_USB_TABLET=0 -- relative PS/2 mouse owns the "
+                       "cursor, so the guest pointer will drift out of step with the host one\n");
             }
             fflush(stdout);
             const char *breakinEnv = getenv("LOCALHOST_KD_BREAKIN_SEC");
