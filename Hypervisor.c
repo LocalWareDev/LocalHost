@@ -4252,6 +4252,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             auxMouseTracking = 0;
             return 0;
         }
+        case WM_SETCURSOR: {
+            // Hide the HOST cursor over the guest's display, so only the GUEST's
+            // own cursor is visible. Otherwise two arrows sit on top of each
+            // other -- and any difference between them, however small, reads as
+            // the pointer being broken.
+            //
+            // Only over HTCLIENT: the frame, title bar and buttons keep a normal
+            // cursor, or the window becomes awkward to move and close.
+            //
+            // Gated on the tablet owning the pointer, which is the case where the
+            // guest cursor is genuinely at the host pointer's position. Under the
+            // relative PS/2 mouse the two drift apart, and hiding the host cursor
+            // there would remove the only pointer the user can actually trust.
+            if (LOWORD(lParam) == HTCLIENT && LH_TABLET_OWNS_POINTER) {
+                SetCursor(NULL);
+                return TRUE;
+            }
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+        }
         // Buttons feed BOTH devices: the tablet's report byte when it is
         // configured, and the PS/2 aux device otherwise, so clicking still works
         // before USB enumeration completes (and on a guest with no USB stack).
@@ -6859,7 +6878,21 @@ static const unsigned char usbTabletConfigDesc[34] = {
     0x81,                   // bEndpointAddress: EP1 IN
     0x03,                   // bmAttributes: interrupt
     8, 0x00,                // wMaxPacketSize (our report is 6 bytes)
-    10                      // bInterval
+    // bInterval. This device reports bcdUSB 2.00 and lives on EHCI, so the field
+    // is LOGARITHMIC, not a plain frame count: the period is
+    // 2^(bInterval-1) microframes x 125us.
+    //   10 -> 2^9  = 512 microframes = 64ms  ->  ~15 position updates/sec
+    //    7 -> 2^6  =  64 microframes =  8ms  ->  ~125/sec
+    // 15/sec is why the pointer tracked correctly but felt sluggish -- the
+    // position was right, it just could not be refreshed more than fifteen times
+    // a second. (Read as a full-speed frame count 10 would mean 100/sec, which is
+    // presumably how it was chosen; on high speed it means something six times
+    // slower.)
+    //
+    // 125/sec is a normal HID pointer rate and stays well under the ~300/sec that
+    // previously drowned the guest's HID queue -- though note that was caused by
+    // re-servicing already-retired qTDs, not by an honestly higher poll rate.
+    7                       // bInterval
 };
 
 // 6-byte report: buttons(1) + X(2, LE) + Y(2, LE) + wheel(1).
