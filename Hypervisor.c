@@ -3195,6 +3195,61 @@ long g_ahciAbarGuestAccesses = 0, g_ahciAbarFwAccesses = 0;
 double g_ps2ReassertMs = 50.0;
 #define PS2_REASSERT_MS g_ps2ReassertMs
 
+// PS/2 hot-path tracing. DEFAULT OFF, and that is a latency fix, not tidying.
+//
+// [ps2-key] (make AND break), [ps2-irq] and [ps2-out] each did printf + fflush
+// PER EVENT and were deliberately written unbounded, on the reasoning that
+// keystrokes are rare. They are -- but a single keystroke is 2 bytes, each byte
+// costs an interrupt attempt and a guest read, so one keypress became ~6
+// SYNCHRONOUS flushes to a multi-megabyte log on the same physical disk that
+// backs the guest's virtual drive. [ps2-irq] sits directly in the interrupt
+// delivery path, and [ps2-out] on the guest's port-0x60 read. Blocking there is
+// exactly what makes typing feel sluggish while the counters all read clean.
+// (Last run's log: 2.5 MB, and the run before hit 11 MB.)
+//
+// Set LOCALHOST_PS2_TRACE=1 to get the full byte-by-byte trace back when
+// diagnosing input; the rare, edge-triggered [ps2-stall] and [ps2-masked] logs
+// are always on, since they fire on trouble rather than per event.
+int g_ps2Trace = -1;
+static int ps2Trace(void) {
+    if (g_ps2Trace < 0) {
+        const char *e = getenv("LOCALHOST_PS2_TRACE");
+        g_ps2Trace = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_ps2Trace;
+}
+
+// Heartbeat pacing, for the same reason and with more impact.
+//
+// The heartbeat triggers on `exitCount % 5000`, and its own comment justifies a
+// register read inside it because "the guest now idles at ~64 exits/sec" -- at
+// that rate it fires once every ~78 seconds. Measured today: roughly TWICE A
+// SECOND, i.e. ~9,500 exits/sec, producing 12,917 lines and 1.79 MB of log in
+// 5.7 minutes. Every one of those does a WHvGetVirtualProcessorRegisters
+// hypercall plus ~20 printf+fflush pairs, synchronously, in the run loop.
+//
+// An exit-count trigger silently changes frequency whenever the guest's exit
+// rate changes, so the assumption it was tuned against expires without warning.
+// Gate on WALL TIME too: the exit counter still decides where to sample, the
+// clock decides how often, and a faster guest can no longer turn the diagnostic
+// into the bottleneck. LOCALHOST_HEARTBEAT_SEC overrides (0 = every trigger).
+double g_heartbeatMinSec = -1.0;
+static int heartbeatDue(void) {
+    static LARGE_INTEGER last = { 0 };
+    LARGE_INTEGER now;
+    if (g_heartbeatMinSec < 0.0) {
+        const char *e = getenv("LOCALHOST_HEARTBEAT_SEC");
+        g_heartbeatMinSec = (e && e[0]) ? atof(e) : 2.0;
+    }
+    if (g_heartbeatMinSec <= 0.0 || !perfFrequency.QuadPart) return 1;
+    QueryPerformanceCounter(&now);
+    if (last.QuadPart == 0) { last = now; return 1; }
+    if ((double)(now.QuadPart - last.QuadPart) / (double)perfFrequency.QuadPart < g_heartbeatMinSec)
+        return 0;
+    last = now;
+    return 1;
+}
+
 unsigned char kbQueue[PS2_QUEUE_SIZE];
 int kbHead = 0, kbTail = 0;
 
@@ -3636,12 +3691,14 @@ int ps2ServiceOutputIrq(WHV_PARTITION_HANDLE partition) {
         // accepted the request. Paired with [ps2-out] it gives the whole path from
         // queued byte to guest read. PS/2 attempts are rare (keystrokes plus one
         // re-assert per 50ms), so this cannot flood the way an RTC-rate log would.
-        printf("[ps2-irq] head=0x%02X seq=%lu -> %s (apicOk +%ld, apicFail +%ld) queueDepth=%d\n",
-               kbQueue[kbHead], seq,
-               delivered ? "raised" : "REFUSED",
-               g_reqIrqOk - apicOkBefore, g_reqIrqFail - apicFailBefore,
-               (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE);
-        fflush(stdout);
+        if (ps2Trace()) {
+            printf("[ps2-irq] head=0x%02X seq=%lu -> %s (apicOk +%ld, apicFail +%ld) queueDepth=%d\n",
+                   kbQueue[kbHead], seq,
+                   delivered ? "raised" : "REFUSED",
+                   g_reqIrqOk - apicOkBefore, g_reqIrqFail - apicFailBefore,
+                   (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE);
+            fflush(stdout);
+        }
         if (!delivered) {
             g_kbIrqMasked++;
             // WHY it was refused. The heartbeat's "masked" total conflates a
@@ -4055,10 +4112,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // and stdout is a file here, so there is no cost -- and every bounded
             // or change-gated version of this has left it ambiguous whether a key
             // was missing or merely unprinted.
-            printf("[ps2-key] #%ld WM_KEYDOWN vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
-                   g_kbVkLogged, (unsigned)wParam, sc, ext ? " (E0)" : "",
-                   (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
-            fflush(stdout);
+            if (ps2Trace()) {
+                printf("[ps2-key] #%ld WM_KEYDOWN vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
+                       g_kbVkLogged, (unsigned)wParam, sc, ext ? " (E0)" : "",
+                       (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
+                fflush(stdout);
+            }
             if (sc != 0) {
                 // Extended keys go out as 0xE0 then the make code. Without the
                 // prefix the guest reads a keypad key instead -- see vkToScancode.
@@ -4076,11 +4135,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // WM_KEYDOWN and no WM_KEYUP reads exactly like "we never send break
             // codes and the guest is holding every key down" -- a wrong diagnosis
             // this very log led to. Make/break pairing is now visible directly.
-            printf("[ps2-key] #%ld WM_KEYUP   vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
-                   g_kbVkLogged, (unsigned)wParam, (unsigned char)(sc | 0x80),
-                   ext ? " (E0)" : "",
-                   (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
-            fflush(stdout);
+            if (ps2Trace()) {
+                printf("[ps2-key] #%ld WM_KEYUP   vk=0x%02X -> sc=0x%02X%s  queueDepth=%d dropped=%ld\n",
+                       g_kbVkLogged, (unsigned)wParam, (unsigned char)(sc | 0x80),
+                       ext ? " (E0)" : "",
+                       (kbTail - kbHead + PS2_QUEUE_SIZE) % PS2_QUEUE_SIZE, g_kbDropped);
+                fflush(stdout);
+            }
             if (sc != 0) {
                 // Break codes carry the same 0xE0 prefix as their make codes; a
                 // release without it leaves the guest holding the key down.
@@ -13428,7 +13489,7 @@ int main(int argc, char *argv[]) {
         // walking guest memory on every single exit would dominate the loop.
         usbServiceSchedules(partition);
 
-        if (exitCount % 5000 == 0) {
+        if (exitCount % 5000 == 0 && heartbeatDue()) {
             static LARGE_INTEGER startTick = { 0 };
             LARGE_INTEGER nowTick;
             QueryPerformanceCounter(&nowTick);
@@ -14919,9 +14980,11 @@ int main(int argc, char *argv[]) {
                             // from the change-gated heartbeat, so a stale snapshot was
                             // indistinguishable from a byte that never moved -- which
                             // is exactly the question here.
-                            printf("[ps2-out] #%ld guest read scancode 0x%02X\n",
-                                   g_kbLastReadCount, returnValue);
-                            fflush(stdout);
+                            if (ps2Trace()) {
+                                printf("[ps2-out] #%ld guest read scancode 0x%02X\n",
+                                       g_kbLastReadCount, returnValue);
+                                fflush(stdout);
+                            }
                         }
                         else if (auxHasData()) {
                             // Count what the guest actually CONSUMES. g_auxPackets
