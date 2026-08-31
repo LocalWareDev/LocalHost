@@ -6992,6 +6992,24 @@ volatile LONG g_tabletDirty = 0;
 //   a large JUMP per change              -> positions are being lost upstream,
 //                                           and a higher rate will not help
 // Recorded per heartbeat window so a burst of movement is not averaged away.
+// U112: interval between HID reports actually DELIVERED on the interrupt
+// endpoint. This is the discriminator the loop measurement pointed to.
+//
+// The pointer freezes for 260ms-1.5s while the main loop never stalls, so the
+// break is downstream. Two very different causes, and this separates them:
+//   report gaps ALSO long  -> the guest stopped polling, or the EHCI path
+//                             stopped completing qTDs. Fix the transfer side.
+//   report gaps STAY SHORT -> we poll and deliver fine, but the POSITION we
+//                             report is not changing -- so the fault is in the
+//                             sampling (GetCursorPos, or the guard that ignores
+//                             the pointer when it is outside the client area),
+//                             not in USB at all.
+// Declared HERE, beside the other tablet counters, because the report path that
+// updates them sits earlier in the file than usbServiceSchedules does.
+double g_repMaxGapMs = 0.0;
+long g_repStalls50 = 0, g_repStalls200 = 0, g_repCount = 0;
+LARGE_INTEGER g_repLast;
+
 double g_tabMaxGapMs = 0.0;      // worst interval between two CHANGED positions
 double g_tabSumGapMs = 0.0;      // for the mean
 long   g_tabChanges = 0;         // reports whose coordinates actually differed
@@ -7336,6 +7354,24 @@ static int ehciRunQueueHead(UINT64 qh) {
                             }
                         }
                     }
+                    // U112: interval between DELIVERED reports, regardless of
+                    // whether the position changed. Compare against the tablet
+                    // motion gaps: if reports keep flowing at ~16ms while the
+                    // position sits still, USB is fine and the sampling is at
+                    // fault.
+                    {
+                        LARGE_INTEGER rnow;
+                        QueryPerformanceCounter(&rnow);
+                        if (g_repLast.QuadPart && perfFrequency.QuadPart) {
+                            double rg = (double)(rnow.QuadPart - g_repLast.QuadPart)
+                                        * 1000.0 / (double)perfFrequency.QuadPart;
+                            if (rg > g_repMaxGapMs) g_repMaxGapMs = rg;
+                            if (rg > 50.0)  g_repStalls50++;
+                            if (rg > 200.0) g_repStalls200++;
+                        }
+                        g_repLast = rnow;
+                        g_repCount++;
+                    }
                     // U110: characterise the stream -- gap between changes, and
                     // how far the pointer moved in each one.
                     {
@@ -7561,6 +7597,7 @@ static LARGE_INTEGER g_usbLastServiceTick;
 // U111: main-loop period, sampled where the USB throttle already measures it.
 double g_usbSvcMaxGapMs = 0.0;
 long g_usbSvcStalls50 = 0, g_usbSvcStalls200 = 0, g_usbSvcCalls = 0;
+
 void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -13760,6 +13797,12 @@ int main(int argc, char *argv[]) {
                        g_usbSvcStalls50,  g_usbSvcStalls50  / (g_heartbeatMinSec > 0 ? g_heartbeatMinSec : 1.0),
                        g_usbSvcStalls200, g_usbSvcStalls200 / (g_heartbeatMinSec > 0 ? g_heartbeatMinSec : 1.0));
                 g_usbSvcMaxGapMs = 0.0; g_usbSvcStalls50 = 0; g_usbSvcStalls200 = 0; g_usbSvcCalls = 0;
+                // U112: delivered-report interval. Read this NEXT TO the tablet
+                // motion line: reports short + motion long => sampling is at
+                // fault, not USB.
+                printf("[heartbeat]   report gap: n=%ld max=%.1fms | >50ms=%ld >200ms=%ld\n",
+                       g_repCount, g_repMaxGapMs, g_repStalls50, g_repStalls200);
+                g_repMaxGapMs = 0.0; g_repStalls50 = 0; g_repStalls200 = 0; g_repCount = 0;
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
                        " reclaimed=%ld | reply latency worst=%.0f ms, over-2s=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
