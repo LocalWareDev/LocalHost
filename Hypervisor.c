@@ -7558,12 +7558,29 @@ static void ehciDumpIntQh(const char *why) {
 // seconds while the guest was still busy after Setup painted, then froze -- no
 // input meant no exits meant no polling meant no input.
 static LARGE_INTEGER g_usbLastServiceTick;
+// U111: main-loop period, sampled where the USB throttle already measures it.
+double g_usbSvcMaxGapMs = 0.0;
+long g_usbSvcStalls50 = 0, g_usbSvcStalls200 = 0, g_usbSvcCalls = 0;
 void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (g_usbLastServiceTick.QuadPart != 0) {
         double ms = (double)(now.QuadPart - g_usbLastServiceTick.QuadPart) * 1000.0 /
                     (double)perfFrequency.QuadPart;
+        // U111: is the VM LOOP stalling, or is the guest just not polling?
+        //
+        // The pointer freezes for 260ms-1.5s and then teleports. The average gap
+        // between position changes is already correct (15-21ms at 62Hz), so the
+        // latency that is actually felt is these stalls, not the configured rate.
+        // This function is called once per main-loop iteration, so the interval
+        // between calls IS the main loop's period -- if that shows the same
+        // hundreds of milliseconds, the loop itself is stopping and the USB side
+        // is innocent. Costs nothing: the interval is already computed here for
+        // the 1kHz throttle.
+        if (ms > g_usbSvcMaxGapMs) g_usbSvcMaxGapMs = ms;
+        if (ms > 50.0)  g_usbSvcStalls50++;
+        if (ms > 200.0) g_usbSvcStalls200++;
+        g_usbSvcCalls++;
         if (ms < 1.0) return;                            // ~1kHz, one USB frame
     }
     g_usbLastServiceTick = now;
@@ -13734,6 +13751,15 @@ int main(int argc, char *argv[]) {
                     g_tabChanges = 0; g_tabSumGapMs = 0.0; g_tabMaxGapMs = 0.0;
                     g_tabSumJump = 0; g_tabMaxJump = 0;
                 }
+                // U111: the main loop's own period. If maxGap here matches the
+                // tablet's stall, the loop is stopping and USB is a bystander.
+                // Rates, not maxima, so windows of different length compare.
+                printf("[heartbeat]   loop period: calls=%ld max=%.1fms |"
+                       " >50ms=%ld (%.2f/s) >200ms=%ld (%.2f/s)\n",
+                       g_usbSvcCalls, g_usbSvcMaxGapMs,
+                       g_usbSvcStalls50,  g_usbSvcStalls50  / (g_heartbeatMinSec > 0 ? g_heartbeatMinSec : 1.0),
+                       g_usbSvcStalls200, g_usbSvcStalls200 / (g_heartbeatMinSec > 0 ? g_heartbeatMinSec : 1.0));
+                g_usbSvcMaxGapMs = 0.0; g_usbSvcStalls50 = 0; g_usbSvcStalls200 = 0; g_usbSvcCalls = 0;
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
                        " reclaimed=%ld | reply latency worst=%.0f ms, over-2s=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
