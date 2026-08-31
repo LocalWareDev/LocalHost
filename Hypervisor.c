@@ -6465,10 +6465,20 @@ void pciInitConfigSpaces(void) {
     // 0:4.0 -- EHCI USB 2.0 controller (ICH9 USB2 EHCI #1). Class 0C/03/20 is
     // what makes Windows load usbehci.sys against it; prog-IF 0x20 specifically
     // means EHCI (0x00 UHCI, 0x10 OHCI, 0x30 xHCI).
+#if LH_USE_XHCI
+    // Intel 7 Series/C210 xHCI. A real controller Windows' inbox USBXHCI.sys
+    // binds without hesitation -- same reasoning as the AHCI and RTL8139 IDs
+    // above: match a real chip so nothing keyed off vendor/device gets confused.
+    pciEhciConfig[0x00] = 0x86; pciEhciConfig[0x01] = 0x80; // vendor 0x8086 (Intel)
+    pciEhciConfig[0x02] = 0x31; pciEhciConfig[0x03] = 0x1E; // device 0x1E31 (7 Series xHCI)
+    pciEhciConfig[0x08] = 0x04; // revision ID
+    pciEhciConfig[0x09] = 0x30; // prog IF: xHCI
+#else
     pciEhciConfig[0x00] = 0x86; pciEhciConfig[0x01] = 0x80; // vendor 0x8086 (Intel)
     pciEhciConfig[0x02] = 0x3A; pciEhciConfig[0x03] = 0x29; // device 0x293A (ICH9 EHCI)
     pciEhciConfig[0x08] = 0x03; // revision ID
     pciEhciConfig[0x09] = 0x20; // prog IF: EHCI
+#endif
     pciEhciConfig[0x0A] = 0x03; // subclass: USB controller
     pciEhciConfig[0x0B] = 0x0C; // base class: serial bus controller
     pciEhciConfig[0x0E] = 0x00; // header type 0, single-function
@@ -9169,6 +9179,19 @@ int rtl8139HandleBar1Mmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEX
 
 #include "e1000_dev.c"
 
+// USB host controller selection. xHCI replaces EHCI on the same PCI function
+// (0:4.0) and the same GSI, so no DSDT/_PRT change is needed -- only the class
+// prog-IF changes, 0x20 (EHCI) -> 0x30 (xHCI).
+//
+// Kept as a switch rather than a straight deletion until xHCI is carrying the
+// tablet: this is the transport the pointer depends on, and "the mouse is gone"
+// is not a useful signal if it cannot be bisected against a known-good
+// controller. EHCI is removed once xHCI enumerates and reports.
+#define LH_USE_XHCI 1
+#if LH_USE_XHCI
+#include "xhci_dev.c"
+#endif
+
 // Handles I/O ports 0xCF8 (CONFIG_ADDRESS) and 0xCFC-0xCFF (CONFIG_DATA) --
 // see pciSelectConfigSpace above for what this stub does and doesn't model.
 int pciConfigAccessLogCount = 0;
@@ -9219,7 +9242,11 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
         } else if (cfg == pciRtl8139Config && baseOffset >= 0x14 && baseOffset <= 0x17) {
             rtl8139HandleBar1Access(partition, io, baseOffset, accessSize, &rax);
         } else if (cfg == pciEhciConfig && baseOffset >= 0x10 && baseOffset <= 0x13) {
+#if LH_USE_XHCI
+            xhciHandleBar0Access(io, baseOffset, accessSize, &rax);
+#else
             ehciHandleBar0Access(io, baseOffset, accessSize, &rax);
+#endif
         } else if (cfg != NULL && baseOffset <= 255) {
             if (io->AccessInfo.IsWrite) {
                 UINT32 i;
@@ -15495,9 +15522,15 @@ int main(int argc, char *argv[]) {
                 if (ahciHandleAbarMmio(partition, &exitContext)) { // U58: trapped ABAR
                     break;
                 }
+#if LH_USE_XHCI
+                if (xhciHandleMmio(partition, &exitContext)) { // USB 3.x controller
+                    break;
+                }
+#else
                 if (ehciHandleMmio(partition, &exitContext)) { // USB 2.0 controller
                     break;
                 }
+#endif
                 if (e1000HandleMmio(partition, &exitContext)) { // Intel 82540EM
                     break;
                 }
