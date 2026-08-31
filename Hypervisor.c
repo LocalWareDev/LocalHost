@@ -20,7 +20,11 @@
 // wrong register map: the trace showed writes to "reserved" offsets that are
 // EHCI's USBINTR, FRINDEX, PERIODICLISTBASE, ASYNCLISTADDR and CONFIGFLAG, and
 // a USBCMD bit 16 that is EHCI's Interrupt Threshold Control.
-#define LH_USE_XHCI 1
+// 0 while the xHCI model is incomplete: Windows binds USBXHCI.sys but loops
+// through init/teardown without programming a ring, so the tablet does not
+// enumerate and the guest has NO pointer. EHCI carries it today. Set to 1 to
+// resume the xHCI work (next step there: MSI/MSI-X, see xhci_dev.c).
+#define LH_USE_XHCI 0
 
 #define _WIN32_WINNT 0x0A00
 // winsock2.h must come before windows.h (it defines _WINSOCKAPI_, which
