@@ -7598,6 +7598,13 @@ static LARGE_INTEGER g_usbLastServiceTick;
 double g_usbSvcMaxGapMs = 0.0;
 long g_usbSvcStalls50 = 0, g_usbSvcStalls200 = 0, g_usbSvcCalls = 0;
 
+// U113: exit attribution. 65536 counters is 256KB, allocated once -- worth it
+// for an exact port histogram rather than a lossy top-N guess.
+long g_exitReasonCount[16];
+UINT32 *g_ioPortHist = NULL;
+UINT64 g_mmioPage[8];
+long g_mmioPageHits[8];
+
 void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -12792,6 +12799,11 @@ int main(int argc, char *argv[]) {
 
     netBackendInit();
 
+    // U113: exact I/O port histogram for exit attribution. 65536 counters,
+    // 256KB, allocated once. If it fails the histogram is simply skipped --
+    // a diagnostic must never be the reason the VM does not start.
+    g_ioPortHist = (UINT32 *)calloc(65536, sizeof(UINT32));
+
     // argv[1]: VM name shown in the window title (defaults to "Guest Display")
     // argv[2]: path to the BIOS image to load (defaults to "bios.bin")
     // argv[3]: path to the raw disk image backing the primary ATA drive (optional)
@@ -13803,6 +13815,43 @@ int main(int argc, char *argv[]) {
                 printf("[heartbeat]   report gap: n=%ld max=%.1fms | >50ms=%ld >200ms=%ld\n",
                        g_repCount, g_repMaxGapMs, g_repStalls50, g_repStalls200);
                 g_repMaxGapMs = 0.0; g_repStalls50 = 0; g_repStalls200 = 0; g_repCount = 0;
+                // U113: where the exits actually come from.
+                {
+                    long tot = 0; int k;
+                    for (k = 0; k < 16; k++) tot += g_exitReasonCount[k];
+                    printf("[heartbeat]   exits: total=%ld | mmio=%ld io=%ld halt=%ld cpuid=%ld"
+                           " exc=%ld cancel=%ld msr=%ld other=%ld\n", tot,
+                           g_exitReasonCount[0], g_exitReasonCount[1],
+                           g_exitReasonCount[2], g_exitReasonCount[3],
+                           g_exitReasonCount[4], g_exitReasonCount[5],
+                           g_exitReasonCount[6], g_exitReasonCount[7]);
+                    if (g_ioPortHist) {
+                        int top[6] = { -1,-1,-1,-1,-1,-1 };
+                        int i2, j2;
+                        for (i2 = 0; i2 < 65536; i2++) {
+                            if (!g_ioPortHist[i2]) continue;
+                            for (j2 = 0; j2 < 6; j2++) {
+                                if (top[j2] < 0 || g_ioPortHist[i2] > g_ioPortHist[top[j2]]) {
+                                    int m; for (m = 5; m > j2; m--) top[m] = top[m-1];
+                                    top[j2] = i2; break;
+                                }
+                            }
+                        }
+                        printf("[heartbeat]   top io ports:");
+                        for (j2 = 0; j2 < 6; j2++)
+                            if (top[j2] >= 0) printf(" 0x%X=%lu", top[j2], (unsigned long)g_ioPortHist[top[j2]]);
+                        printf("\n");
+                        memset(g_ioPortHist, 0, 65536 * sizeof(UINT32));
+                    }
+                    printf("[heartbeat]   top mmio pages:");
+                    for (k = 0; k < 8; k++)
+                        if (g_mmioPageHits[k]) printf(" 0x%llX=%ld", (unsigned long long)(g_mmioPage[k] << 12), g_mmioPageHits[k]);
+                    printf("\n");
+                    memset(g_exitReasonCount, 0, sizeof(g_exitReasonCount));
+                    memset(g_mmioPageHits, 0, sizeof(g_mmioPageHits));
+                    memset(g_mmioPage, 0, sizeof(g_mmioPage));
+                    fflush(stdout);
+                }
                 printf("[heartbeat]   net UDP: out=%ld outFail=%ld in=%ld noSession=%ld"
                        " reclaimed=%ld | reply latency worst=%.0f ms, over-2s=%ld\n",
                        g_netUdpOut, g_netUdpOutFail, g_netUdpIn, g_netUdpNoSession,
@@ -14455,6 +14504,43 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // U113: attribute the exits. The guest sits at ~9000 exits/sec while
+        // IDLE, which is the number that silently broke the heartbeat's
+        // exit-count trigger (tuned when it was ~64/sec) and is the most likely
+        // reason the guest is CPU-saturated and slow to redraw its own cursor.
+        // "How many exits" has never been broken down by CAUSE, so there is
+        // nothing to aim a fix at. Count by reason, and for I/O by port, so the
+        // top consumer can simply be read off.
+        {
+            // Map the reason to a dense slot. NOT a mask: the WHP values are not
+            // contiguous -- Cpuid is 0x1001 and Exception 0x1002, so masking with
+            // &15 aliases them onto MemoryAccess and IoPort and silently reports
+            // identical counts for unrelated causes. (It did exactly that here.)
+            UINT32 r;
+            switch (exitContext.ExitReason) {
+                case WHvRunVpExitReasonMemoryAccess:    r = 0; break;
+                case WHvRunVpExitReasonX64IoPortAccess: r = 1; break;
+                case WHvRunVpExitReasonX64Halt:         r = 2; break;
+                case WHvRunVpExitReasonX64Cpuid:        r = 3; break;
+                case WHvRunVpExitReasonException:       r = 4; break;
+                case WHvRunVpExitReasonCanceled:        r = 5; break;
+                case WHvRunVpExitReasonX64MsrAccess:    r = 6; break;
+                default:                                r = 7; break;
+            }
+            g_exitReasonCount[r]++;
+            if (exitContext.ExitReason == WHvRunVpExitReasonX64IoPortAccess) {
+                if (g_ioPortHist) g_ioPortHist[exitContext.IoPortAccess.PortNumber & 0xFFFF]++;
+            } else if (exitContext.ExitReason == WHvRunVpExitReasonMemoryAccess) {
+                // Bucket MMIO by 4KB page; the address itself is too sparse to
+                // histogram and the page is what identifies the device.
+                UINT64 pg = exitContext.MemoryAccess.Gpa >> 12;
+                int k;
+                for (k = 0; k < 8; k++) {
+                    if (g_mmioPage[k] == pg) { g_mmioPageHits[k]++; break; }
+                    if (g_mmioPageHits[k] == 0) { g_mmioPage[k] = pg; g_mmioPageHits[k] = 1; break; }
+                }
+            }
+        }
         switch (exitContext.ExitReason) {
             case WHvRunVpExitReasonX64Halt: {
                 // Don't stop the hypervisor -- park the CPU and wait for an
