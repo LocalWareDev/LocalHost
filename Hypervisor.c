@@ -4,6 +4,24 @@
 // docs/investigations/vppt-synic-blocker.md for the full investigation
 // before re-attempting a fix here.
 
+// USB host controller selection. xHCI replaces EHCI on the same PCI function
+// (0:4.0) and the same GSI, so no DSDT/_PRT change is needed -- only the class
+// prog-IF changes, 0x20 (EHCI) -> 0x30 (xHCI).
+//
+// Kept as a switch rather than a straight deletion until xHCI is carrying the
+// tablet: this is the transport the pointer depends on, and "the mouse is gone"
+// is not a bisectable signal on its own. EHCI goes once xHCI reports.
+//
+// MUST BE DEFINED HERE, at the top. It first lived beside the xhci_dev.c
+// include far down the file, which is AFTER pciInitConfigSpaces -- so the #if
+// there chose the EHCI branch, the device advertised prog-IF 0x20 and Intel
+// ICH9 EHCI IDs, and Windows dutifully loaded usbehci.sys and spoke EHCI at our
+// xHCI register model. That cost a full debug cycle and looked exactly like a
+// wrong register map: the trace showed writes to "reserved" offsets that are
+// EHCI's USBINTR, FRINDEX, PERIODICLISTBASE, ASYNCLISTADDR and CONFIGFLAG, and
+// a USBCMD bit 16 that is EHCI's Interrupt Threshold Control.
+#define LH_USE_XHCI 1
+
 #define _WIN32_WINNT 0x0A00
 // winsock2.h must come before windows.h (it defines _WINSOCKAPI_, which
 // stops windows.h from pulling in the legacy winsock.h and conflicting).
@@ -6466,12 +6484,17 @@ void pciInitConfigSpaces(void) {
     // what makes Windows load usbehci.sys against it; prog-IF 0x20 specifically
     // means EHCI (0x00 UHCI, 0x10 OHCI, 0x30 xHCI).
 #if LH_USE_XHCI
-    // Intel 7 Series/C210 xHCI. A real controller Windows' inbox USBXHCI.sys
-    // binds without hesitation -- same reasoning as the AHCI and RTL8139 IDs
-    // above: match a real chip so nothing keyed off vendor/device gets confused.
-    pciEhciConfig[0x00] = 0x86; pciEhciConfig[0x01] = 0x80; // vendor 0x8086 (Intel)
-    pciEhciConfig[0x02] = 0x31; pciEhciConfig[0x03] = 0x1E; // device 0x1E31 (7 Series xHCI)
-    pciEhciConfig[0x08] = 0x04; // revision ID
+    // NEC/Renesas uPD720200, the same controller QEMU presents. Deliberately NOT
+    // an Intel part: the first attempt used Intel 0x1E31 (7 Series) and Windows
+    // wrote bit 16 of USBCMD, which xHCI does not define -- the signature of a
+    // chipset-specific quirk path (Intel controllers carry extra port-routing
+    // registers like XUSB2PR that we do not model). Matching a real chip is
+    // usually the right instinct, and it is what the AHCI and RTL8139 IDs do,
+    // but here it invites initialisation we cannot answer. A generic controller
+    // binds the same inbox USBXHCI.sys by class code 0C0330 with no quirks.
+    pciEhciConfig[0x00] = 0x33; pciEhciConfig[0x01] = 0x10; // vendor 0x1033 (NEC)
+    pciEhciConfig[0x02] = 0x94; pciEhciConfig[0x03] = 0x01; // device 0x0194 (uPD720200)
+    pciEhciConfig[0x08] = 0x03; // revision ID
     pciEhciConfig[0x09] = 0x30; // prog IF: xHCI
 #else
     pciEhciConfig[0x00] = 0x86; pciEhciConfig[0x01] = 0x80; // vendor 0x8086 (Intel)
@@ -9179,15 +9202,6 @@ int rtl8139HandleBar1Mmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEX
 
 #include "e1000_dev.c"
 
-// USB host controller selection. xHCI replaces EHCI on the same PCI function
-// (0:4.0) and the same GSI, so no DSDT/_PRT change is needed -- only the class
-// prog-IF changes, 0x20 (EHCI) -> 0x30 (xHCI).
-//
-// Kept as a switch rather than a straight deletion until xHCI is carrying the
-// tablet: this is the transport the pointer depends on, and "the mouse is gone"
-// is not a useful signal if it cannot be bisected against a known-good
-// controller. EHCI is removed once xHCI enumerates and reports.
-#define LH_USE_XHCI 1
 #if LH_USE_XHCI
 #include "xhci_dev.c"
 #endif

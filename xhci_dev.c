@@ -111,7 +111,12 @@ UINT32 xhciDnctrl = 0;
 UINT64 xhciCrcr = 0;             // command ring control (pointer + flags)
 UINT64 xhciDcbaap = 0;
 UINT32 xhciConfig = 0;
-UINT32 xhciPortsc = XHCI_PORTSC_PP;   // powered, nothing attached yet
+// Powered, WITH the device already present. The tablet is soldered in as far as
+// the guest is concerned -- it is not hot-plugged, so reporting an empty port
+// until the controller is started models something that never happens. Windows
+// inspects ports during initialisation, before it sets RUN, and an xHCI with no
+// ports worth enabling is a plausible thing for it to give up on.
+UINT32 xhciPortsc = XHCI_PORTSC_PP | XHCI_PORTSC_CCS | XHCI_PORTSC_CSC;
 
 // runtime / interrupter 0
 UINT32 xhciIman = 0, xhciImod = 0, xhciErstsz = 0;
@@ -266,6 +271,48 @@ static void xhciAttachPort(WHV_PARTITION_HANDLE partition) {
                   ((UINT32)TRB_PORT_STATUS_EVENT << 10));
 }
 
+// Name a BAR offset, so the trace says what the driver thinks it is touching
+// rather than leaving me to subtract CAPLENGTH by hand for every line.
+static const char *xhciRegName(UINT32 off) {
+    if (off < XHCI_CAPLENGTH) {
+        switch (off) {
+            case 0x00: return "CAPLENGTH/HCIVERSION";
+            case 0x04: return "HCSPARAMS1";
+            case 0x08: return "HCSPARAMS2";
+            case 0x0C: return "HCSPARAMS3";
+            case 0x10: return "HCCPARAMS1";
+            case 0x14: return "DBOFF";
+            case 0x18: return "RTSOFF";
+            default:   return "cap?";
+        }
+    }
+    if (off >= 0x500 && off < 0x520) return "extcap";
+    if (off >= XHCI_DBOFF)  return "doorbell";
+    if (off >= XHCI_RTSOFF) {
+        switch (off - XHCI_RTSOFF) {
+            case 0x20: return "IMAN";   case 0x24: return "IMOD";
+            case 0x28: return "ERSTSZ"; case 0x30: return "ERSTBA.lo";
+            case 0x34: return "ERSTBA.hi"; case 0x38: return "ERDP.lo";
+            case 0x3C: return "ERDP.hi"; default: return "rt?";
+        }
+    }
+    switch (off - XHCI_CAPLENGTH) {
+        case 0x00: return "op:USBCMD";
+        case 0x04: return "op:USBSTS";
+        case 0x08: return "op:PAGESIZE";
+        case 0x14: return "op:DNCTRL";
+        case 0x18: return "op:CRCR.lo";
+        case 0x1C: return "op:CRCR.hi";
+        case 0x30: return "op:DCBAAP.lo";
+        case 0x34: return "op:DCBAAP.hi";
+        case 0x38: return "op:CONFIG";
+        case 0x400: return "op:PORTSC";
+        case 0x404: return "op:PORTPMSC";
+        case 0x408: return "op:PORTLI";
+        default:   return "op:RESERVED";
+    }
+}
+
 // --- MMIO ------------------------------------------------------------------
 UINT64 xhciRegRead(UINT32 off, UINT32 size) {
     UINT64 v = 0;
@@ -273,7 +320,12 @@ UINT64 xhciRegRead(UINT32 off, UINT32 size) {
     if (off < XHCI_CAPLENGTH) {
         switch (off) {
             case 0x00: v = XHCI_CAPLENGTH | (0x0100u << 16); break;  // CAPLENGTH + HCIVERSION 1.0
-            case 0x04: v = (XHCI_MAX_SLOTS) | (1u << 8) | ((UINT32)XHCI_MAX_PORTS << 24); break; // HCSPARAMS1
+            // HCSPARAMS1: MaxSlots 7:0, MaxIntrs 18:8, MaxPorts 31:24.
+            // We only ever hand out one slot, but ADVERTISING one is a different
+            // thing: the driver sizes its device-context array from this and a
+            // controller claiming a single slot is unusual enough to be a
+            // plausible reason to refuse. Advertise 32, use 1.
+            case 0x04: v = 32u | (1u << 8) | ((UINT32)XHCI_MAX_PORTS << 24); break;
             case 0x08: v = 0; break;                                  // HCSPARAMS2
             case 0x0C: v = 0; break;                                  // HCSPARAMS3
             // HCCPARAMS1. AC64=0 (32-bit addressing), CSZ=0 (32-byte contexts),
@@ -286,7 +338,10 @@ UINT64 xhciRegRead(UINT32 off, UINT32 size) {
             // willing to use, and it stops after resetting the controller --
             // which is exactly what happened here (reset logged, then silence,
             // setups=0 configured=0).
-            case 0x10: v = (0x140u << 16); break;
+            // AC64 (bit 0) set: we address guest memory as 64-bit throughout, and
+            // a controller that cannot do 64-bit addressing is a constraint the
+            // driver has to work around rather than a capability it needs.
+            case 0x10: v = (0x140u << 16) | 0x1u; break;
             case 0x14: v = XHCI_DBOFF; break;
             case 0x18: v = XHCI_RTSOFF; break;
             default: v = 0; break;
@@ -402,7 +457,8 @@ void xhciRegWrite(WHV_PARTITION_HANDLE partition, UINT32 off, UINT32 size, UINT6
                 xhciCmdRingPtr = 0; xhciCmdCcs = 1;
                 xhciEventRingBase = xhciEventEnqueue = 0; xhciEventRingSize = 0;
                 xhciEventPcs = 1; xhciSlotId = 0; xhciDeviceAddressed = 0;
-                xhciPortAttached = 0; xhciPortsc = XHCI_PORTSC_PP;
+                xhciPortAttached = 0;
+                xhciPortsc = XHCI_PORTSC_PP | XHCI_PORTSC_CCS | XHCI_PORTSC_CSC;
                 xhciIman = xhciImod = xhciErstsz = 0; xhciErstba = xhciErdp = 0;
                 printf("[xhci] host controller reset\n"); fflush(stdout);
                 break;
@@ -462,11 +518,80 @@ int xhciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
     int len = rtl8139FetchInsn(partition, exitContext, insn);
     int isWrite = 0, isImm = 0, regNum = 0, insnLen = 0;
     UINT32 imm = 0;
+
+    // REP MOVSD / REP MOVSQ out of our register space.
+    //
+    // USBXHCI reads the extended capability list with a STRING COPY, not a
+    // sequence of MOVs -- observed as F3 A5 at offset 0x500. The generic decoder
+    // handles single-operand moves only, so it failed, the read went unserved,
+    // and the driver gave up and had Windows restart the device. Nothing about
+    // that failure was visible except a repeated BAR reprogramming.
+    //
+    // Emulate it directly: copy RCX elements from our register model at RSI into
+    // guest memory at RDI, then retire the whole instruction at once (RCX=0), as
+    // the REP prefix would.
+    if (len >= 2 && insn[0] == 0xF3 &&
+        (insn[1] == 0xA5 || (len >= 3 && (insn[1] & 0xF8) == 0x48 && insn[2] == 0xA5))) {
+        int wide = (insn[1] != 0xA5);             // REX.W -> MOVSQ, 8 bytes
+        int stride = wide ? 8 : 4;
+        int skip = wide ? 3 : 2;
+        WHV_REGISTER_NAME rn[4] = { WHvX64RegisterRsi, WHvX64RegisterRdi,
+                                    WHvX64RegisterRcx, WHvX64RegisterRip };
+        WHV_REGISTER_VALUE rv[4] = { 0 };
+        WHvGetVirtualProcessorRegisters(partition, 0, rn, 4, rv);
+        UINT64 rsi = rv[0].Reg64, rdi = rv[1].Reg64, rcx = rv[2].Reg64;
+        UINT64 n = rcx, i;
+        if (n > 1024) n = 1024;                   // sanity bound
+        for (i = 0; i < n; i++) {
+            UINT64 src = rsi + i * stride;
+            if (src < xhciBarBase || src + stride > (UINT64)xhciBarBase + XHCI_BAR_SIZE) break;
+            UINT32 o = (UINT32)(src - xhciBarBase);
+            UINT64 lo = xhciRegRead(o, 4);
+            xhciWrite32(rdi + i * stride, (UINT32)lo);
+            if (wide) xhciWrite32(rdi + i * stride + 4, (UINT32)xhciRegRead(o + 4, 4));
+        }
+        rv[0].Reg64 = rsi + n * stride;
+        rv[1].Reg64 = rdi + n * stride;
+        rv[2].Reg64 = rcx - n;
+        rv[3].Reg64 = exitContext->VpContext.Rip + skip;
+        WHvSetVirtualProcessorRegisters(partition, 0, rn, 4, rv);
+        return 1;
+    }
+
+    // 8-bit read, MOV r8, r/m8 (opcode 8A). The firmware reads CAPLENGTH a byte
+    // at a time -- CAPLENGTH is genuinely a byte field, so this is the natural
+    // way to read it, not an oddity.
+    if (len >= 2 && insn[0] == 0x8A) {
+        unsigned char modrm = insn[1];
+        int reg = (modrm >> 3) & 7;
+        int mod = (modrm >> 6) & 3;
+        int rmLen = 2;
+        if (mod == 1) rmLen += 1; else if (mod == 2) rmLen += 4;
+        if ((modrm & 7) == 4) rmLen += 1;         // SIB
+        UINT64 v = xhciRegRead(off, 1) & 0xFF;
+        WHV_REGISTER_VALUE rv = { 0 };
+        WHvGetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[reg], 1, &rv);
+        rv.Reg64 = (rv.Reg64 & ~0xFFULL) | v;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[reg], 1, &rv);
+        WHV_REGISTER_NAME ripN = WHvX64RegisterRip;
+        WHV_REGISTER_VALUE ripV = { 0 };
+        ripV.Reg64 = exitContext->VpContext.Rip + rmLen;
+        WHvSetVirtualProcessorRegisters(partition, 0, &ripN, 1, &ripV);
+        return 1;
+    }
     if (!ioapicDecodeMmio(insn, len, &isWrite, &isImm, &regNum, &imm, &insnLen)) {
+        // Dump the BYTES. "undecodable" without the opcode is not actionable --
+        // and this is fatal, not cosmetic: returning 0 leaves the access
+        // unhandled, so the driver gets nothing, gives up, and Windows restarts
+        // the device (seen as repeated BAR reprogramming).
         static int failLog = 0;
         if (failLog++ < 12) {
-            printf("[xhci-mmio] undecodable instruction at rip=0x%llX off=0x%03X\n",
-                   (unsigned long long)exitContext->VpContext.Rip, off);
+            int bi;
+            printf("[xhci-mmio] UNDECODABLE at rip=0x%llX off=0x%03X (%s) len=%d:",
+                   (unsigned long long)exitContext->VpContext.Rip, off,
+                   xhciRegName(off), len);
+            for (bi = 0; bi < len && bi < 16; bi++) printf(" %02X", insn[bi]);
+            printf("\n");
             fflush(stdout);
         }
         return 0;
@@ -497,7 +622,10 @@ int xhciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
         if (doTrace) {
             if (sameCount > 1) printf("[xhci-io]   (previous read x%ld)\n", sameCount);
             sameCount = 0; lastOff = 0xFFFFFFFF;
-            printf("[xhci-io] W +0x%03X = 0x%08X\n", off, value);
+            // Print the OPERATIONAL offset alongside the raw BAR offset. Doing
+            // "off - CAPLENGTH" in my head across several competing theories is
+            // how the port-register-set mistake survived a whole debug cycle.
+            printf("[xhci-io] W +0x%03X (%s) = 0x%08X\n", off, xhciRegName(off), value);
             fflush(stdout);
             xhciTrace++;
         }
@@ -509,7 +637,7 @@ int xhciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
                 sameCount++;
             } else {
                 if (sameCount > 1) printf("[xhci-io]   (previous read x%ld)\n", sameCount);
-                printf("[xhci-io] R +0x%03X -> 0x%08X\n", off, (UINT32)v);
+                printf("[xhci-io] R +0x%03X (%s) -> 0x%08X\n", off, xhciRegName(off), (UINT32)v);
                 fflush(stdout);
                 xhciTrace++;
                 lastOff = off; sameCount = 1;
