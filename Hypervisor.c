@@ -7603,6 +7603,7 @@ long g_usbSvcStalls50 = 0, g_usbSvcStalls200 = 0, g_usbSvcCalls = 0;
 long g_exitReasonCount[16];
 UINT32 *g_ioPortHist = NULL;
 UINT64 g_mmioPage[8];
+long g_ehciOffHist[256];   // U114: byte offset within the EHCI register page
 long g_mmioPageHits[8];
 
 void usbServiceSchedules(WHV_PARTITION_HANDLE partition) {
@@ -13847,6 +13848,27 @@ int main(int argc, char *argv[]) {
                     for (k = 0; k < 8; k++)
                         if (g_mmioPageHits[k]) printf(" 0x%llX=%ld", (unsigned long long)(g_mmioPage[k] << 12), g_mmioPageHits[k]);
                     printf("\n");
+                    // U114: which EHCI register. Offsets are the operational
+                    // registers: 0x00 CAPLENGTH/HCIVERSION, 0x04 HCSPARAMS,
+                    // 0x20 USBCMD, 0x24 USBSTS, 0x28 USBINTR, 0x2C FRINDEX,
+                    // 0x34 ASYNCLISTADDR, 0x44 PORTSC[0].
+                    {
+                        int t2[5] = { -1,-1,-1,-1,-1 }; int i3, j3;
+                        for (i3 = 0; i3 < 256; i3++) {
+                            if (!g_ehciOffHist[i3]) continue;
+                            for (j3 = 0; j3 < 5; j3++) {
+                                if (t2[j3] < 0 || g_ehciOffHist[i3] > g_ehciOffHist[t2[j3]]) {
+                                    int m2; for (m2 = 4; m2 > j3; m2--) t2[m2] = t2[m2-1];
+                                    t2[j3] = i3; break;
+                                }
+                            }
+                        }
+                        printf("[heartbeat]   top ehci regs:");
+                        for (j3 = 0; j3 < 5; j3++)
+                            if (t2[j3] >= 0) printf(" +0x%02X=%ld", t2[j3], g_ehciOffHist[t2[j3]]);
+                        printf("\n");
+                        memset(g_ehciOffHist, 0, sizeof(g_ehciOffHist));
+                    }
                     memset(g_exitReasonCount, 0, sizeof(g_exitReasonCount));
                     memset(g_mmioPageHits, 0, sizeof(g_mmioPageHits));
                     memset(g_mmioPage, 0, sizeof(g_mmioPage));
@@ -14539,6 +14561,14 @@ int main(int argc, char *argv[]) {
                     if (g_mmioPage[k] == pg) { g_mmioPageHits[k]++; break; }
                     if (g_mmioPageHits[k] == 0) { g_mmioPage[k] = pg; g_mmioPageHits[k] = 1; break; }
                 }
+                // U114: WHICH register. ~10000 accesses/sec to serve a 62Hz
+                // tablet is ~160 reads per useful report, which looks like a
+                // spin rather than normal polling -- and a spin has a specific
+                // register at the bottom of it. EHCI's operational registers all
+                // live in the first 256 bytes, so a byte-offset histogram over
+                // the busiest page names it directly.
+                if (ehciBarBase && (exitContext.MemoryAccess.Gpa >> 12) == ((UINT64)ehciBarBase >> 12))
+                    g_ehciOffHist[exitContext.MemoryAccess.Gpa & 0xFF]++;
             }
         }
         switch (exitContext.ExitReason) {
@@ -16332,3 +16362,4 @@ int main(int argc, char *argv[]) {
     WHvDeletePartition(partition);
     return 0;
 }
+
