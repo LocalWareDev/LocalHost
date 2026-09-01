@@ -155,6 +155,31 @@ static void xhciWrite32(UINT64 gpa, UINT32 v) {
     *(UINT32 *)((unsigned char *)guestMemory + gpa) = v;
 }
 
+// Raise the controller's interrupt, by MSI when the guest has enabled it and
+// by the legacy INTx line otherwise.
+//
+// An MSI is architecturally a memory write to the LAPIC's address range, and
+// the vector is simply the low byte of the message data. Rather than synthesise
+// that write and decode it back, inject the vector directly through the same
+// queue the INTx path uses -- the delivery machinery (priority, IF=0 latching,
+// the virtual APIC) is identical once you have a vector.
+long g_xhciMsiIrqs = 0, g_xhciIntxIrqs = 0;
+static void xhciRaiseInterrupt(WHV_PARTITION_HANDLE partition) {
+    UINT16 msgCtrl = (UINT16)(pciEhciConfig[0x52] | ((UINT16)pciEhciConfig[0x53] << 8));
+    if (msgCtrl & 1) {                          // MSI Enable
+        UINT16 data = (UINT16)(pciEhciConfig[0x5C] | ((UINT16)pciEhciConfig[0x5D] << 8));
+        unsigned char vec = (unsigned char)(data & 0xFF);
+        if (vec >= 0x10) {                      // below 0x10 is CPU exception space
+            g_xhciMsiIrqs++;
+            queueInterrupt(vec, IRQ_PRIO_INPUT);
+            drainInterruptQueue(partition);
+            return;
+        }
+    }
+    g_xhciIntxIrqs++;
+    injectDeviceIrq(partition, GSI_EHCI, 0x73);
+}
+
 // --- event ring -----------------------------------------------------------
 // Push one event TRB and raise the interrupt. The cycle bit is what tells the
 // driver an entry is valid, so it MUST be written last: publish the payload,
@@ -188,7 +213,7 @@ static void xhciPushEvent(WHV_PARTITION_HANDLE partition,
     xhciIman |= 1;                       // Interrupt Pending
     if ((xhciUsbCmd & XHCI_CMD_INTE) && (xhciIman & 2)) {   // INTE and IE
         g_xhciIrqs++;
-        injectDeviceIrq(partition, GSI_EHCI, 0x73 /* unused here; routed */);
+        xhciRaiseInterrupt(partition);
     }
 }
 

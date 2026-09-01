@@ -6510,6 +6510,28 @@ void pciInitConfigSpaces(void) {
     pciEhciConfig[0x0B] = 0x0C; // base class: serial bus controller
     pciEhciConfig[0x0E] = 0x00; // header type 0, single-function
     pciEhciConfig[0x3D] = 0x01; // interrupt pin: INTA# -> GSI 20 via the _PRT
+#if LH_USE_XHCI
+    // MSI capability. xHCI effectively assumes message-signalled interrupts --
+    // the spec's interrupter model is built around them -- and USBXHCI was
+    // looping through init/teardown against a function that advertised NO
+    // capability list at all (no pointer at 0x34, status bit 4 clear), which is
+    // a combination no real xHCI presents.
+    //
+    // Structure at 0x50: ID(0x05), next(0), Message Control, Address lo/hi,
+    // Data. 64-bit capable (bit 7 of control) because that is what real parts
+    // report; the guest writes the address and data, and the low byte of the
+    // data IS the vector we inject.
+    // Message Control is the 16-bit word at 0x52. Bit 0 MSI Enable (guest
+    // writes), bits 3:1 Multiple Message Capable = 000 (one vector), bit 7
+    // 64-bit Address Capable. With 64-bit capable set, Message Data sits at
+    // 0x5C rather than 0x58.
+    pciEhciConfig[0x06] |= 0x10;  // status: capabilities list present
+    pciEhciConfig[0x34] = 0x50;   // capabilities pointer
+    pciEhciConfig[0x50] = 0x05;   // cap ID: MSI
+    pciEhciConfig[0x51] = 0x00;   // next: end of list
+    pciEhciConfig[0x52] = 0x80;   // control lo: 64-bit capable, MSI disabled
+    pciEhciConfig[0x53] = 0x00;   // control hi
+#endif
 
     // Real Realtek RTL8139 IDs -- same reasoning as AHCI above, matches a
     // real chip so nothing keyed off vendor/device ID gets confused.
@@ -16413,4 +16435,6 @@ int main(int argc, char *argv[]) {
     WHvDeletePartition(partition);
     return 0;
 }
+
+
 
