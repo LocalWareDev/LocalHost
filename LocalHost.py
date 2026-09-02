@@ -19,6 +19,9 @@ import platform
 import ctypes
 import ctypes.wintypes as wintypes
 import threading
+import struct
+import uuid
+import calendar
 from pathlib import Path
 
 # Optional: powers the App Utilisation panel's CPU/RAM/Disk figures. The panel
@@ -189,6 +192,123 @@ def _create_sparse_disk_image(path, size_bytes):
         kernel32.CloseHandle(handle)
 
 
+def _vhd_chs(total_sectors):
+    """Cylinder/head/sector geometry for a VHD footer, following the algorithm
+    in the VHD spec verbatim rather than inventing one.
+
+    The numbers are legacy fiction -- nothing addresses the disk this way any
+    more -- but they are validated: Windows' own VHD stack sanity-checks the
+    geometry against the declared size, and a self-consistent footer is the
+    difference between a file Disk Management will attach and one it refuses.
+    """
+    if total_sectors > 65535 * 16 * 255:
+        total_sectors = 65535 * 16 * 255
+    if total_sectors >= 65535 * 16 * 63:
+        spt = 255
+        heads = 16
+        cth = total_sectors // spt
+    else:
+        spt = 17
+        cth = total_sectors // spt
+        heads = (cth + 1023) // 1024
+        if heads < 4:
+            heads = 4
+        if cth >= heads * 1024 or heads > 16:
+            spt = 31
+            heads = 16
+            cth = total_sectors // spt
+        if cth >= heads * 1024:
+            spt = 63
+            heads = 16
+            cth = total_sectors // spt
+    return (cth // heads), heads, spt
+
+
+def _vhd_fixed_footer(size_bytes):
+    """Build the 512-byte footer that turns a raw image into a fixed-format VHD.
+
+    A fixed VHD is exactly the raw data followed by this footer, which is why
+    the hypervisor needs no VHD parsing at all -- it reads the data region with
+    the same fseek+fread it always used, and only has to know not to count the
+    footer as a final sector (it checks for the 'conectix' cookie and drops one
+    sector). Everything here is BIG-endian; the format predates the x86
+    monoculture and byte order is the easiest thing to get silently wrong.
+    """
+    total_sectors = size_bytes // 512
+    cylinders, heads, spt = _vhd_chs(total_sectors)
+    # Timestamp is seconds since 2000-01-01 UTC, not the Unix epoch.
+    epoch2000 = calendar.timegm((2000, 1, 1, 0, 0, 0, 0, 0, 0))
+    stamp = max(0, int(time.time()) - epoch2000)
+
+    footer = bytearray(512)
+    footer[0:8] = b"conectix"
+    struct.pack_into(">I", footer, 8, 0x00000002)   # features: reserved bit set
+    struct.pack_into(">I", footer, 12, 0x00010000)  # format version 1.0
+    # Data offset is meaningful only for dynamic/differencing disks; fixed disks
+    # set every bit, and a reader uses this to tell the kinds apart.
+    struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
+    struct.pack_into(">I", footer, 24, stamp)
+    footer[28:32] = b"lhst"                          # creator application
+    struct.pack_into(">I", footer, 32, 0x00010000)   # creator version
+    footer[36:40] = b"Wi2k"                          # creator host OS: Windows
+    struct.pack_into(">Q", footer, 40, size_bytes)   # original size
+    struct.pack_into(">Q", footer, 48, size_bytes)   # current size
+    struct.pack_into(">H", footer, 56, cylinders & 0xFFFF)
+    footer[58] = heads & 0xFF
+    footer[59] = spt & 0xFF
+    struct.pack_into(">I", footer, 60, 2)            # disk type: 2 = fixed
+    footer[68:84] = uuid.uuid4().bytes               # unique id
+    footer[84] = 0                                   # saved state: no
+    # Checksum is the one's complement of the sum of every other byte, so it is
+    # computed with its own field left as zero -- which it still is here.
+    struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+    return bytes(footer)
+
+
+def _write_vhd_footer(path, size_bytes):
+    """Stamp a fixed-VHD footer at `size_bytes`, making the file size_bytes+512."""
+    try:
+        with open(path, "r+b") as f:
+            f.seek(size_bytes)
+            f.write(_vhd_fixed_footer(size_bytes))
+            f.truncate(size_bytes + 512)
+        return True
+    except OSError:
+        return False
+
+
+def _create_fixed_vhd(path, size_bytes):
+    """Create a sparse fixed-format VHD whose usable capacity is size_bytes.
+
+    The file on disk is size_bytes+512; the extra 512 is the footer. Sparseness
+    is unaffected -- the footer is the only block actually allocated until the
+    guest writes something.
+    """
+    if not _create_sparse_disk_image(path, size_bytes + 512):
+        return False
+    return _write_vhd_footer(path, size_bytes)
+
+
+def _vhd_data_size(path):
+    """Usable capacity of `path`: total size minus the footer if it is a VHD.
+
+    Returns None if the file cannot be read. Plain raw .img disks created before
+    the switch to VHD have no footer and report their whole size, so they keep
+    working untouched.
+    """
+    try:
+        total = os.path.getsize(path)
+        if total < 512:
+            return total
+        with open(path, "rb") as f:
+            f.seek(-512, os.SEEK_END)
+            if f.read(8) == b"conectix":
+                return total - 512
+        return total
+    except OSError:
+        return None
+
+
 def _resize_sparse_disk_image(path, new_size_bytes):
     """Resize an existing sparse disk image to new_size_bytes. Growing just
     moves the logical end-of-file forward -- the newly exposed region reads
@@ -221,6 +341,40 @@ def _resize_sparse_disk_image(path, new_size_bytes):
         return bool(kernel32.SetEndOfFile(handle))
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _resize_disk_image(path, new_size_bytes):
+    """Resize a VM disk to new_size_bytes of USABLE capacity, keeping whatever
+    kind of image it already is.
+
+    For a VHD the footer has to move: it lives at the end of the file, so
+    growing the data region would otherwise leave the old footer stranded in
+    the middle of the disk, where the guest would read it as 512 bytes of
+    garbage. Growing therefore zeroes the old footer's bytes before stamping a
+    new one at the new end. Raw .img disks from before the VHD switch have no
+    footer and are resized exactly as they always were.
+    """
+    data_size = _vhd_data_size(path)
+    if data_size is None:
+        return False
+    try:
+        is_vhd = data_size != os.path.getsize(path)
+    except OSError:
+        return False
+
+    if not is_vhd:
+        return _resize_sparse_disk_image(path, new_size_bytes)
+
+    if not _resize_sparse_disk_image(path, new_size_bytes + 512):
+        return False
+    if new_size_bytes > data_size:
+        try:
+            with open(path, "r+b") as f:
+                f.seek(data_size)
+                f.write(b"\0" * 512)
+        except OSError:
+            return False
+    return _write_vhd_footer(path, new_size_bytes)
 
 
 class _FILE_ALLOCATED_RANGE_BUFFER(ctypes.Structure):
@@ -1413,7 +1567,7 @@ class VMSettingsDialog(QDialog):
     sound/display/TPM are cosmetic for now -- same as in NewVMWizard, the
     hypervisor doesn't yet take these as launch parameters -- but they're
     still real, persisted settings. The hard disk can genuinely grow (sparse
-    -extends the backing .img with existing data untouched); shrinking isn't
+    -extends the backing image with existing data untouched); shrinking isn't
     offered since that would require actually relocating guest data.
     Renaming isn't offered here to avoid juggling live process/tracking-dict
     keys out from under a VM that might be running."""
@@ -1618,7 +1772,7 @@ class VMSettingsDialog(QDialog):
                 if choice != QMessageBox.Yes:
                     return
 
-            if not _resize_sparse_disk_image(self.vm.disk_path, new_disk_gb * 1024 * 1024 * 1024):
+            if not _resize_disk_image(self.vm.disk_path, new_disk_gb * 1024 * 1024 * 1024):
                 QMessageBox.warning(
                     self, "Can't resize disk",
                     "Couldn't resize the hard disk. Make sure the VM is powered off "
@@ -2429,12 +2583,25 @@ class LocalHostWindow(QMainWindow):
         return d
 
     def _create_vm_disk_image(self, vm_name, size_gb):
-        """Allocate a per-VM raw disk image (sparse -- doesn't actually use
+        """Allocate a per-VM fixed-format VHD (sparse -- doesn't actually use
         size_gb worth of space until the guest writes to it). The hypervisor's
-        ATA emulation is LBA28, so only the first ~128 GB is addressable."""
+        ATA emulation is LBA28, so only the first ~128 GB is addressable.
+
+        VHD rather than a bare .img so the disk is a real, portable disk image
+        other tools recognise, at no cost: a fixed VHD IS the raw image plus a
+        512-byte footer, so the data region stays byte-identical and the
+        hypervisor still reads it with plain seeks.
+
+        One caveat, verified rather than assumed: Windows' own Mount-DiskImage
+        refuses SPARSE files outright ("must not be sparse"), so these can't be
+        attached in Disk Management as-is even though the footer is valid --
+        a non-sparse copy of the same bytes gets past format validation. Keeping
+        the disk sparse is the right trade anyway: it makes creating an 80 GB
+        disk instant instead of writing 80 GB. Copy it dense if you need to
+        mount it on the host."""
         safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in vm_name).strip() or "vm"
-        path = self._vm_disks_dir() / f"{safe_name}.img"
-        if not _create_sparse_disk_image(path, size_gb * 1024 * 1024 * 1024):
+        path = self._vm_disks_dir() / f"{safe_name}.vhd"
+        if not _create_fixed_vhd(path, size_gb * 1024 * 1024 * 1024):
             self.statusBar().showMessage(f"Failed to create disk image at {path}", 5000)
             return None
         return path
@@ -3727,7 +3894,7 @@ class LocalHostWindow(QMainWindow):
             QMessageBox.warning(self, "Snapshot exists", f"'{vm.name}' already has a snapshot named '{name}'.")
             return False
 
-        snap_path = self._vm_snapshots_dir(vm.name) / f"{int(time.time() * 1000)}.img"
+        snap_path = self._vm_snapshots_dir(vm.name) / f"{int(time.time() * 1000)}.vhd"
         self.statusBar().showMessage(f"Taking snapshot '{name}'...")
         QApplication.processEvents()
         if not _copy_sparse_disk_image(vm.disk_path, snap_path):
