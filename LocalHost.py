@@ -607,8 +607,6 @@ def detect_guest_os(path, scan_bytes=8 * 1024 * 1024):
 # WS_POPUP window covering the whole screen for a real fullscreen mode.
 # ---------------------------------------------------------------------------
 _user32 = ctypes.windll.user32
-_user32.FindWindowW.restype = ctypes.c_void_p
-_user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
 _user32.SetParent.restype = ctypes.c_void_p
 _user32.SetParent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _user32.GetWindowLongPtrW.restype = ctypes.c_longlong
@@ -625,6 +623,69 @@ _user32.GetForegroundWindow.restype = ctypes.c_void_p
 _user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
 _user32.GetKeyState.restype = ctypes.c_short
 _user32.GetKeyState.argtypes = [ctypes.c_int]
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+_user32.EnumWindows.argtypes = [_WNDENUMPROC, ctypes.c_void_p]
+_user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+
+# The window class Hypervisor.c registers for the guest display. Unlike the
+# title, this never changes at runtime.
+HYPERVISOR_WINDOW_CLASS = "HypervisorWindowClass"
+HYPERVISOR_TITLE_PREFIX = "LocalHost Hypervisor -- "
+
+
+def _find_hypervisor_window(vm_name, pid=None):
+    """Find a VM's guest-display window, by process identity where possible.
+
+    This deliberately does NOT use FindWindowW on the exact title, which is
+    what it used to do and why the console never embedded: the hypervisor
+    appends its keyboard-capture state to its own title the moment the window
+    is created (updateCaptureTitle, called unconditionally right after
+    CreateWindowA), so the real title is
+
+        LocalHost Hypervisor -- Win10  [keys captured -- Right Ctrl to release]
+
+    and an exact-match lookup for "LocalHost Hypervisor -- Win10" returned 0
+    every single time. Nothing was ever reparented, so the guest window just
+    stayed a floating top-level window -- it looked like it was "escaping"
+    the manager, when in truth it was never captured in the first place.
+
+    Given a pid (we have one for any VM we launched) this matches on window
+    class + owning process and never reads the title at all, which also
+    sidesteps the cross-process GetWindowText round trip that the old code
+    had to retry around -- GetClassNameW is served locally and can't block on
+    a guest that's busy inside its emulation loop.
+
+    Without a pid (adopting a VM that was already running) it falls back to
+    the title, but matches the VM-name prefix plus the capture suffix rather
+    than the whole string, so a VM named "Win10" can't claim the window
+    belonging to "Win10 Pro".
+    """
+    found = []
+    expected = HYPERVISOR_TITLE_PREFIX + vm_name
+
+    def check(hwnd, _lparam):
+        cls = ctypes.create_unicode_buffer(64)
+        if _user32.GetClassNameW(hwnd, cls, 64) and cls.value == HYPERVISOR_WINDOW_CLASS:
+            if pid is not None:
+                owner = wintypes.DWORD()
+                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value == pid:
+                    found.append(hwnd)
+                    return False
+            else:
+                title = ctypes.create_unicode_buffer(512)
+                _user32.GetWindowTextW(hwnd, title, 512)
+                if title.value == expected or title.value.startswith(expected + "  ["):
+                    found.append(hwnd)
+                    return False
+        return True
+
+    try:
+        _user32.EnumWindows(_WNDENUMPROC(check), None)
+    except OSError:
+        return None
+    return found[0] if found else None
 
 GWL_STYLE = -16
 WS_CHILD = 0x40000000
@@ -3480,13 +3541,13 @@ class LocalHostWindow(QMainWindow):
         """
         for vm_name in self.vms:
             hwnd = None
-            # FindWindowW compares titles via a synchronous cross-process
-            # GetWindowText call to the target window -- if the guest's
-            # message loop doesn't answer promptly (e.g. mid-frame in its
-            # own emulation loop) it can spuriously come back empty, same
-            # fragility _embed_hypervisor_window already retries around.
+            # No pid to match on here -- discovering it is the whole point of
+            # this pass -- so this is the one lookup that still reads titles
+            # cross-process. If the guest's message loop doesn't answer
+            # promptly (e.g. mid-frame in its own emulation loop) the read can
+            # come back empty, hence the retries.
             for _ in range(5):
-                hwnd = _user32.FindWindowW(None, f"LocalHost Hypervisor -- {vm_name}")
+                hwnd = _find_hypervisor_window(vm_name)
                 if hwnd:
                     break
                 time.sleep(0.1)
@@ -3542,7 +3603,7 @@ class LocalHostWindow(QMainWindow):
             # undone by a VM selection change, a resume, or a retry.
             return
 
-        hwnd = _user32.FindWindowW(None, f"LocalHost Hypervisor -- {vm_name}")
+        hwnd = _find_hypervisor_window(vm_name, self.processes.get(vm_name))
         if not hwnd:
             if attempt < 25:
                 QTimer.singleShot(200, lambda: self._embed_hypervisor_window(vm_name, attempt + 1))
@@ -3657,7 +3718,7 @@ class LocalHostWindow(QMainWindow):
             # Not currently in the pane: it may be fullscreened (still
             # tracked) or hidden after a background/close cycle -- find it
             # the same way the initial embed does.
-            hwnd = _user32.FindWindowW(None, f"LocalHost Hypervisor -- {vm_name}")
+            hwnd = _find_hypervisor_window(vm_name, self.processes.get(vm_name))
         if not hwnd:
             return False
 
@@ -3695,7 +3756,7 @@ class LocalHostWindow(QMainWindow):
         """Inverse of _pop_out_hypervisor_window: pull a detached console
         back in as a WS_CHILD of the preview pane. Reuses the HWND we kept
         rather than looking it up again, so it also works for a guest too
-        busy to answer FindWindowW's cross-process title read."""
+        busy to answer a cross-process title read."""
         hwnd = self.detached_hwnds.pop(vm_name, None)
         if not hwnd:
             return False
