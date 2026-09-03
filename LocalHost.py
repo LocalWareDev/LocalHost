@@ -627,6 +627,7 @@ _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_
 _user32.EnumWindows.argtypes = [_WNDENUMPROC, ctypes.c_void_p]
 _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 _user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+_user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
 
 # The window class Hypervisor.c registers for the guest display. Unlike the
 # title, this never changes at runtime.
@@ -3637,8 +3638,26 @@ class LocalHostWindow(QMainWindow):
         hwnd = self.embedded_hwnds.get(vm_name)
         if not hwnd:
             return
-        rect = self.preview_frame.rect()
-        _win32_async(_user32.MoveWindow, hwnd, 0, 0, max(rect.width(), 1), max(rect.height(), 1), True)
+        # Ask Win32 for the pane's size instead of converting Qt's.
+        #
+        # preview_frame.rect() is in LOGICAL pixels, but MoveWindow is a raw
+        # Win32 call and wants PHYSICAL ones. At 150% scaling that sized the
+        # guest window to two thirds of the pane and left the remainder black
+        # down the right and bottom edges -- which reads as "the guest thinks
+        # it has a small monitor" but is really just the window being sized
+        # wrong underneath it. The fullscreen and pop-out paths already
+        # multiplied by devicePixelRatio; this one, the one that runs for
+        # every embedded VM, was the one that didn't.
+        #
+        # Reading the parent's own client rect gets the exact figure with no
+        # scaling arithmetic to round or to get wrong if Qt's DPI policy
+        # changes.
+        r = wintypes.RECT()
+        parent = ctypes.c_void_p(int(self.preview_frame.winId()))
+        if not _user32.GetClientRect(parent, ctypes.byref(r)):
+            return
+        w, h = max(r.right - r.left, 1), max(r.bottom - r.top, 1)
+        _win32_async(_user32.MoveWindow, hwnd, 0, 0, w, h, True)
 
     def _detach_from_preview(self, vm_name, blocking=False, show=True):
         """Pop a VM's window out of the shared preview pane back to a
