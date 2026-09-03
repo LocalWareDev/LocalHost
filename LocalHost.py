@@ -628,6 +628,7 @@ _user32.EnumWindows.argtypes = [_WNDENUMPROC, ctypes.c_void_p]
 _user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 _user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
 _user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.RECT)]
+_user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
 
 # The window class Hypervisor.c registers for the guest display. Unlike the
 # title, this never changes at runtime.
@@ -704,6 +705,9 @@ SWP_NOSIZE = 0x0001
 SWP_FRAMECHANGED = 0x0020
 SW_SHOW = 5
 SW_HIDE = 0
+# Posted to the console window to request an ACPI power-button shutdown; the
+# hypervisor turns it into PWRBTN_STS + an SCI rather than closing the window.
+WM_CLOSE = 0x0010
 
 
 def _win32_async(fn, *args):
@@ -2129,6 +2133,9 @@ class LocalHostWindow(QMainWindow):
         self.processes = {}  # vm name -> running Hypervisor.exe PID (detached, not QProcess-owned)
         self.embedded_hwnds = {}  # vm name -> hypervisor window HWND, reparented into preview_frame
         self.detached_hwnds = {}  # vm name -> HWND deliberately popped out to its own desktop window
+        # vm name -> time.time() when we asked the guest to shut down, so a
+        # guest that ignores the request can be escalated instead of hanging.
+        self._shutdown_requested = {}
         self.fullscreen_vm = None  # vm name currently popped out to a fullscreen window, if any
         self._f11_down = False  # debounces key-repeat in the keyboard hook (see below)
         self.suspended_vms = set()  # vm names currently thread-frozen (best-effort suspend)
@@ -3493,21 +3500,56 @@ class LocalHostWindow(QMainWindow):
             self._update_power_ui()
         QTimer.singleShot(200, lambda: self._embed_hypervisor_window(vm.name))
 
-    def power_off_vm(self, vm):
+    def power_off_vm(self, vm, force=False):
+        """Ask the guest to shut down, the way pressing a real power button
+        would. force=True skips that and cuts the power.
+
+        This used to be an unconditional _terminate_process, which to the guest
+        is indistinguishable from yanking the cord: Windows gets no chance to
+        flush or mark its filesystem clean, and the next boot lands in
+        Automatic Repair. Killing it mid-login lost the session outright.
+
+        The graceful path posts WM_CLOSE to the console window, which the
+        hypervisor turns into an ACPI power-button event (PWRBTN_STS + SCI)
+        rather than closing anything. The guest then runs its own shutdown and
+        finally writes S5, at which point the hypervisor exits on its own and
+        the existing once-a-second liveness poll notices. So there is no new
+        waiting machinery here -- the process simply goes away when the guest
+        is genuinely finished, which is the entire point.
+        """
         pid = self.processes.get(vm.name)
         if pid is None:
             return
         if self.fullscreen_vm == vm.name:
             self._exit_vm_fullscreen()
         self.suspended_vms.discard(vm.name)
-        _terminate_process(pid)
-        self.statusBar().showMessage(f"Powering off {vm.name}...", 3000)
+
+        if force:
+            _terminate_process(pid)
+            self.statusBar().showMessage(f"Forcing {vm.name} off...", 3000)
+            return
+
+        hwnd = (self.embedded_hwnds.get(vm.name) or self.detached_hwnds.get(vm.name)
+                or _find_hypervisor_window(vm.name, pid))
+        if not hwnd:
+            # No window to ask through -- the guest can't be reached, so a hard
+            # stop is the only option left. Say so instead of doing it silently.
+            _terminate_process(pid)
+            self.statusBar().showMessage(
+                f"Couldn't reach {vm.name}'s console -- forced it off.", 5000)
+            return
+
+        self._shutdown_requested[vm.name] = time.time()
+        _win32_async(_user32.PostMessageW, hwnd, WM_CLOSE, 0, 0)
+        self.statusBar().showMessage(
+            f"Asking {vm.name} to shut down -- give it a moment...", 8000)
 
     def on_vm_process_finished(self, vm_name):
         self.processes.pop(vm_name, None)
         self.embedded_hwnds.pop(vm_name, None)  # the window died with the process
         self.detached_hwnds.pop(vm_name, None)  # ...detached or not
         self.suspended_vms.discard(vm_name)
+        self._shutdown_requested.pop(vm_name, None)  # it shut down; nothing to escalate
         if self.fullscreen_vm == vm_name:
             self.fullscreen_vm = None
         self.statusBar().showMessage(f"'{vm_name}' has stopped.", 3000)
@@ -3528,6 +3570,29 @@ class LocalHostWindow(QMainWindow):
         for vm_name, pid in list(self.processes.items()):
             if not _process_is_alive(pid):
                 self.on_vm_process_finished(vm_name)
+                continue
+            # A guest that never acts on the power button would otherwise sit
+            # here forever looking like the button did nothing. Offer the hard
+            # stop rather than taking it: at this point only the user knows
+            # whether the guest is wedged or just slow (Windows Update installs
+            # on shutdown can legitimately take many minutes).
+            asked_at = self._shutdown_requested.get(vm_name)
+            if asked_at is not None and time.time() - asked_at > 120:
+                self._shutdown_requested.pop(vm_name, None)
+                vm = self.vms.get(vm_name)
+                if vm is None:
+                    continue
+                choice = QMessageBox.question(
+                    self, "Still shutting down",
+                    f"'{vm_name}' hasn't powered off two minutes after being asked.\n\n"
+                    "It may still be finishing (installing updates on shutdown can "
+                    "take a while). Forcing it off now is a power cut to the guest "
+                    "and can leave its filesystem needing repair.\n\n"
+                    "Force it off?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if choice == QMessageBox.Yes:
+                    self.power_off_vm(vm, force=True)
 
     def _reconnect_running_vms(self):
         """Since VMs are launched detached (see power_on_vm), a VM left

@@ -2141,6 +2141,15 @@ int ramfbConfigWritten = 0; // becomes true once all 28 bytes have been written 
 UINT64 ramfbAddress = 0;
 UINT32 ramfbWidth = 0, ramfbHeight = 0, ramfbStride = 0;
 
+// ACPI power button / soft-off handoff between the WINDOW thread and the VM
+// thread -- declared up here for the same reason as the ramfb state above:
+// WndProc sets g_powerButtonRequest on WM_CLOSE and is defined further up the
+// file than the rest of the PM1a emulation. volatile + Interlocked because the
+// two threads genuinely run concurrently. See the PM1a_EVT_BLK block for what
+// consumes these.
+volatile LONG g_powerButtonRequest = 0;
+volatile LONG g_guestPoweredOff = 0;
+
 // --- UEFI (OVMF) boot support ---
 // UEFI firmware wants to sit at the very top of a real 4GB address space
 // (see the reset-vector setup in main()), not squeezed into the legacy
@@ -4347,6 +4356,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EndPaint(hwnd, &ps);
             return 0;
         }
+        // Closing the console asks the GUEST to shut down; it does not kill it.
+        // Returning 0 without calling DefWindowProc deliberately suppresses the
+        // default destroy -- the window has to stay alive to keep painting while
+        // Windows runs its shutdown sequence, and the process exits only once
+        // the guest writes S5 (see the PM1a_CNT handler). The manager's "power
+        // off" button drives exactly this path by posting WM_CLOSE.
+        case WM_CLOSE:
+            InterlockedExchange(&g_powerButtonRequest, 1);
+            return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -4720,6 +4738,23 @@ int pciConfigSpacesInit = 0;
 // never happen since nothing ever writes SMI_CMD=0. Starting this at 1
 // keeps the two in sync.
 UINT16 pm1aControl = 0x1;
+
+// PM1a_EVT_BLK (pmBase+0): PM1a_STS at +0, PM1a_EN at +2, 4 bytes total to
+// match the FADT's PM1_EVT_LEN. This is how a guest learns the power button
+// was pressed, and until it existed there was NO way to ask the guest to shut
+// itself down -- the manager's "power off" could only kill the process, which
+// is a power cut as far as the guest is concerned and lands Windows in
+// Automatic Repair on the next boot.
+//
+// The FADT flags (0x101) deliberately leave PWR_BUTTON clear, which tells the
+// OS the power button is FIXED HARDWARE rather than a control-method device --
+// so this register pair is the whole interface, with no AML object needed.
+UINT16 pm1aStatus = 0;
+UINT16 pm1aEnable = 0;
+#define PM1_PWRBTN  0x0100   // PWRBTN_STS / PWRBTN_EN are both bit 8
+#define PM1_SLP_EN  0x2000   // PM1a_CNT bit 13: "act on SLP_TYP now"
+#define GSI_SCI     9        // matches FADT SCI_INT and the MADT override
+
 
 // PORT_SMI_STATUS (0xB3): SeaBIOS's SMM relocation code
 // (smm_relocate_and_restore()) writes 0x01 here, writes 0x00 to
@@ -14105,6 +14140,35 @@ int main(int argc, char *argv[]) {
         deliverPendingAtaIrq(partition);
         deliverPendingE1000Irq(partition);
         deliverPendingRtl8139Irq(partition);
+
+        // The guest finished its shutdown and asked to be powered off. Leaving
+        // the loop here is a CLEAN exit -- everything is already flushed --
+        // unlike killing the process, which is a power cut to the guest.
+        if (InterlockedCompareExchange(&g_guestPoweredOff, 1, 1)) {
+            printf("[acpi] guest is powered off -- exiting\n");
+            fflush(stdout);
+            break;
+        }
+
+        // Power button pressed (the console window was closed, or the manager
+        // asked for a graceful power off). Latch PWRBTN_STS and raise the SCI so
+        // the guest's ACPI driver runs its normal shutdown, exactly as a real
+        // short press of a real power button would.
+        if (InterlockedExchange(&g_powerButtonRequest, 0)) {
+            pm1aStatus |= PM1_PWRBTN;
+            if (pm1aEnable & PM1_PWRBTN) {
+                printf("[acpi] power button pressed -- raising SCI to the guest\n");
+                injectDeviceIrq(partition, GSI_SCI, 0);
+            } else {
+                // No OS has armed PWRBTN_EN yet (still in firmware, or the guest
+                // has no ACPI driver running). Nothing would ever consume the
+                // event, so say so rather than appearing to hang.
+                printf("[acpi] power button pressed, but the guest has not enabled "
+                       "PWRBTN_EN (PM1a_EN=0x%04X) -- it cannot shut itself down yet\n",
+                       pm1aEnable);
+            }
+            fflush(stdout);
+        }
         // REVERTED: delivering PS/2 keyboard/mouse bytes from here (in addition to
         // the halted-CPU wait branch) looked like the fix for hover feeling
         // stuttery while the guest is busy, but it re-injects on EVERY loop
@@ -14792,6 +14856,40 @@ int main(int argc, char *argv[]) {
                     WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
                     break;
                 }
+                // PM1a_EVT_BLK: PM1a_STS (pmBase+0) and PM1a_EN (pmBase+2).
+                // Accessed as two 16-bit registers or as one 32-bit read of the
+                // pair, both of which real OSes do, so both are handled here.
+                // PM1a_STS is WRITE-1-TO-CLEAR, not a plain store: writing the
+                // bit back is how an OS acknowledges the event, and treating it
+                // as a normal write would make the guest unable to ever clear
+                // PWRBTN_STS -- leaving the SCI asserted forever.
+                {
+                    UINT32 pmBase = (*(UINT32 *)&pciPmConfig[0x40]) & 0xFFC0;
+                    if (pmBase != 0 && (port == (UINT16)(pmBase + 0) || port == (UINT16)(pmBase + 2))) {
+                        int isStatus = (port == (UINT16)(pmBase + 0));
+                        int is32 = (exitContext.IoPortAccess.AccessInfo.AccessSize == 4);
+                        UINT64 rax;
+                        if (isStatus)
+                            rax = is32 ? ((UINT32)pm1aStatus | ((UINT32)pm1aEnable << 16)) : pm1aStatus;
+                        else
+                            rax = pm1aEnable;
+                        if (isWrite) {
+                            UINT32 v = (UINT32)exitContext.IoPortAccess.Rax;
+                            if (isStatus) {
+                                pm1aStatus &= (UINT16)~(UINT16)v;      // write-1-to-clear
+                                if (is32) pm1aEnable = (UINT16)(v >> 16);
+                            } else {
+                                pm1aEnable = (UINT16)v;
+                            }
+                        }
+                        WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
+                        WHV_REGISTER_VALUE values[2] = { 0 };
+                        values[0].Reg64 = isWrite ? 0 : rax;
+                        values[1].Reg64 = exitContext.VpContext.Rip + exitContext.VpContext.InstructionLength;
+                        WHvSetVirtualProcessorRegisters(partition, 0, names, 2, values);
+                        break;
+                    }
+                }
                 {
                     UINT32 pmBase = (*(UINT32 *)&pciPmConfig[0x40]) & 0xFFC0;
                     if (pmBase != 0 && port == (UINT16)(pmBase + 4)) {
@@ -14808,7 +14906,22 @@ int main(int argc, char *argv[]) {
                         // live: SeaBIOS hangs at its own PM1a_CNT init read
                         // immediately after this write). Pin SCI_EN through
                         // writes to keep it consistent with that guarantee.
-                        if (isWrite) pm1aControl = (UINT16)exitContext.IoPortAccess.Rax | 0x1;
+                        if (isWrite) {
+                            UINT16 v = (UINT16)exitContext.IoPortAccess.Rax;
+                            // SLP_EN with SLP_TYP=5 is the guest saying it has
+                            // finished shutting down (\_S5 in our DSDT declares
+                            // SLP_TYP 0x05). This is the ONLY safe moment to
+                            // exit: the filesystem is flushed and consistent.
+                            // SLP_TYP=0 with SLP_EN is a harmless S0 no-op that
+                            // POST code writes -- see the note above -- so the
+                            // type has to be checked, not just SLP_EN.
+                            if ((v & PM1_SLP_EN) && (((v >> 10) & 0x7) == 5)) {
+                                printf("[acpi] guest requested S5 (soft off) -- shutting down cleanly\n");
+                                fflush(stdout);
+                                InterlockedExchange(&g_guestPoweredOff, 1);
+                            }
+                            pm1aControl = v | 0x1;
+                        }
                         WHV_REGISTER_NAME names[2] = { WHvX64RegisterRax, WHvX64RegisterRip };
                         WHV_REGISTER_VALUE values[2] = { 0 };
                         values[0].Reg64 = isWrite ? 0 : rax;
