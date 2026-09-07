@@ -60,9 +60,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from patch_ovmf_logo import find_lzma_section, LayoutError  # noqa: E402
 
 MODE_STRIDE = 0x24
-# The stock table. Matching all three is what makes locating it by signature
-# safe: a lone 800x600 appears over a hundred times in the volume.
-STOCK_MODES = [(640, 480), (800, 600), (1024, 768)]
+# Entries 0 and 2 are the signature; entry 1 is deliberately NOT matched because
+# it is the one this tool rewrites, and requiring the stock 800x600 there would
+# make the tool refuse to run a second time on its own output. Two fixed entries
+# at the right stride are still specific enough: a lone 640x480 or 1024x768
+# appears many times in the volume, both at exactly 0x48 apart does not.
+ANCHOR_MODES = {0: (640, 480), 2: (1024, 768)}
+MODE_COUNT = 3
 # QemuRamfbDxe selects this entry. Established empirically (see the docstring),
 # not from the edk2 source, so it is stated as a measurement rather than a fact.
 SELECTED_INDEX = 1
@@ -102,15 +106,15 @@ def find_mode_table(volume):
     anchor = volume.find(b"etc/ramfb")
     if anchor < 0:
         raise LayoutError("no 'etc/ramfb' string -- this firmware has no ramfb driver")
-    limit = min(anchor + SEARCH_WINDOW, len(volume) - MODE_STRIDE * len(STOCK_MODES))
+    limit = min(anchor + SEARCH_WINDOW, len(volume) - MODE_STRIDE * MODE_COUNT)
     for base in range(anchor, limit):
-        modes = [struct.unpack_from("<II", volume, base + i * MODE_STRIDE)
-                 for i in range(len(STOCK_MODES))]
-        if modes == STOCK_MODES:
+        if all(struct.unpack_from("<II", volume, base + i * MODE_STRIDE) == want
+               for i, want in ANCHOR_MODES.items()):
             return base
     raise LayoutError(
-        "found the ramfb driver but not its 640x480/800x600/1024x768 mode table "
-        "-- refusing to patch a layout this does not understand")
+        "found the ramfb driver but not its mode table (expected 640x480 and "
+        "1024x768 at a 36-byte stride) -- refusing to patch a layout this does "
+        "not understand")
 
 
 def main():
