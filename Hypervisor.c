@@ -13298,7 +13298,7 @@ int main(int argc, char *argv[]) {
     // CPUID directly, no exit/host round-trip needed).
     UINT64 measuredTscFrequency = measureTscFrequency();
     printf("[cpuid] measured host TSC frequency: %llu Hz\n", (unsigned long long)measuredTscFrequency);
-    WHV_X64_CPUID_RESULT cpuidOverrides[2] = { 0 };
+    WHV_X64_CPUID_RESULT cpuidOverrides[3] = { 0 };
     cpuidOverrides[0].Function = 0x15;
     cpuidOverrides[0].Eax = 1;
     cpuidOverrides[0].Ebx = 1;
@@ -13327,6 +13327,45 @@ int main(int argc, char *argv[]) {
     cpuidOverrides[1].Edx = (UINT32)hostCpuid1[3] & ~(1UL << 28); // clear HTT -- not multi-processor capable
     printf("[cpuid] leaf 1 override: host EBX=0x%08X EDX=0x%08X -> guest EBX=0x%08X EDX=0x%08X\n",
            (UINT32)hostCpuid1[1], (UINT32)hostCpuid1[3], cpuidOverrides[1].Ebx, cpuidOverrides[1].Edx);
+
+    // Leaf 0x80000007 EDX bit 8: INVARIANT TSC -- "the TSC ticks at a constant
+    // rate regardless of P-state, C-state or turbo, so it is safe as a clock
+    // source". It was never advertised, so the guest had no dependable
+    // high-resolution clock and fell back to the ACPI PM timer, which lives at
+    // an I/O PORT: every single read is a VM exit, and PM timer reads have been
+    // measured at roughly 42% of all exits. Exits are the scarce resource here
+    // (the vCPU already runs at 0% idle, which is why raising the tablet's poll
+    // rate made the pointer feel WORSE rather than better) so this is aimed at
+    // cursor latency as much as at throughput.
+    //
+    // The host really does have it (verified by probe: leaf 0x80000007
+    // EDX=0x00000100), so this claims nothing untrue. Leaf 0x15 already gives
+    // the guest the exact TSC frequency, which is the other half of what it
+    // needs to use the TSC as a timebase.
+    //
+    // NOT VERIFIED to change the guest's clock-source choice yet -- see the
+    // note below about the hypervisor-present bit, which may pre-empt it.
+    int hostCpuid7ex[4] = { 0 };
+    __cpuid(hostCpuid7ex, 0x80000007);
+    cpuidOverrides[2].Function = 0x80000007;
+    cpuidOverrides[2].Eax = (UINT32)hostCpuid7ex[0];
+    cpuidOverrides[2].Ebx = (UINT32)hostCpuid7ex[1];
+    cpuidOverrides[2].Ecx = (UINT32)hostCpuid7ex[2];
+    cpuidOverrides[2].Edx = (UINT32)hostCpuid7ex[3] | (1UL << 8);
+    printf("[cpuid] leaf 0x80000007: host EDX=0x%08X -> guest EDX=0x%08X (invariant TSC %s on host)\n",
+           (UINT32)hostCpuid7ex[3], cpuidOverrides[2].Edx,
+           ((UINT32)hostCpuid7ex[3] & (1UL << 8)) ? "present" : "ABSENT -- we are asserting it anyway");
+
+    // KNOWN, UNADDRESSED: leaf 1 ECX bit 31 (hypervisor present) is passed
+    // through from the host, where it is SET -- WHP itself runs on Hyper-V --
+    // and the host advertises "Microsoft Hv" at leaf 0x40000000. So the guest is
+    // told it is running under Hyper-V and will look for Hyper-V's timing
+    // enlightenments (reference TSC page, synthetic timers), none of which we
+    // implement. If Windows prefers those over the plain TSC, it will find them
+    // missing and may keep falling back to the PM timer regardless of the bit
+    // set above. The two candidate follow-ups are to hide the hypervisor bit, or
+    // to implement the reference TSC page properly. Both need measuring before
+    // either is worth shipping.
 
     hr = WHvSetPartitionProperty(partition, WHvPartitionPropertyCodeCpuidResultList, cpuidOverrides, sizeof(cpuidOverrides));
     if (FAILED(hr)) { printf("Failed to set CPUID result list. HRESULT: 0x%lx\n", hr); return 1; }
