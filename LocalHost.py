@@ -1343,6 +1343,56 @@ def _format_bytes(n):
     return f"{n:.1f} TB"
 
 
+# Aspect ratio of the guest display, and therefore of the preview pane.
+# Should match the guest's framebuffer (set with tools/patch_ovmf_resolution.py,
+# currently 1920x1080). When the two agree the guest fills the pane exactly and
+# the hypervisor's own letterboxing computes zero-width bars, so nothing is
+# stretched and nothing is wasted.
+PREVIEW_ASPECT_W, PREVIEW_ASPECT_H = 16, 9
+
+
+class AspectRatioBox(QWidget):
+    """Holds one child widget at a fixed aspect ratio, centred.
+
+    The guest display is a fixed shape, so a pane that is some other shape can
+    only ever be wrong in one of two ways: stretch the picture to fill it, or
+    letterbox and waste the remainder. Shaping the PANE removes the choice.
+
+    Done by positioning the child in resizeEvent rather than through
+    QSizePolicy.setHeightForWidth: heightForWidth needs cooperation from every
+    layout in the chain to actually take effect, while setGeometry on a child we
+    own is unconditional. The leftover space stays app background, which reads
+    as layout rather than as a broken picture.
+    """
+
+    def __init__(self, child, ratio_w=PREVIEW_ASPECT_W, ratio_h=PREVIEW_ASPECT_H,
+                 parent=None, on_resized=None):
+        super().__init__(parent)
+        self._child = child
+        self._rw, self._rh = ratio_w, ratio_h
+        # Called AFTER the child is repositioned. The embedded guest window is a
+        # foreign HWND that has to be moved separately, and the main window's own
+        # resizeEvent is not a safe place to do it -- it can run before this box
+        # has laid the child out, and would then size the guest to the previous
+        # geometry.
+        self._on_resized = on_resized
+        child.setParent(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        avail_w, avail_h = self.width(), self.height()
+        if avail_w <= 0 or avail_h <= 0:
+            return
+        w = avail_w
+        h = w * self._rh // self._rw
+        if h > avail_h:
+            h = avail_h
+            w = h * self._rw // self._rh
+        self._child.setGeometry((avail_w - w) // 2, (avail_h - h) // 2, max(w, 1), max(h, 1))
+        if self._on_resized is not None:
+            self._on_resized()
+
+
 class VM:
     def __init__(self, name, memory="4 GB", processors=2, hard_disk="60 GB",
                  cdrom="Auto detect", network="NAT", usb="Present",
@@ -2483,9 +2533,15 @@ class LocalHostWindow(QMainWindow):
 
         self.preview_frame = QFrame()
         self.preview_frame.setObjectName("PreviewFrame")
-        self.preview_frame.setMinimumSize(500, 400)
-        self.preview_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        preview_layout.addWidget(self.preview_frame)
+        # No minimum on the frame itself any more: AspectRatioBox sets its
+        # geometry outright, and a 500x400 floor would fight a 16:9 shape (500
+        # wide is 281 tall). The floor belongs on the box, which is what the
+        # surrounding layout actually negotiates over.
+        self.preview_frame.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.preview_box = AspectRatioBox(self.preview_frame, on_resized=self._on_preview_box_resized)
+        self.preview_box.setMinimumSize(500, 500 * PREVIEW_ASPECT_H // PREVIEW_ASPECT_W)
+        self.preview_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_layout.addWidget(self.preview_box)
         # Force the native HWND to be realized now, at startup, rather than
         # lazily on first winId() call from inside a QTimer callback later.
         self.preview_frame.winId()
@@ -3036,6 +3092,16 @@ class LocalHostWindow(QMainWindow):
         if clicked == shutdown_btn:
             return "shutdown"
         return "cancel"
+
+    def _on_preview_box_resized(self):
+        """The pane changed shape -- follow it with the embedded guest window.
+
+        This is where the foreign HWND gets resized, rather than in the window's
+        own resizeEvent, because the pane is now positioned by AspectRatioBox and
+        only it knows when that has actually happened.
+        """
+        if self.current_vm and self.fullscreen_vm is None:
+            self._resize_embedded_window(self.current_vm.name)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
