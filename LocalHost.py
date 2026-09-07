@@ -91,11 +91,28 @@ def _find_ovmf_firmware():
     OS: legacy BIOS gives the guest 1MB of RAM (see UEFI_GUEST_RAM_SIZE in
     Hypervisor.c), which Windows cannot boot in at all. So making UEFI the easy
     default matters more than it would elsewhere.
+
+    Order matters: the LocalHost build comes first because it is ours -- same
+    OVMF, with the boot logo replaced (see tools/patch_ovmf_logo.py) -- so a VM
+    created without touching this field boots showing LocalHost branding rather
+    than TianoCore's. The stock builds remain the fallback.
     """
-    names = ("RELEASEX64_OVMF.fd", "OVMF.fd", "DEBUGX64_OVMF.fd")
-    roots = [_app_dir(), _app_dir() / "firmware", Path.home() / "Downloads"]
-    for root in roots:
-        for name in names:
+    names = ("RELEASEX64_OVMF_LocalHost.fd", "RELEASEX64_OVMF.fd",
+             "OVMF.fd", "DEBUGX64_OVMF.fd")
+    # Documents before Downloads: that is where these actually live here, and
+    # searching only Downloads meant the hunt came up empty and the field
+    # opened blank even with firmware sitting on the machine.
+    docs = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    roots = [_app_dir(), _app_dir() / "firmware"]
+    if docs:
+        roots.append(Path(docs))
+    roots += [Path.home() / "Documents", Path.home() / "Downloads"]
+    # Name-major, not root-major: the LocalHost build wins wherever it happens
+    # to live. Searching folder-by-folder instead would let a stock OVMF sitting
+    # in the app directory outrank our own build in Documents, which is exactly
+    # the case this is meant to settle.
+    for name in names:
+        for root in roots:
             candidate = root / name
             if candidate.is_file():
                 return str(candidate)
