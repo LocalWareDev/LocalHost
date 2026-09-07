@@ -2141,6 +2141,43 @@ int ramfbConfigWritten = 0; // becomes true once all 28 bytes have been written 
 UINT64 ramfbAddress = 0;
 UINT32 ramfbWidth = 0, ramfbHeight = 0, ramfbStride = 0;
 
+// Aspect-preserving fit of the guest framebuffer inside a client area.
+//
+// The painter used to stretch the framebuffer across the WHOLE client rect,
+// which looks right only while the two happen to share an aspect ratio. They
+// did while the guest was 800x600 and 1280x960 in a 4:3 preview pane. Once the
+// guest went 16:9 the picture came out visibly stretched -- circles as
+// ellipses. Letterboxing keeps the proportions; the leftover strips are painted
+// black so they read as a deliberate border rather than a rendering fault.
+//
+// The SAME rectangle must drive the tablet's absolute coordinates. The guest is
+// told "the pointer is at this fraction of the display", so measuring that
+// fraction against the whole window while the image occupies only part of it
+// puts the guest cursor at a steadily growing offset from the host one -- the
+// exact class of mismatch the tablet exists to eliminate.
+static void guestDisplayRect(int clientW, int clientH, RECT *out) {
+    out->left = 0; out->top = 0; out->right = clientW; out->bottom = clientH;
+    if (clientW <= 0 || clientH <= 0 || ramfbWidth == 0 || ramfbHeight == 0) return;
+
+    // Integer throughout: compare the two aspect ratios by cross-multiplying
+    // rather than dividing, so nothing depends on floating point here.
+    long long fbW = (long long)ramfbWidth, fbH = (long long)ramfbHeight;
+    long long wantW, wantH;
+    if (fbW * (long long)clientH > fbH * (long long)clientW) {
+        wantW = clientW;                      // framebuffer is the wider shape:
+        wantH = (fbH * (long long)clientW) / fbW;  // full width, bars top+bottom
+    } else {
+        wantH = clientH;                      // taller shape: full height,
+        wantW = (fbW * (long long)clientH) / fbH;  // bars left+right
+    }
+    if (wantW < 1) wantW = 1;
+    if (wantH < 1) wantH = 1;
+    out->left = (int)((clientW - wantW) / 2);
+    out->top = (int)((clientH - wantH) / 2);
+    out->right = out->left + (int)wantW;
+    out->bottom = out->top + (int)wantH;
+}
+
 // ACPI power button / soft-off handoff between the WINDOW thread and the VM
 // thread -- declared up here for the same reason as the ramfb state above:
 // WndProc sets g_powerButtonRequest on WM_CLOSE and is defined further up the
@@ -4252,12 +4289,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // drifting. Scaled against the client rect so it stays correct when
             // the window is resized and the framebuffer is stretched to fit.
             {
-                RECT rc;
+                RECT rc, dsp;
                 GetClientRect(hwnd, &rc);
-                int w = rc.right - rc.left, h = rc.bottom - rc.top;
+                // Against the IMAGE rect, not the window: with letterboxing the
+                // two differ, and scaling against the window would offset the
+                // guest cursor by the size of the bars.
+                guestDisplayRect(rc.right - rc.left, rc.bottom - rc.top, &dsp);
+                int w = dsp.right - dsp.left, h = dsp.bottom - dsp.top;
                 if (w > 0 && h > 0) {
-                    int cx = x < 0 ? 0 : (x >= w ? w - 1 : x);
-                    int cy = y < 0 ? 0 : (y >= h ? h - 1 : y);
+                    int ix = x - dsp.left, iy = y - dsp.top;
+                    int cx = ix < 0 ? 0 : (ix >= w ? w - 1 : ix);
+                    int cy = iy < 0 ? 0 : (iy >= h ? h - 1 : iy);
                     InterlockedExchange(&g_tabletX, (LONG)(((LONGLONG)cx * 32767) / (w - 1 > 0 ? w - 1 : 1)));
                     InterlockedExchange(&g_tabletY, (LONG)(((LONGLONG)cy * 32767) / (h - 1 > 0 ? h - 1 : 1)));
                     InterlockedExchange(&g_tabletDirty, 1);
@@ -4337,8 +4379,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bmi.bmiHeader.biPlanes = 1;
                 bmi.bmiHeader.biBitCount = 32;
                 bmi.bmiHeader.biCompression = BI_RGB;
+                RECT dst;
+                guestDisplayRect(rect.right - rect.left, rect.bottom - rect.top, &dst);
+                // Black out only the letterbox strips, not the whole client
+                // area: filling everything first would blit the full rect on
+                // every repaint and make the guest image flicker.
+                if (dst.left > rect.left || dst.top > rect.top ||
+                    dst.right < rect.right || dst.bottom < rect.bottom) {
+                    HRGN bars = CreateRectRgnIndirect(&rect);
+                    HRGN image = CreateRectRgnIndirect(&dst);
+                    CombineRgn(bars, bars, image, RGN_DIFF);
+                    FillRgn(hdc, bars, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                    DeleteObject(image);
+                    DeleteObject(bars);
+                }
                 StretchDIBits(
-                    hdc, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                    hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                     0, 0, ramfbWidth, ramfbHeight,
                     (unsigned char *)guestMemory + ramfbAddress, &bmi, DIB_RGB_COLORS, SRCCOPY);
             } else {
@@ -7435,16 +7491,21 @@ static int ehciRunQueueHead(UINT64 qh) {
                         RECT rc;
                         if (GetCursorPos(&pt) && ScreenToClient(g_hwnd, &pt) &&
                             GetClientRect(g_hwnd, &rc)) {
-                            int w = rc.right - rc.left, h = rc.bottom - rc.top;
+                            RECT dsp;
+                            guestDisplayRect(rc.right - rc.left, rc.bottom - rc.top, &dsp);
+                            int w = dsp.right - dsp.left, h = dsp.bottom - dsp.top;
+                            int ix = pt.x - dsp.left, iy = pt.y - dsp.top;
                             // Only while the pointer is actually over the guest's
                             // display -- otherwise moving away across the host
                             // desktop would keep dragging the guest cursor along.
+                            // The letterbox bars count as "away": they are not
+                            // part of the guest's screen.
                             if (w > 0 && h > 0 &&
-                                pt.x >= 0 && pt.y >= 0 && pt.x < w && pt.y < h) {
+                                ix >= 0 && iy >= 0 && ix < w && iy < h) {
                                 InterlockedExchange(&g_tabletX,
-                                    (LONG)(((LONGLONG)pt.x * 32767) / (w - 1 > 0 ? w - 1 : 1)));
+                                    (LONG)(((LONGLONG)ix * 32767) / (w - 1 > 0 ? w - 1 : 1)));
                                 InterlockedExchange(&g_tabletY,
-                                    (LONG)(((LONGLONG)pt.y * 32767) / (h - 1 > 0 ? h - 1 : 1)));
+                                    (LONG)(((LONGLONG)iy * 32767) / (h - 1 > 0 ? h - 1 : 1)));
                             }
                         }
                     }
