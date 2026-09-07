@@ -4393,6 +4393,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DeleteObject(image);
                     DeleteObject(bars);
                 }
+                // Blend when scaling instead of dropping pixels. The default
+                // stretch mode (COLORONCOLOR) simply DISCARDS the rows and
+                // columns that do not survive the scale, which is why a guest
+                // shown smaller than its framebuffer came out speckled and its
+                // text broke up into noise -- thin strokes were landing on
+                // dropped pixels. HALFTONE averages instead, at some cost per
+                // blit, and is the difference between readable and not.
+                //
+                // HALFTONE requires the brush origin be reset afterwards or it
+                // leaves a dithering artefact; that is documented on
+                // SetStretchBltMode and is not optional.
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, NULL);
                 StretchDIBits(
                     hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                     0, 0, ramfbWidth, ramfbHeight,
