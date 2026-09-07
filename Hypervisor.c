@@ -4393,19 +4393,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DeleteObject(image);
                     DeleteObject(bars);
                 }
-                // Blend when scaling instead of dropping pixels. The default
-                // stretch mode (COLORONCOLOR) simply DISCARDS the rows and
-                // columns that do not survive the scale, which is why a guest
-                // shown smaller than its framebuffer came out speckled and its
-                // text broke up into noise -- thin strokes were landing on
-                // dropped pixels. HALFTONE averages instead, at some cost per
-                // blit, and is the difference between readable and not.
+                // DELIBERATELY the cheap stretch mode, despite it dropping the
+                // rows and columns that do not survive a scale rather than
+                // blending them.
                 //
-                // HALFTONE requires the brush origin be reset afterwards or it
-                // leaves a dithering artefact; that is documented on
-                // SetStretchBltMode and is not optional.
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, NULL);
+                // HALFTONE was tried here for quality and is unusable: measured
+                // on this machine at 1280x720 -> 1050x590 it costs 57.99ms per
+                // blit against COLORONCOLOR's 3.48ms -- 16.7x slower, and three
+                // and a half times the entire 16.7ms frame budget at 60fps.
+                // This runs on the window thread, which also carries input, so
+                // it did not merely drop frames: it made the whole VM feel
+                // broken. Quality is not worth that, and the fix for
+                // readability was the resolution (see the ramfb mode table),
+                // not the filter.
+                //
+                // If blending is ever wanted, it has to be a hand-rolled box
+                // filter over the framebuffer, not GDI's.
+                SetStretchBltMode(hdc, COLORONCOLOR);
                 StretchDIBits(
                     hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
                     0, 0, ramfbWidth, ramfbHeight,
