@@ -1498,8 +1498,9 @@ class NewVMWizard(QDialog):
             self.guest_os_combo.addItem(os_label)
         form.addRow("Guest OS:", self.guest_os_combo)
 
-        # Firmware -- UEFI needs an OVMF.fd the user supplies (not bundled).
-        # The path row only appears once UEFI is selected.
+        # Firmware -- the OVMF .fd is resolved automatically (LocalHost's own
+        # build first), so there is no path row here in the normal case; it
+        # only appears if no firmware could be found at all.
         self.firmware_combo = QComboBox()
         self.firmware_combo.addItems(["UEFI (OVMF)", "Legacy BIOS (SeaBIOS)"])
         # UEFI FIRST, and therefore the default. Legacy BIOS was the default and
@@ -1521,9 +1522,10 @@ class NewVMWizard(QDialog):
         uefi_row.addWidget(self.uefi_path_edit)
         uefi_row.addWidget(uefi_browse_btn)
 
-        uefi_container = QVBoxLayout()
-        uefi_container.setContentsMargins(0, 0, 0, 0)
-        uefi_container.addLayout(uefi_row)
+        # This hint belongs with the Firmware combo, not with the .fd picker
+        # below it: the picker is hidden in the normal case now, and the note
+        # about ISO media taking the only controller port is worth keeping on
+        # screen either way.
         uefi_hint = QLabel(
             "UEFI is required to boot a modern OS -- Legacy BIOS gives the guest "
             "only 1 MB of RAM. An ISO set below is booted as installer media; "
@@ -1531,7 +1533,11 @@ class NewVMWizard(QDialog):
         )
         uefi_hint.setWordWrap(True)
         uefi_hint.setStyleSheet("color: #888;")
-        uefi_container.addWidget(uefi_hint)
+        form.addRow("", uefi_hint)
+
+        uefi_container = QVBoxLayout()
+        uefi_container.setContentsMargins(0, 0, 0, 0)
+        uefi_container.addLayout(uefi_row)
 
         # QFormLayout rows aren't directly hide-able -- wrap the row's
         # contents in a real QWidget so on_firmware_changed can toggle both
@@ -1561,9 +1567,18 @@ class NewVMWizard(QDialog):
             self._validate_and_detect_iso(path)
 
     def on_firmware_changed(self, text):
+        # The .fd picker stays hidden whenever a firmware was resolved
+        # automatically -- _find_ovmf_firmware prefers our own LocalHost OVMF
+        # build, so there is nothing for the user to choose and the row was
+        # only ever clutter.
+        #
+        # It reappears if that hunt came up empty, which is the one case where
+        # hiding it outright would dead-end someone with no OVMF on their
+        # machine and no way to point at one.
         is_uefi = text.startswith("UEFI")
-        self.uefi_firmware_row_label.setVisible(is_uefi)
-        self.uefi_firmware_row_widget.setVisible(is_uefi)
+        needs_picker = is_uefi and not self.uefi_path_edit.text().strip()
+        self.uefi_firmware_row_label.setVisible(needs_picker)
+        self.uefi_firmware_row_widget.setVisible(needs_picker)
 
     def on_browse_uefi_firmware(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1650,8 +1665,22 @@ class NewVMWizard(QDialog):
         uefi_firmware_path = self.uefi_path_edit.text().strip()
         if firmware == "UEFI":
             if not uefi_firmware_path:
+                # The picker is hidden whenever firmware is found automatically,
+                # so getting here means the hunt came up empty. Reveal the row
+                # and say why it has suddenly appeared, rather than flashing a
+                # red border on a field the user has never seen before.
+                self.uefi_firmware_row_label.setVisible(True)
+                self.uefi_firmware_row_widget.setVisible(True)
                 self.uefi_path_edit.setStyleSheet("border: 1px solid #e05555;")
                 self.uefi_path_edit.setPlaceholderText("A UEFI firmware (.fd) file is required!")
+                QMessageBox.warning(
+                    self, "No UEFI firmware found",
+                    "No OVMF firmware could be found automatically.\n\n"
+                    "Looked for RELEASEX64_OVMF_LocalHost.fd, then the stock OVMF "
+                    "builds, in the app folder, its firmware/ subfolder, Documents "
+                    "and Downloads.\n\n"
+                    "Choose one below, or put a .fd file in any of those folders."
+                )
                 return
             if not Path(uefi_firmware_path).is_file():
                 self.uefi_path_edit.setStyleSheet("border: 1px solid #e05555;")
@@ -1750,10 +1779,10 @@ class VMSettingsDialog(QDialog):
         self._set_combo(self.guest_os_combo, vm.guest_os, "Other / Unknown")
         form.addRow("Guest OS:", self.guest_os_combo)
 
-        # Firmware -- UEFI needs an OVMF.fd the user supplies (not bundled).
-        # The path row only appears once UEFI is selected. Locked while
-        # running, same rationale as the hard disk size: the hypervisor
-        # process already has its firmware path fixed for this run.
+        # Firmware -- the OVMF .fd is resolved automatically (LocalHost's own
+        # build first), so the path row is hidden unless nothing could be
+        # found. Locked while running, same rationale as the hard disk size:
+        # the hypervisor process already has its firmware path fixed.
         self.firmware_combo = QComboBox()
         # UEFI first here too, matching the wizard -- and the fallback for an
         # unrecognised stored value is now UEFI, since Legacy BIOS cannot boot
@@ -1777,9 +1806,10 @@ class VMSettingsDialog(QDialog):
         uefi_row.addWidget(self.uefi_path_edit)
         uefi_row.addWidget(uefi_browse_btn)
 
-        uefi_container = QVBoxLayout()
-        uefi_container.setContentsMargins(0, 0, 0, 0)
-        uefi_container.addLayout(uefi_row)
+        # This hint belongs with the Firmware combo, not with the .fd picker
+        # below it: the picker is hidden in the normal case now, and the note
+        # about ISO media taking the only controller port is worth keeping on
+        # screen either way.
         uefi_hint = QLabel(
             "UEFI is required to boot a modern OS -- Legacy BIOS gives the guest "
             "only 1 MB of RAM. An ISO set below is booted as installer media; "
@@ -1787,7 +1817,11 @@ class VMSettingsDialog(QDialog):
         )
         uefi_hint.setWordWrap(True)
         uefi_hint.setStyleSheet("color: #888;")
-        uefi_container.addWidget(uefi_hint)
+        form.addRow("", uefi_hint)
+
+        uefi_container = QVBoxLayout()
+        uefi_container.setContentsMargins(0, 0, 0, 0)
+        uefi_container.addLayout(uefi_row)
 
         self.uefi_firmware_row_widget = QWidget()
         self.uefi_firmware_row_widget.setLayout(uefi_container)
@@ -1842,9 +1876,18 @@ class VMSettingsDialog(QDialog):
             self.iso_edit.setText(path)
 
     def on_firmware_changed(self, text):
+        # The .fd picker stays hidden whenever a firmware was resolved
+        # automatically -- _find_ovmf_firmware prefers our own LocalHost OVMF
+        # build, so there is nothing for the user to choose and the row was
+        # only ever clutter.
+        #
+        # It reappears if that hunt came up empty, which is the one case where
+        # hiding it outright would dead-end someone with no OVMF on their
+        # machine and no way to point at one.
         is_uefi = text.startswith("UEFI")
-        self.uefi_firmware_row_label.setVisible(is_uefi)
-        self.uefi_firmware_row_widget.setVisible(is_uefi)
+        needs_picker = is_uefi and not self.uefi_path_edit.text().strip()
+        self.uefi_firmware_row_label.setVisible(needs_picker)
+        self.uefi_firmware_row_widget.setVisible(needs_picker)
 
     def on_browse_uefi_firmware(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1858,8 +1901,22 @@ class VMSettingsDialog(QDialog):
         uefi_firmware_path = self.uefi_path_edit.text().strip()
         if firmware == "UEFI":
             if not uefi_firmware_path:
+                # The picker is hidden whenever firmware is found automatically,
+                # so getting here means the hunt came up empty. Reveal the row
+                # and say why it has suddenly appeared, rather than flashing a
+                # red border on a field the user has never seen before.
+                self.uefi_firmware_row_label.setVisible(True)
+                self.uefi_firmware_row_widget.setVisible(True)
                 self.uefi_path_edit.setStyleSheet("border: 1px solid #e05555;")
                 self.uefi_path_edit.setPlaceholderText("A UEFI firmware (.fd) file is required!")
+                QMessageBox.warning(
+                    self, "No UEFI firmware found",
+                    "No OVMF firmware could be found automatically.\n\n"
+                    "Looked for RELEASEX64_OVMF_LocalHost.fd, then the stock OVMF "
+                    "builds, in the app folder, its firmware/ subfolder, Documents "
+                    "and Downloads.\n\n"
+                    "Choose one below, or put a .fd file in any of those folders."
+                )
                 return
             if not Path(uefi_firmware_path).is_file():
                 self.uefi_path_edit.setStyleSheet("border: 1px solid #e05555;")
