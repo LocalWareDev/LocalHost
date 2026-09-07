@@ -343,6 +343,41 @@ def _resize_sparse_disk_image(path, new_size_bytes):
         kernel32.CloseHandle(handle)
 
 
+# Interpreter names the library used to be filed under, before the app pinned
+# its own application name. See _find_legacy_library.
+_LEGACY_APPDATA_DIRS = ("python", "pythonw", "python3", "py")
+
+
+def _find_legacy_library(new_folder):
+    """Find a VM library written before the app pinned its own name.
+
+    Back then Qt derived AppDataLocation from the interpreter's filename, so
+    the same app kept separate libraries under .../Roaming/python/ and
+    .../Roaming/pythonw/ depending on how it was launched. Whichever one holds
+    the most VMs is the real one; an empty file is what an accidental launch
+    the other way leaves behind, and must not win.
+
+    Disk paths inside the library are absolute, so adopting it here is enough
+    -- the disks themselves stay where they are and keep resolving.
+    """
+    best, best_count = None, 0
+    roots = [new_folder.parent]
+    if new_folder.parent.parent != new_folder.parent:
+        roots.append(new_folder.parent.parent)
+    for root, name in ((r, n) for r in roots for n in _LEGACY_APPDATA_DIRS):
+        candidate = root / name / "library.json"
+        if candidate == new_folder / "library.json":
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        count = len(data.get("vms") or {})
+        if count > best_count:
+            best, best_count = candidate, count
+    return best
+
+
 def _resize_disk_image(path, new_size_bytes):
     """Resize a VM disk to new_size_bytes of USABLE capacity, keeping whatever
     kind of image it already is.
@@ -2644,7 +2679,19 @@ class LocalHostWindow(QMainWindow):
             app_data_dir = str(Path(__file__).resolve().parent)
         folder = Path(app_data_dir)
         folder.mkdir(parents=True, exist_ok=True)
-        return folder / "library.json"
+        path = folder / "library.json"
+        if not path.exists():
+            legacy = _find_legacy_library(folder)
+            if legacy is not None:
+                # Carry the old library across rather than silently starting
+                # empty, which is what "all my VMs are gone" actually looked
+                # like. Copy, don't move: if anything here is wrong, the
+                # original is still sitting where it always was.
+                try:
+                    path.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+                except OSError:
+                    pass
+        return path
 
     def _vm_disks_dir(self):
         d = self.library_file_path().parent / "disks"
@@ -4233,6 +4280,21 @@ class LocalHostWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # Pin the application identity BEFORE anything asks Qt for a standard path.
+    #
+    # QStandardPaths.AppDataLocation derives its folder from the application
+    # name, and with no name set Qt falls back to the running EXECUTABLE's
+    # basename. Since this is a script, that basename is the interpreter's:
+    # launching with python.exe stored the VM library under
+    # .../Roaming/python/, and with pythonw.exe under .../Roaming/pythonw/.
+    # Same app, same user, two separate libraries -- so merely launching it the
+    # other way made every VM vanish. Naming ourselves makes the location
+    # depend on the app, which is the only thing it should ever depend on.
+    # Application name only, deliberately no organization name: Qt nests
+    # AppDataLocation as <org>/<app> when both are set, and the extra level
+    # buys nothing while putting the legacy folders two levels up instead of
+    # one, out of reach of the migration below.
+    app.setApplicationName("LocalHost")
 
     splash = _create_splash(app)
     if splash is not None:
