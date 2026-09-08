@@ -3693,6 +3693,16 @@ class LocalHostWindow(QMainWindow):
         # therefore undiagnosable without relaunching it by hand from a shell.
         # The INSTANCE form honours setStandardOutputFile and still detaches, so
         # the process keeps outliving the manager exactly as before.
+        #
+        # It gives us NO process id though, which is the catch. Unlike the static
+        # overload -- which returns (ok, pid) -- the instance form returns a bare
+        # bool, and processId() reads 0 once detached (both verified directly).
+        # Getting that wrong is what made the console escape the manager: the
+        # tuple-unpack raised AFTER the child had already launched, so the VM ran
+        # while self.processes never got an entry and nothing ever embedded it.
+        #
+        # So the pid is discovered from the window instead, exactly as
+        # _reconnect_running_vms does for a VM that was already running.
         log_path = self._vm_log_path(vm.name)
         proc = QProcess(self)
         proc.setProgram(str(exe_path))
@@ -3700,20 +3710,51 @@ class LocalHostWindow(QMainWindow):
         proc.setWorkingDirectory(str(self.app_dir()))
         proc.setStandardOutputFile(str(log_path))
         proc.setProcessChannelMode(QProcess.MergedChannels)
-        ok, pid = proc.startDetached()
-        if not ok:
-            # Fall back to the old path rather than refusing to start a VM just
-            # because a log file could not be opened.
-            ok, pid = QProcess.startDetached(str(exe_path), args, str(self.app_dir()))
+        started = bool(proc.startDetached())
+
+        if started:
+            self.statusBar().showMessage(f"Powering on {vm.name}...", 3000)
+            self._adopt_launched_vm(vm.name)
+            return
+
+        # Logging could not be set up. Start the VM anyway rather than refusing
+        # over a log file; this path does hand back a usable pid.
+        ok, pid = QProcess.startDetached(str(exe_path), args, str(self.app_dir()))
         if not ok:
             self.statusBar().showMessage(f"Failed to start '{vm.name}'.", 5000)
             return
-
         self.processes[vm.name] = pid
-        self.statusBar().showMessage(f"Powering on {vm.name}...", 3000)
+        self.statusBar().showMessage(
+            f"Powering on {vm.name} (no log -- couldn't write {log_path.name}).", 5000)
         if self.current_vm is vm:
             self._update_power_ui()
         QTimer.singleShot(200, lambda: self._embed_hypervisor_window(vm.name))
+
+    def _adopt_launched_vm(self, vm_name, attempt=0):
+        """Find the pid of a VM we just launched detached, then embed it.
+
+        Qt cannot tell us the pid of a detached child that has its output
+        redirected, so the window is the only handle on it. Looked up by title
+        here because there is no pid yet to match on -- that is the whole point
+        of this pass -- and the window takes a moment to appear, hence the
+        retries.
+        """
+        hwnd = _find_hypervisor_window(vm_name)
+        pid = wintypes.DWORD()
+        if hwnd:
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not hwnd or not pid.value:
+            if attempt < 40:      # ~10s, well past a normal window appearance
+                QTimer.singleShot(250, lambda: self._adopt_launched_vm(vm_name, attempt + 1))
+            else:
+                self.statusBar().showMessage(
+                    f"'{vm_name}' started but its console window never appeared.", 6000)
+            return
+
+        self.processes[vm_name] = pid.value
+        if self.current_vm and self.current_vm.name == vm_name:
+            self._update_power_ui()
+        self._embed_hypervisor_window(vm_name)
 
     def power_off_vm(self, vm, force=False):
         """Ask the guest to shut down, the way pressing a real power button
