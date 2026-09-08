@@ -2823,6 +2823,15 @@ class LocalHostWindow(QMainWindow):
                     pass
         return path
 
+    def _vm_log_path(self, vm_name):
+        """Where a VM's hypervisor output goes. One file per VM, overwritten on
+        each power-on, so the log always describes the CURRENT run rather than
+        growing without bound across sessions."""
+        d = self.library_file_path().parent / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in vm_name).strip() or "vm"
+        return d / f"{safe}.log"
+
     def _vm_disks_dir(self):
         d = self.library_file_path().parent / "disks"
         d.mkdir(parents=True, exist_ok=True)
@@ -3676,7 +3685,26 @@ class LocalHostWindow(QMainWindow):
         # normal QProcess would get killed the instant the manager exits,
         # which is exactly what "run in background"/"suspend on close"
         # needs to *not* happen.
-        ok, pid = QProcess.startDetached(str(exe_path), args, str(self.app_dir()))
+        # Capture the hypervisor's stdout to a per-VM log.
+        #
+        # The STATIC QProcess.startDetached() throws the child's output away, so
+        # a VM launched from the manager produced no log at all -- and every
+        # problem reported while actually USING a VM ("the pointer skips") was
+        # therefore undiagnosable without relaunching it by hand from a shell.
+        # The INSTANCE form honours setStandardOutputFile and still detaches, so
+        # the process keeps outliving the manager exactly as before.
+        log_path = self._vm_log_path(vm.name)
+        proc = QProcess(self)
+        proc.setProgram(str(exe_path))
+        proc.setArguments(args)
+        proc.setWorkingDirectory(str(self.app_dir()))
+        proc.setStandardOutputFile(str(log_path))
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        ok, pid = proc.startDetached()
+        if not ok:
+            # Fall back to the old path rather than refusing to start a VM just
+            # because a log file could not be opened.
+            ok, pid = QProcess.startDetached(str(exe_path), args, str(self.app_dir()))
         if not ok:
             self.statusBar().showMessage(f"Failed to start '{vm.name}'.", 5000)
             return
