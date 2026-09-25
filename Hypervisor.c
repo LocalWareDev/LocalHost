@@ -1,4 +1,4 @@
-﻿// Known limitations and the backend roadmap are tracked in docs/
+// Known limitations and the backend roadmap are tracked in docs/
 // (docs/known-limitations.md, docs/roadmap.md). In particular, real Windows
 // guests currently bugcheck 0x5C during HAL timer init -- see
 // docs/investigations/vppt-synic-blocker.md for the full investigation
@@ -4764,12 +4764,18 @@ unsigned char pciEhciConfig[256] = { 0 };       // 0:4.0 -- EHCI USB 2.0 control
 UINT32 ehciBarBase = 0;          // guest-programmed BAR0 GPA, once set
 int ehciBarMapped = 0;           // BAR0 programmed => MMIO is being decoded
 int ehciBarSizing = 0;           // guest wrote 0xFFFFFFFF to probe the BAR size
+void *ehciMmioPage = NULL;       // 4KB page mapped WHvMapGpaRangeFlagRead for zero-exit reads
+int ehciMmioMapped = 0;          // whether ehciMmioPage is currently GPA-mapped
 
 // Operational register state. Kept as named fields rather than a backing buffer
-// because almost every one of them has real semantics (RW1C change bits, a reset
-// that must self-clear), and the AHCI ABAR taught us that letting a driver store
-// status bits verbatim produces exactly the sort of self-sustaining interrupt
-// storm U61 had to unpick.
+// alone because almost every one of them has real semantics (RW1C change bits,
+// a reset that must self-clear), and the AHCI ABAR taught us that letting a driver
+// store status bits verbatim produces exactly the sort of self-sustaining
+// interrupt storm U61 had to unpick.
+//
+// When ehciMmioPage is mapped with WHvMapGpaRangeFlagRead, reads run natively out
+// of the page with ZERO exits, while writes still trap to ehciHandleMmio.
+// ehciSyncRegsToPage() mirrors these fields into the backing page.
 UINT32 ehciUsbCmd = 0;
 UINT32 ehciUsbSts = 0x00001000;  // HCHalted set: the controller starts halted
 UINT32 ehciUsbIntr = 0;
@@ -4782,6 +4788,37 @@ UINT32 ehciConfigFlag = 0;
 // CCS (bit0) = device present, CSC (bit1) = connect change pending so the hub
 // driver notices, PP (bit12) = port powered.
 UINT32 ehciPortSc = 0x00001003;
+
+void ehciSyncRegsToPage(void) {
+    if (!ehciMmioPage) return;
+    volatile UINT32 *regs = (volatile UINT32 *)ehciMmioPage;
+    regs[0x00 / 4] = EHCI_CAPLENGTH | (0x0100u << 16);
+    regs[0x04 / 4] = 0x00000011u;
+    regs[0x08 / 4] = 0x00000000u;
+    regs[0x20 / 4] = ehciUsbCmd;
+    regs[0x24 / 4] = ehciUsbSts;
+    regs[0x28 / 4] = ehciUsbIntr;
+    regs[0x2C / 4] = ehciFrIndex;
+    regs[0x30 / 4] = ehciCtrlDsSegment;
+    regs[0x34 / 4] = ehciPeriodicBase;
+    regs[0x38 / 4] = ehciAsyncBase;
+    regs[0x60 / 4] = ehciConfigFlag;
+    regs[0x64 / 4] = ehciPortSc;
+}
+
+static inline void ehciSetUsbStsBits(UINT32 bits) {
+    ehciUsbSts |= bits;
+    if (ehciMmioPage) {
+        *(volatile UINT32 *)((unsigned char *)ehciMmioPage + 0x24) = ehciUsbSts;
+    }
+}
+
+static inline void ehciAdvanceFrIndex(void) {
+    ehciFrIndex = (ehciFrIndex + 8) & 0x3FFF;
+    if (ehciMmioPage) {
+        *(volatile UINT32 *)((unsigned char *)ehciMmioPage + 0x2C) = ehciFrIndex;
+    }
+}
 
 // Uncapped, per the standing rule in this file: six times now a capped log has
 // produced a wrong conclusion here. "usbehci is talking to us" must be a counter,
@@ -6958,11 +6995,14 @@ int ahciHandleAbarMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *
 }
 
 // EHCI BAR0 (offset 0x10), same sizing protocol as AHCI's BAR5: write all-ones
-// to read back a size mask, then write the real aligned base. Unlike the ABAR we
-// never allocate a backing buffer -- every EHCI register has semantics, so the
-// GPA is left unmapped and each access faults out to ehciHandleMmio below.
-void ehciHandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset,
-                          UINT32 accessSize, UINT64 *rax) {
+// to read back a size mask, then write the real aligned base.
+//
+// When read-backed mapping is enabled (default, toggleable via
+// LOCALHOST_EHCI_READ_BACKED=0), BAR0 is mapped with WHvMapGpaRangeFlagRead.
+// Register reads are served directly by the CPU out of ehciMmioPage with zero
+// exits, while writes trap to ehciHandleMmio where side effects belong.
+void ehciHandleBar0Access(WHV_PARTITION_HANDLE partition, WHV_X64_IO_PORT_ACCESS_CONTEXT *io,
+                          UINT32 baseOffset, UINT32 accessSize, UINT64 *rax) {
     if (io->AccessInfo.IsWrite) {
         if (baseOffset == 0x10 && accessSize >= 4) {
             UINT32 written = (UINT32)io->Rax;
@@ -6972,6 +7012,40 @@ void ehciHandleBar0Access(WHV_X64_IO_PORT_ACCESS_CONTEXT *io, UINT32 baseOffset,
                 ehciBarSizing = 0;
                 UINT32 newBase = written & ~(UINT32)(EHCI_BAR_SIZE - 1);
                 if (newBase != 0 && newBase != ehciBarBase) {
+                    const char *off = getenv("LOCALHOST_EHCI_READ_BACKED");
+                    int enableReadBacked = !(off && off[0] == '0');
+
+                    if (enableReadBacked) {
+                        if (ehciMmioPage == NULL) {
+                            ehciMmioPage = VirtualAlloc(NULL, EHCI_BAR_SIZE,
+                                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                            if (ehciMmioPage == NULL) {
+                                printf("[ehci] BAR0: VirtualAlloc failed -- falling back to trapped MMIO\n");
+                                fflush(stdout);
+                            }
+                        }
+                        if (ehciMmioPage != NULL) {
+                            if (ehciMmioMapped && ehciBarBase != 0) {
+                                WHvUnmapGpaRange(partition, ehciBarBase, EHCI_BAR_SIZE);
+                                ehciMmioMapped = 0;
+                            }
+                            ehciSyncRegsToPage();
+                            HRESULT hr = WHvMapGpaRange(partition, ehciMmioPage, newBase,
+                                                        EHCI_BAR_SIZE, WHvMapGpaRangeFlagRead);
+                            ehciBarBase = newBase;
+                            ehciBarMapped = 1;
+                            ehciMmioMapped = SUCCEEDED(hr) ? 1 : 0;
+                            printf("[ehci] memory BAR0 at 0x%X -- reads native, writes trapped (hr=0x%lX %s)\n",
+                                   newBase, (unsigned long)hr, SUCCEEDED(hr) ? "ok" : "FAILED");
+                            fflush(stdout);
+                            return;
+                        }
+                    }
+
+                    if (ehciMmioMapped && ehciBarBase != 0) {
+                        WHvUnmapGpaRange(partition, ehciBarBase, EHCI_BAR_SIZE);
+                        ehciMmioMapped = 0;
+                    }
                     ehciBarBase = newBase;
                     ehciBarMapped = 1;
                     printf("[ehci] BAR0 at 0x%X -- trapped MMIO (%d bytes, decoded per access)\n",
@@ -7456,8 +7530,8 @@ static int ehciRunQueueHead(UINT64 qh) {
                     // perfectly ordinary protocol stall -- measured: enumeration
                     // stopped dead at the Microsoft OS string descriptor (index
                     // 0xEE), which every device is entitled to stall.
-                    ehciUsbSts |= 0x2u;   // USBERRINT
-                    if (token & 0x8000u) ehciUsbSts |= 0x1u;
+                    ehciSetUsbStsBits(0x2u);   // USBERRINT
+                    if (token & 0x8000u) ehciSetUsbStsBits(0x1u);
                     raisedInterrupt = 1;
                     break;
                 }
@@ -7667,7 +7741,7 @@ void ehciProcessAsyncSchedule(void) {
         qh = nextQh;
     }
 
-    if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
+    if (raisedInterrupt) ehciSetUsbStsBits(0x1u);             // USBINT
 }
 
 // Walks the periodic frame list, which is where interrupt endpoints live -- so
@@ -7707,9 +7781,9 @@ void ehciProcessPeriodicSchedule(void) {
         link = next;
     }
 
-    ehciFrIndex = (ehciFrIndex + 8) & 0x3FFF;            // advance one frame
+    ehciAdvanceFrIndex();                                // advance one frame and sync
 
-    if (raisedInterrupt) ehciUsbSts |= 0x1u;             // USBINT
+    if (raisedInterrupt) ehciSetUsbStsBits(0x1u);        // USBINT
 }
 
 // Dumps the interrupt endpoint's queue head and its qTD chain straight out of
@@ -8279,6 +8353,8 @@ int ehciHandleMmio(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTEXT *exit
         WHV_REGISTER_VALUE dstVal = { 0 };
         dstVal.Reg64 = result;
         WHvSetVirtualProcessorRegisters(partition, 0, &ioapicGprNames[regNum], 1, &dstVal);
+    } else {
+        ehciSyncRegsToPage();
     }
     // InstructionLength is not populated for MMIO exits, so advance RIP by the
     // length our own decode determined (same as the IOAPIC/ABAR paths).
@@ -9398,7 +9474,7 @@ void pciHandleConfigAccess(WHV_PARTITION_HANDLE partition, WHV_RUN_VP_EXIT_CONTE
 #if LH_USE_XHCI
             xhciHandleBar0Access(io, baseOffset, accessSize, &rax);
 #else
-            ehciHandleBar0Access(io, baseOffset, accessSize, &rax);
+            ehciHandleBar0Access(partition, io, baseOffset, accessSize, &rax);
 #endif
         } else if (cfg != NULL && baseOffset <= 255) {
             if (io->AccessInfo.IsWrite) {
